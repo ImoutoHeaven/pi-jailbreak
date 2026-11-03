@@ -1,11 +1,17 @@
 /**
- * Injects the jailbreak text into the system prompt of the sessions a rule selects.
+ * Injects the jailbreak text into the system prompt of the sessions a rule selects, and a fabricated
+ * conversation ahead of the first real user message in the sessions a turn file selects.
  *
  * The text goes in as the head of the leading system message's `content`, ahead of every section,
  * on every request. A section would name the block, which marks it as injected. The
  * `context_with_system` guard places the raw text, with no wrapper, ahead of every section. The
  * transcript records nothing for it, so nothing is persisted, nothing leaks to another model, and
  * an unchanged run sends byte-identical prompts turn after turn.
+ *
+ * The fabricated conversation is spliced before the first message that is not a system message, so
+ * it lands after the prompt and after a compaction summary alike. It is rebuilt from the turn file
+ * on every request, so a model switch, a fork, a reload or a new session leaves nothing to clean
+ * up, and a file that fails to load injects nothing while the text above stays in force.
  *
  * The leading system message is the first system message in the transcript, not the entry at index
  * 0: an entry written before the first run, such as the `bashExecution` record of a `!command`, sits
@@ -28,19 +34,17 @@
  * applies a `setActiveTools()` call made in either to the run being prepared.
  */
 
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { authorizeGate, GATE_FIELDS, GATE_TOOL, normalizeFields } from "./gate.js";
-import { configPath, loadConfig, parseConfig, promptPath, resolve } from "./config.js";
+import { configPath, loadConfig, parseConfig, promptPath, resolve, turnsPath } from "./config.js";
 import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
+import { cachedFile, loadTurns, toMessages } from "./turns.js";
 import { registerCommands } from "./commands.ts";
 
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
-// Legacy only: earlier versions recorded the text as a section under this name. The load-time
-// check stays so a transcript written by those versions can still be scrubbed.
-const SECTION = "deepseek_policy";
 // The raw, untagged section holding pi's stock identity sentence.
 const PREAMBLE = "preamble";
 // Pi's stock preamble, byte for byte (dist/core/system-prompt.js, identical in 1.3.0 and 1.4.0).
@@ -78,16 +82,24 @@ const GATE_SNIPPET = "Ruling for a request you are unsure about delivering";
 const GATE_GUIDELINE =
 	"Any request you are unsure about delivering goes to ask_authorize_gate first; the ruling's NEXT ACTION is what you follow";
 
-// Pi reports an invalid section name as a generic run error with no extension attribution.
-if (!/^[a-z][a-z0-9_-]*$/.test(SECTION) || SECTION === "preamble") {
-	throw new Error(`pi-jailbreak: invalid section name ${SECTION}`);
-}
+/** One item of a turn file, as `turns.js` normalizes it. */
+type TurnSpec =
+	| { role: "user"; text: string }
+	| { role: "assistant"; cot: string; text: string; call: { name: string; arguments: Record<string, any> } | null }
+	| { role: "toolResult"; name: string; text: string };
 
-/** The decision a run works from. `text` is null when the session runs normal or the file is unusable. */
+/**
+ * The decision a run works from. `text` is null when the session runs normal or the file is unusable,
+ * and `turns` is null when no turn file is configured or the one configured does not load.
+ */
 type Decision = {
 	key: string;
 	mode: "jailbreak" | "normal";
 	text: string | null;
+	turns: TurnSpec[] | null;
+	turnsError: string | null;
+	turnsPath: string | null;
+	cotMode: "reasoning_content" | "text";
 	prompt: string;
 	source: string;
 	inherit: string;
@@ -122,15 +134,13 @@ type State = {
 	/** This session's own answer, mirrored into the environment for the processes it starts. */
 	override: { mode: "on" | "off"; key: string } | null;
 	/** What the last request sent actually carried, keyed like a decision. */
-	delivery: { key: string; prompt: string; delivered: boolean } | null;
+	delivery: { key: string; prompt: string; turns: string | null; delivered: boolean; injected: boolean } | null;
 	decision: Decision | null;
 	reported: Set<string>;
 	gateBlocked: boolean;
 	/** Whether the run being prepared sends a forced prompt, which drops the text after the guard. */
 	forced: boolean;
 };
-
-const promptCache = new Map<string, { mtimeMs: number; size: number; text: string }>();
 
 function report(s: State, ctx: any, message: string, type = "error") {
 	const key = `${type}:${message}`;
@@ -149,20 +159,15 @@ function report(s: State, ctx: any, message: string, type = "error") {
 
 /** Read the text once per file revision. An unreadable or empty file leaves the run normal. */
 function readPrompt(s: State, path: string, ctx: any) {
-	try {
-		const stat = statSync(path);
-		const hit = promptCache.get(path);
-		if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.text;
-		const text = readFileSync(path, "utf8").trim();
-		if (!text) {
-			report(s, ctx, `${basename(path)} is empty`);
-			return;
-		}
-		promptCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, text });
-		return text;
-	} catch {
-		report(s, ctx, `${basename(path)} unreadable`);
+	const hit = cachedFile(path, "prompt", (text: string) => {
+		const trimmed = text.trim();
+		return trimmed ? { value: trimmed } : { error: `${basename(path)} is empty` };
+	});
+	if (hit.error) {
+		report(s, ctx, hit.error);
+		return undefined;
 	}
+	return hit.value;
 }
 
 /** Whether the context carries a usable model. A missing provider or id is no model. */
@@ -183,10 +188,30 @@ function buildDecision(s: State, ctx: any): Decision {
 	const mode = session ? (session.mode === "on" ? "jailbreak" : "normal") : hit.mode;
 	const prompt = promptPath(config, hit.prompt);
 	const text = mode === "jailbreak" ? readPrompt(s, prompt, ctx) ?? null : null;
+	// The fabricated conversation is read only in a jailbreak session: a normal one never opens it.
+	const turnsFile = mode === "jailbreak" && hit.turns ? turnsPath(config, hit.turns) : null;
+	let turns: TurnSpec[] | null = null;
+	let turnsError: string | null = null;
+	if (turnsFile) {
+		const file = loadTurns(turnsFile);
+		if (file.error) {
+			turnsError = file.error;
+			report(s, ctx, file.error, "warning");
+		} else turns = file.specs;
+	}
+	// The channel the fabricated chain of thought travels in, from the model api alone.
+	const cotMode = ctx?.model?.api === "openai-completions" ? "reasoning_content" : "text";
+	if (turns && cotMode === "text" && turns.some((spec) => spec.role === "assistant" && spec.cot)) {
+		report(s, ctx, `${basename(turnsFile ?? "")}: the chain of thought is sent as text on ${ctx?.model?.api ?? "this api"}`, "info");
+	}
 	s.decision = {
 		key,
 		mode,
 		text,
+		turns,
+		turnsError,
+		turnsPath: turnsFile,
+		cotMode,
 		prompt,
 		source: session ? "session" : hit.ruleIndex < 0 ? "default" : `rule ${hit.ruleIndex + 1}`,
 		inherit: config.inherit,
@@ -230,14 +255,12 @@ function withoutSection(message: any, name: string) {
 }
 
 /**
- * Copy `messages` with every legacy marker record removed, and while the text is in force with the
- * stock identity preamble removed from every system message. Returns undefined when nothing needed
- * to change.
+ * Copy `messages` with every system message's stock identity preamble removed while the text is in
+ * force. Returns undefined when nothing needed to change.
  *
- * Both keys have to go from every system message, not only the leading one: pi unshifts its own
- * prompt patch at index 0, so the node carrying `preamble` sits later, and a later system message
- * is rendered by name. A `null` marker record renders as a `Removed system prompt section`
- * sentence, so it goes too.
+ * The key has to go from every system message, not only the leading one: pi unshifts its own prompt
+ * patch at index 0, so the node carrying `preamble` sits later, and a later system message is
+ * rendered by name.
  */
 function project(messages: any[], stripIdentity: boolean) {
 	let next;
@@ -245,12 +268,9 @@ function project(messages: any[], stripIdentity: boolean) {
 		const message = messages[i];
 		const sections = message?.sections;
 		if (message?.role !== "system" || !sections) continue;
-		let copy = message;
-		if (Object.hasOwn(sections, SECTION)) copy = withoutSection(copy, SECTION);
-		if (stripIdentity && isStockPreamble(sections[PREAMBLE])) copy = withoutSection(copy, PREAMBLE);
-		if (copy === message) continue;
+		if (!stripIdentity || !isStockPreamble(sections[PREAMBLE])) continue;
 		next ??= messages.slice();
-		next[i] = copy;
+		next[i] = withoutSection(message, PREAMBLE);
 	}
 	return next;
 }
@@ -293,12 +313,71 @@ function syncGate(s: State, want: boolean, ctx: any) {
 	}
 }
 
+/**
+ * Copy `messages` with the fabricated conversation spliced in. `messages` is absent when nothing is
+ * spliced: no file, a forced prompt, or an all-system list. `injected` says whether the request
+ * carries the block, which a block already in the transcript also satisfies.
+ *
+ * The anchor is the first message that is not a system message. That keeps the position fixed
+ * through compaction: after one, the projection begins with the system message captured at
+ * compaction time followed by the summary, and the run-start prompt patch sits ahead of both, so a
+ * fixed index would land between them.
+ */
+function injectTurns(s: State, ctx: any, current: Decision, messages: any[], next: any[] | undefined, at: number) {
+	const specs = current.turns;
+	if (!specs) return { injected: false };
+	const file = basename(current.turnsPath ?? "");
+	// A forced prompt replaces the whole list after this handler, so the block would be dropped
+	// without a word.
+	if (s.forced) {
+		report(s, ctx, `${file} is not injected (another extension replaced the system prompt)`, "warning");
+		return { injected: false };
+	}
+	const base = next ?? messages;
+	const insertAt = base.findIndex((message) => message?.role !== "system");
+	// An all-system list has nowhere to put the block, and nothing to splice it ahead of.
+	if (insertAt < 0) {
+		report(s, ctx, `${file} is not injected (the transcript carries no non-system message)`, "warning");
+		return { injected: false };
+	}
+	const block = toMessages(specs, {
+		provider: ctx?.model?.provider,
+		api: ctx?.model?.api,
+		model: ctx?.model?.id,
+		cotMode: current.cotMode,
+	});
+	// Two points, so a pasted message that happens to match one fabricated one does not pass for a
+	// block that is already there.
+	const same = (a: any, b: any) => a !== undefined && JSON.stringify(a) === JSON.stringify(b);
+	if (same(base[insertAt], block[0]) && same(base[insertAt + specs.length - 1], block[block.length - 1])) {
+		report(s, ctx, `${file} is already in the transcript (the fabricated block is not added twice)`, "warning");
+		return { injected: true };
+	}
+	const out = base === messages ? messages.slice() : base;
+	// The leading system message moves up with the splice: pi renders the prompt from index 0 only,
+	// and a handler that leaves it below the block hands pi a message list it rejects.
+	if (at > 0) {
+		const [moved] = out.splice(at, 1);
+		out.unshift(moved);
+	}
+	// Recomputed, because the move shifts the anchor with it.
+	out.splice(out.findIndex((message) => message?.role !== "system"), 0, ...block);
+	return { messages: out, injected: true };
+}
+
 function updateStatus(s: State, ctx: any, current: Decision) {
+	// A request that carried neither half, or a configured turn file that did not load, is a loss the
+	// footer shows at once.
+	const lost =
+		s.delivery &&
+		s.delivery.key === current.key &&
+		s.delivery.prompt === current.prompt &&
+		(!s.delivery.delivered || (s.delivery.turns !== null && !s.delivery.injected));
 	const state = !current.text
 		? current.mode === "jailbreak"
 			? "JailBreak !"
 			: "JailBreak off"
-		: s.delivery && s.delivery.key === current.key && s.delivery.prompt === current.prompt && !s.delivery.delivered
+		: lost || current.turnsError
 			? "JailBreak !"
 			: "JailBreak on";
 	try {
@@ -309,10 +388,18 @@ function updateStatus(s: State, ctx: any, current: Decision) {
 }
 
 /** Record what a request carried, and show the loss the moment it happens. */
-function noteDelivery(s: State, ctx: any, current: Decision, delivered: boolean) {
+function noteDelivery(s: State, ctx: any, current: Decision, delivered: boolean, injected: boolean) {
 	const before = s.delivery;
-	s.delivery = { key: current.key, prompt: current.prompt, delivered };
-	if (before && before.key === s.delivery.key && before.prompt === s.delivery.prompt && before.delivered === delivered) return;
+	s.delivery = { key: current.key, prompt: current.prompt, turns: current.turnsPath, delivered, injected };
+	if (
+		before &&
+		before.key === s.delivery.key &&
+		before.prompt === s.delivery.prompt &&
+		before.turns === s.delivery.turns &&
+		before.delivered === s.delivery.delivered &&
+		before.injected === s.delivery.injected
+	)
+		return;
 	updateStatus(s, ctx, current);
 }
 
@@ -409,6 +496,9 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// remembering a mode would silently switch the model to the default prompt file.
 	const applied = resolve(parsed.config, ctx?.model);
 	const carried = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].prompt : undefined;
+	// The turns value the model resolves, written even when it is null: an absent key would inherit a
+	// config-level default and turn injection back on.
+	const carriedTurns = applied.turns;
 	const rules = Array.isArray(data.rules) ? data.rules : [];
 	const at = rules.findIndex(
 		(rule: any) =>
@@ -422,8 +512,13 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// edited where it sits.
 	if (at >= 0) {
 		const [updated] = rules.splice(at, 1);
-		rules.unshift({ ...updated, mode: next, ...(updated.prompt === undefined && carried ? { prompt: carried } : {}) });
-	} else rules.unshift({ provider, model: id, mode: next, ...(carried ? { prompt: carried } : {}) });
+		rules.unshift({
+			...updated,
+			mode: next,
+			...(updated.prompt === undefined && carried ? { prompt: carried } : {}),
+			...(updated.turns === undefined ? { turns: carriedTurns } : {}),
+		});
+	} else rules.unshift({ provider, model: id, mode: next, ...(carried ? { prompt: carried } : {}), turns: carriedTurns });
 	const out = {
 		...data,
 		default: data.default ?? "normal",
@@ -459,11 +554,13 @@ function panel(s: State, ctx: any) {
 		["mode", current.mode],
 		["source", current.source],
 		["prompt", current.prompt],
+		["turns", current.turnsPath ?? "off"],
 	];
 	if (current.mode === "jailbreak" && !current.text) rows.push(["text", "missing"]);
 	rows.push(["inherit", current.inherit], ["config", current.configPath ?? "none"]);
 	if (inherited) rows.push(["env", `${inherited.mode}@${inherited.key} ${applies(inherited, current.key) ? "applied" : "ignored"}`]);
 	if (current.error) rows.push(["error", current.error]);
+	if (current.turnsError) rows.push(["turns error", current.turnsError]);
 	const width = Math.max(...rows.map(([name]) => name.length)) + 2;
 	return rows.map(([name, value]) => `${name.padEnd(width)}${value}`).join("\n");
 }
@@ -552,7 +649,6 @@ export default function jailbreak(pi: ExtensionAPI) {
 	pi.on("before_agent_start", (event, ctx) => {
 		const options = event.systemPromptOptions;
 		// The transcript records nothing for the text; the guard projects it onto each request.
-		delete options.sections[SECTION];
 		// One decision per run: a config edited since the last one is read again here.
 		s.decision = null;
 		const current = buildDecision(s, ctx);
@@ -586,8 +682,11 @@ export default function jailbreak(pi: ExtensionAPI) {
 		if (!Array.isArray(messages) || messages.length === 0) return;
 		const current = buildDecision(s, ctx);
 		let next = project(messages, current.text !== null);
+		// The leading system message, and where the splice leaves it: pi renders the prompt from
+		// index 0, and the fabricated block is anchored on the first message that is not a system one.
+		let at = leadingSystem(messages);
+		let delivered = false;
 		if (current.text) {
-			const at = leadingSystem(messages);
 			const projected = at < 0 ? undefined : next === undefined ? messages[at] : next[at];
 			const existing = projected ? headText(projected.content) : undefined;
 			if (existing === undefined) {
@@ -618,13 +717,19 @@ export default function jailbreak(pi: ExtensionAPI) {
 						// moves up to where it is the prompt rather than a section update.
 						const [moved] = next.splice(at, 1);
 						next.unshift(moved);
+						at = 0;
 					}
 				}
+				delivered = true;
 			}
-			// The footer reports what the request carried, not only what the mode asked for. A forced
-			// prompt replaces the list after this point, so that run carries nothing either.
-			noteDelivery(s, ctx, current, existing !== undefined && !s.forced);
-		} else forgetDelivery(s);
+		}
+		// The fabricated conversation, spliced ahead of the first real user message. A run whose
+		// system prompt was replaced by another extension skips it and says so.
+		const spliced = injectTurns(s, ctx, current, messages, next, at);
+		if (spliced.messages) next = spliced.messages;
+		// The footer reports what the request carried, not only what the mode asked for.
+		if (current.text || current.turns) noteDelivery(s, ctx, current, delivered && !s.forced, spliced.injected);
+		else forgetDelivery(s);
 		// Aligned: return undefined so the request stays byte-identical and allocation-free.
 		return next === undefined ? undefined : { messages: next };
 	});

@@ -1,7 +1,8 @@
 # pi-jailbreak
 
 A Pi extension that puts the text of `prompt.md` at the head of the system prompt for the sessions a
-rule selects, and declares the `ask_authorize_gate` tool while that text is in force.
+rule selects, splices a fabricated conversation ahead of the first real user message for the
+sessions a turn file selects, and declares the `ask_authorize_gate` tool while that text is in force.
 
 The extension ships no rules. Nothing is injected until a config file names the model.
 
@@ -9,13 +10,17 @@ The extension ships no rules. Nothing is injected until a config file names the 
 
 This repository is the source of truth. `pi install` records the package path in the agent
 directory's `settings.json` and loads the files in place: nothing is copied and nothing is built.
+The turn file is read through the `yaml` package, so a clone needs one install in the repository
+directory first:
 
 ```bash
+npm install --no-audit --no-fund
 pi install /path/to/pi-jailbreak
 ```
 
 `pi -e ./index.ts` loads it for one run. The extension reads its own directory, so `prompt.md`,
-`config.js`, `channel.js`, `gate.js` and `commands.ts` travel with `index.ts`.
+`config.js`, `channel.js`, `gate.js`, `turns.js` and `commands.ts` travel with `index.ts`. A missing
+`yaml` package disables the fabricated conversation and leaves the prompt text in force.
 
 ## Configure
 
@@ -44,6 +49,20 @@ case. `mode` is `jailbreak` or `normal`. `prompt.md` is the text that ships with
 other `prompt` path is relative to the config file. A file with one bad value is rejected whole and
 reported once, and the empty config applies instead.
 
+`turns` names the YAML file whose messages are spliced ahead of the first real user message. It has
+three states: absent takes `turn0.yml`, the file that ships with the extension, `null` turns the
+block off, and a string names another file. A rule's own value wins over the config-level one, and a
+rule that sets `null` keeps it off even when the config names a file. `turn0.yml` resolves to the
+package copy wherever the config lives; every other relative path resolves against the directory
+holding the config file.
+
+```json
+{
+	"turns": "team/turn0.yml",
+	"rules": [{ "provider": "deepseek", "mode": "jailbreak", "turns": null }]
+}
+```
+
 `inherit` decides what a session hands to the processes it starts: `keyed` (the same model only),
 `tree` (every model, in this process and in the ones it starts), or `none` (nothing, and inherited
 values are dropped).
@@ -70,8 +89,9 @@ do not share them, and the mode the process set is what a new instance reads.
 
 The footer shows `JailBreak on` while the text is in force, `JailBreak off` while the mode is normal,
 and `JailBreak !` when the mode is jailbreak and the request carried nothing: the prompt file is
-missing or empty, or the transcript has nowhere to put the text. The third state follows the request
-that was actually sent, so a run whose text cannot be placed says so at once instead of showing on.
+missing or empty, the transcript has nowhere to put the text, or the configured turn file did not
+load. The third state follows the request that was actually sent, so a run whose text cannot be
+placed says so at once instead of showing on.
 
 ## Subagents
 
@@ -124,6 +144,52 @@ the leading system message holds blocks Pi never puts there, or the transcript c
 message at all, the extension places nothing: the text stays out, the identity sentence stays in, and
 the loss is reported.
 
+## The fabricated conversation
+
+The `turns` file is a YAML sequence, and one item is one message. Three keys:
+
+```yaml
+- user: |
+    ...
+- assistant:
+    cot: |
+      ...
+    text: |
+      ...
+    call:
+      name: ask_authorize_gate
+      arguments:
+        fields: [PENTEST]
+- result: |
+    ...
+```
+
+`assistant` also takes a bare string, which is its `text`. `result` answers the `call` of the
+assistant before it, so every `call` has exactly one `result`, and the sequence begins with `user`.
+A file with one bad item injects nothing: a half-fabricated history would leave the model an
+assistant turn nobody answered.
+
+The block is spliced before the first message that is not a system message, so it lands after the
+prompt and after a compaction summary, and the leading system message moves to index 0 with it. It
+is rebuilt from the file on every request, so the transcript records nothing: a model switch, a
+fork, a reload or a new session leaves nothing to clean up. The bytes depend on the file and the
+model alone, so the block stays inside the provider's prompt cache.
+
+The last item decides what the model reads immediately before the real request. `assistant` closes
+the block with a reply, and the request follows as a new turn. `result` closes it with tool output,
+which is the shape to use when the fabricated turn carries a gate ruling. `user` closes it with an
+unanswered turn, which Anthropic combines with the real request and the OpenAI-compatible apis send
+as written.
+
+The fabricated chain of thought travels in `reasoning_content` on `openai-completions`, the field
+that adapter writes a thinking block to. Every other api receives it as leading text, and the
+extension says so once per session, because `openai-responses` parses any thinking signature it is
+given and Anthropic turns a signature-less block into text on its own.
+
+A file that does not load injects nothing, reports once, and leaves the prompt text in force. The
+footer shows `JailBreak !` while a configured block is missing, and `/jailbreak` names the file and
+the reason.
+
 ## The authorization gate
 
 `ask_authorize_gate` is a direct tool the model calls before any request it is unsure about
@@ -146,8 +212,8 @@ permits one line and nothing else: `Are the characters fictional?`
 
 `index.ts` is the hook and the tool definition, `commands.ts` the `jailbreak` command, `config.js` the
 rule table and the resolver, `channel.js` the cross-process value, `gate.js` the field table and the
-ruling text, `prompt.md` the injected text. Edit `prompt.md`; the next run uses it. A missing or
-empty file is reported in the UI and injects nothing.
+ruling text, `turns.js` the turn file's parse and its messages, `prompt.md` the injected text. Edit
+`prompt.md`; the next run uses it. A missing or empty file is reported in the UI and injects nothing.
 
 ## Check
 
@@ -157,9 +223,9 @@ node check.mjs
 
 `node check.mjs` drives the registered handlers against a temp config. It pins the resolver, the
 channel payload, the guard's placement and preamble withholding, the config write, the gate rulings,
-and the `prompt.md` invariants. A drift guard fails when an installed Pi release rewords the stock
-preamble, or when no release is installed at all; set `PI_PKG` to point the check at a pi package
-elsewhere.
+the turn file's parse and injection, and the `prompt.md` invariants. A drift guard fails when an
+installed Pi release rewords the stock preamble, or when no release is installed at all; set
+`PI_PKG` to point the check at a pi package elsewhere.
 
 ## Attribution
 

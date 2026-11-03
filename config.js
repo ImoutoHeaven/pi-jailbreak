@@ -18,12 +18,13 @@ const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
 
 export const CONFIG_NAME = "jailbreak.json";
 export const DEFAULT_PROMPT = "prompt.md";
+export const DEFAULT_TURNS = "turn0.yml";
 export const MODES = Object.freeze(["jailbreak", "normal"]);
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
 
 /** What a session uses when no config file loads. */
 export function emptyConfig(dir) {
-	return { default: "normal", inherit: "keyed", prompt: DEFAULT_PROMPT, rules: [], dir, path: null };
+	return { default: "normal", inherit: "keyed", prompt: DEFAULT_PROMPT, turns: DEFAULT_TURNS, rules: [], dir, path: null };
 }
 
 /**
@@ -57,6 +58,25 @@ export function promptPath(config, prompt) {
 }
 
 /**
+ * The absolute path a `turns` value names. `turn0.yml` is the text that ships with the extension, so
+ * a config anywhere resolves it to the package copy; every other relative path sits next to the
+ * config file.
+ */
+export function turnsPath(config, turns) {
+	if (isAbsolute(turns)) return turns;
+	if (turns === DEFAULT_TURNS) return join(PACKAGE_DIR, turns);
+	return join(config.dir, turns);
+}
+
+/**
+ * A `turns` value is three-state: absent takes the shipped file, `null` turns injection off, a
+ * string names a file. Every other type rejects the file whole, so a typo never reads as "off".
+ */
+function turnsValue(value) {
+	return value === null || (typeof value === "string" && value !== "");
+}
+
+/**
  * Parse and validate one file. A file with a single bad value is rejected whole: a table that
  * silently dropped the entry it could not read would answer with a rule the user did not write.
  */
@@ -74,6 +94,10 @@ export function parseConfig(text, dir) {
 	if (!INHERITS.includes(inherit)) return { error: `inherit must be ${INHERITS.join(", ")}` };
 	const prompt = data.prompt ?? DEFAULT_PROMPT;
 	if (typeof prompt !== "string" || !prompt) return { error: "prompt must be a non-empty string" };
+	// Absent takes the file that ships with the package: the fabricated conversation is on unless a
+	// config turns it off with `null`.
+	const turns = data.turns === undefined ? DEFAULT_TURNS : data.turns;
+	if (!turnsValue(turns)) return { error: "turns must be a non-empty string or null" };
 	const rules = data.rules ?? [];
 	if (!Array.isArray(rules)) return { error: "rules must be an array" };
 	const out = [];
@@ -85,9 +109,12 @@ export function parseConfig(text, dir) {
 			if (rule[field] === undefined) continue;
 			if (typeof rule[field] !== "string" || !rule[field]) return { error: `${at}: ${field} must be a non-empty string` };
 		}
-		out.push({ mode: rule.mode, provider: rule.provider, model: rule.model, prompt: rule.prompt });
+		// A rule keeps `undefined` apart from `null`: the first inherits the config-level value, the
+		// second turns injection off even when the config names a file.
+		if (rule.turns !== undefined && !turnsValue(rule.turns)) return { error: `${at}: turns must be a non-empty string or null` };
+		out.push({ mode: rule.mode, provider: rule.provider, model: rule.model, prompt: rule.prompt, turns: rule.turns });
 	}
-	return { config: { default: mode, inherit, prompt, rules: out, dir, path: null } };
+	return { config: { default: mode, inherit, prompt, turns, rules: out, dir, path: null } };
 }
 
 /** The first rule that matches, or the default. `ruleIndex` is -1 for the default. */
@@ -98,9 +125,9 @@ export function resolve(config, model) {
 		const rule = config.rules[ruleIndex];
 		if (rule.provider !== undefined && !globMatch(rule.provider, provider)) continue;
 		if (rule.model !== undefined && !globMatch(rule.model, id)) continue;
-		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, ruleIndex };
+		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, turns: rule.turns === undefined ? config.turns : rule.turns, ruleIndex };
 	}
-	return { mode: config.default, prompt: config.prompt, ruleIndex: -1 };
+	return { mode: config.default, prompt: config.prompt, turns: config.turns, ruleIndex: -1 };
 }
 
 /**

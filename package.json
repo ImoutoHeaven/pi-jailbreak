@@ -13,10 +13,18 @@
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*"
 	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	},
 	"engines": {
 		"node": ">=22.19"
 	},
 	"scripts": {
 		"test": "node check.mjs"
+	},
+	"dependencies": {
+		"yaml": "^2.9.1"
 	}
 }
