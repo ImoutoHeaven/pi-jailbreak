@@ -105,7 +105,8 @@ type Decision = {
 	turns: TurnSpec[] | null;
 	turnsError: string | null;
 	turnsPath: string | null;
-	cotMode: "reasoning_content" | "text";
+	cotMode: "reasoning_content" | "content";
+	cotTag: string;
 	prompt: string;
 	source: string;
 	inherit: string;
@@ -205,10 +206,12 @@ function buildDecision(s: State, ctx: any): Decision {
 			report(s, ctx, file.error, "warning");
 		} else turns = file.specs;
 	}
-	// The channel the fabricated chain of thought travels in, from the model api alone.
-	const cotMode = ctx?.model?.api === "openai-completions" ? "reasoning_content" : "text";
-	if (turns && cotMode === "text" && turns.some((spec) => spec.role === "assistant" && spec.cot)) {
-		report(s, ctx, `${basename(turnsFile ?? "")}: the chain of thought is sent as text on ${ctx?.model?.api ?? "this api"}`, "info");
+	// The configured channel, downgraded where the api has no replayable reasoning field: anthropic
+	// drops a signature-less thinking block, and openai-responses parses any signature as JSON.
+	const wanted = hit.cot ?? "reasoning_content";
+	const cotMode = wanted === "reasoning_content" && ctx?.model?.api === "openai-completions" ? "reasoning_content" : "content";
+	if (turns && cotMode === "content" && turns.some((spec) => spec.role === "assistant" && spec.cot)) {
+		report(s, ctx, `${basename(turnsFile ?? "")}: the chain of thought is sent inside content on ${ctx?.model?.api ?? "this api"}`, "info");
 	}
 	s.decision = {
 		key,
@@ -218,6 +221,7 @@ function buildDecision(s: State, ctx: any): Decision {
 		turnsError,
 		turnsPath: turnsFile,
 		cotMode,
+		cotTag: hit.cotTag,
 		prompt,
 		source: session ? "session" : hit.ruleIndex < 0 ? "default" : `rule ${hit.ruleIndex + 1}`,
 		inherit: config.inherit,
@@ -351,6 +355,7 @@ function injectTurns(s: State, ctx: any, current: Decision, messages: any[], nex
 		api: ctx?.model?.api,
 		model: ctx?.model?.id,
 		cotMode: current.cotMode,
+		cotTag: current.cotTag,
 	});
 	// Two points, so a pasted message that happens to match one fabricated one does not pass for a
 	// block that is already there.
@@ -502,6 +507,10 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// remembering a mode would silently switch the model to the default prompt file.
 	const applied = resolve(parsed.config, ctx?.model);
 	const carried = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].prompt : undefined;
+	// The channel is carried the same way: a rule that pinned `content` or its own tag keeps it, and a
+	// rule that left the key absent still inherits the config level.
+	const carriedCot = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cot : undefined;
+	const carriedCotTag = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cotTag : undefined;
 	// The turns value the model resolves, written even when it is null: an absent key would inherit a
 	// config-level default and turn injection back on.
 	const carriedTurns = applied.turns;
@@ -522,9 +531,20 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 			...updated,
 			mode: next,
 			...(updated.prompt === undefined && carried ? { prompt: carried } : {}),
+			...(updated.cot === undefined && carriedCot ? { cot: carriedCot } : {}),
+			...(updated.cotTag === undefined && carriedCotTag ? { cotTag: carriedCotTag } : {}),
 			...(updated.turns === undefined ? { turns: carriedTurns } : {}),
 		});
-	} else rules.unshift({ provider, model: id, mode: next, ...(carried ? { prompt: carried } : {}), turns: carriedTurns });
+	} else
+		rules.unshift({
+			provider,
+			model: id,
+			mode: next,
+			...(carried ? { prompt: carried } : {}),
+			...(carriedCot ? { cot: carriedCot } : {}),
+			...(carriedCotTag ? { cotTag: carriedCotTag } : {}),
+			turns: carriedTurns,
+		});
 	const out = {
 		...data,
 		default: data.default ?? "normal",

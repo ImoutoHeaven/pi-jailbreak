@@ -63,6 +63,23 @@ holding the config file.
 }
 ```
 
+`cot` decides the channel the fabricated chain of thought travels in, and a rule's own value wins
+over the config-level one. `reasoning_content` is the default. `content` fences the cot in
+`<think>` tags at the head of the assistant reply, and every api that cannot replay a reasoning
+field uses it whatever the config says.
+
+`cotTag` names the tag that fences it. It defaults to `think`, and either spelling of one
+tag is the same tag: `think` and `<think>` both write `<think>` and `</think>`. A rule's own
+value wins over the config-level one.
+
+```json
+{
+	"cot": "reasoning_content",
+	"cotTag": "think",
+	"rules": [{ "provider": "CLIProxy-Chat", "model": "glm-*", "mode": "jailbreak", "cot": "content", "cotTag": "reasoning" }]
+}
+```
+
 `inherit` decides what a session hands to the processes it starts: `keyed` (the same model only),
 `tree` (every model, in this process and in the ones it starts), or `none` (nothing, and inherited
 values are dropped).
@@ -174,8 +191,8 @@ assistant turn nobody answered.
 The block is spliced before the first message that is not a system message, so it lands after the
 prompt and after a compaction summary, and the leading system message moves to index 0 with it. It
 is rebuilt from the file on every request, so the transcript records nothing: a model switch, a
-fork, a reload or a new session leaves nothing to clean up. The bytes depend on the file and the
-model alone, so the block stays inside the provider's prompt cache.
+fork, a reload or a new session leaves nothing to clean up. The bytes depend on the file, the model,
+and the resolved `cot` and `cotTag`, so the block stays inside the provider's prompt cache.
 
 The last item decides what the model reads immediately before the real request. `assistant` closes
 the block with a reply, and the request follows as a new turn. `result` closes it with tool output,
@@ -183,10 +200,13 @@ which is the shape to use when the fabricated turn carries a gate ruling. `user`
 unanswered turn, which Anthropic combines with the real request and the OpenAI-compatible apis send
 as written.
 
-The fabricated chain of thought travels in `reasoning_content` on `openai-completions`, the field
-that adapter writes a thinking block to. Every other api receives it as leading text, and the
-extension says so once per session, because `openai-responses` parses any thinking signature it is
-given and Anthropic turns a signature-less block into text on its own.
+The fabricated chain of thought travels in the channel `cot` selects. `reasoning_content`, the
+default, puts it in the field the OpenAI-compatible adapter writes a thinking block to. `content`
+puts it at the head of the assistant reply, fenced in `<think>` tags, so the turn reads as reasoning
+the assistant wrote down followed by what it said. `content` is the channel an api without a
+replayable reasoning field gets: `openai-responses` parses any thinking signature it is given, and
+Anthropic turns a signature-less block into text on its own. The extension reports the content
+channel once per session.
 
 A file that does not load injects nothing, reports once, and leaves the prompt text in force. The
 footer shows `JailBreak !` while a configured block is missing, and `/jailbreak` names the file and

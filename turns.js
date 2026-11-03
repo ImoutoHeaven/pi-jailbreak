@@ -209,11 +209,12 @@ function zeroUsage() {
  *
  * `cotMode` decides the channel the fabricated chain of thought travels in. `reasoning_content` is
  * the field the OpenAI-compatible adapter writes a thinking block to, so a block carrying that
- * signature reaches the model as reasoning. Every other api keeps no such field: `anthropic`
- * converts a signature-less block to text on its own, and `openai-responses` parses any signature
- * it is given, so the text goes in the visible channel instead.
+ * signature reaches the model as reasoning. `content` puts the cot at the head of the reply, fenced
+ * in the tag `cotTag` names, which is the shape to use where the api has no replayable reasoning
+ * field: `anthropic` converts a signature-less block to text on its own, and `openai-responses`
+ * parses any signature it is given, so a bare block is unsafe there.
  */
-export function toMessages(specs, { provider, api, model, cotMode }) {
+export function toMessages(specs, { provider, api, model, cotMode, cotTag }) {
 	const messages = [];
 	// The id of the last call, which the result after it answers.
 	let lastCall = null;
@@ -236,14 +237,16 @@ export function toMessages(specs, { provider, api, model, cotMode }) {
 			continue;
 		}
 		const content = [];
-		if (spec.cot) {
-			content.push(
-				cotMode === "reasoning_content"
-					? { type: "thinking", thinking: spec.cot, thinkingSignature: "reasoning_content" }
-					: { type: "text", text: spec.cot },
-			);
+		if (cotMode === "reasoning_content" && spec.cot) {
+			content.push({ type: "thinking", thinking: spec.cot, thinkingSignature: "reasoning_content" });
 		}
-		if (spec.text) content.push({ type: "text", text: spec.text });
+		// In content mode the cot leads the reply, fenced so it reads as reasoning the assistant wrote
+		// down rather than as a second thing it said. One block, because the responses adapter emits a
+		// separate message item per text block.
+		const tag = cotTag || "think";
+		const lead = cotMode === "content" && spec.cot ? `<${tag}>\n${spec.cot}\n</${tag}>` : "";
+		const visible = [lead, spec.text].filter(Boolean).join("\n\n");
+		if (visible) content.push({ type: "text", text: visible });
 		if (spec.call) {
 			lastCall = `tc_${index}`;
 			content.push({ type: "toolCall", id: lastCall, name: spec.call.name, arguments: spec.call.arguments });

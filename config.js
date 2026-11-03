@@ -21,10 +21,24 @@ export const DEFAULT_PROMPT = "prompt.md";
 export const DEFAULT_TURNS = "turn0.yml";
 export const MODES = Object.freeze(["jailbreak", "normal"]);
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
+/** Where the fabricated chain of thought travels: the reasoning field, or fenced at the head of the reply. */
+export const COTS = Object.freeze(["reasoning_content", "content"]);
+export const DEFAULT_COT = "reasoning_content";
+/** The tag that fences the cot in content mode. `<think>` and `think` name the same tag. */
+export const DEFAULT_COT_TAG = "think";
+
+/** A tag name from either spelling, or null when the value is not one. A bracketed value has to be
+ * exactly one tag, so a stray `>` or a second pair is rejected rather than trimmed away. */
+export function tagName(value) {
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	const name = /^<([^<>]+)>$/.exec(trimmed)?.[1] ?? trimmed;
+	return /^[A-Za-z][A-Za-z0-9_-]*$/.test(name) ? name : null;
+}
 
 /** What a session uses when no config file loads. */
 export function emptyConfig(dir) {
-	return { default: "normal", inherit: "keyed", prompt: DEFAULT_PROMPT, turns: DEFAULT_TURNS, rules: [], dir, path: null };
+	return { default: "normal", inherit: "keyed", prompt: DEFAULT_PROMPT, turns: DEFAULT_TURNS, cot: DEFAULT_COT, cotTag: DEFAULT_COT_TAG, rules: [], dir, path: null };
 }
 
 /**
@@ -98,6 +112,13 @@ export function parseConfig(text, dir) {
 	// config turns it off with `null`.
 	const turns = data.turns === undefined ? DEFAULT_TURNS : data.turns;
 	if (!turnsValue(turns)) return { error: "turns must be a non-empty string or null" };
+	// An api string says nothing about whether the upstream replays a reasoning block, so the channel
+	// is a config value: a rule pins it when the default is wrong for that model.
+	const cot = data.cot ?? DEFAULT_COT;
+	if (!COTS.includes(cot)) return { error: `cot must be ${COTS.join(" or ")}` };
+	// The tag names the fence content mode writes, and either spelling of it is the same tag.
+	const cotTag = data.cotTag === undefined ? DEFAULT_COT_TAG : tagName(data.cotTag);
+	if (!cotTag) return { error: "cotTag must be a tag name, such as think or <think>" };
 	const rules = data.rules ?? [];
 	if (!Array.isArray(rules)) return { error: "rules must be an array" };
 	const out = [];
@@ -112,9 +133,12 @@ export function parseConfig(text, dir) {
 		// A rule keeps `undefined` apart from `null`: the first inherits the config-level value, the
 		// second turns injection off even when the config names a file.
 		if (rule.turns !== undefined && !turnsValue(rule.turns)) return { error: `${at}: turns must be a non-empty string or null` };
-		out.push({ mode: rule.mode, provider: rule.provider, model: rule.model, prompt: rule.prompt, turns: rule.turns });
+		if (rule.cot !== undefined && !COTS.includes(rule.cot)) return { error: `${at}: cot must be ${COTS.join(" or ")}` };
+		const ruleTag = rule.cotTag === undefined ? undefined : tagName(rule.cotTag);
+		if (rule.cotTag !== undefined && !ruleTag) return { error: `${at}: cotTag must be a tag name, such as think or <think>` };
+		out.push({ mode: rule.mode, provider: rule.provider, model: rule.model, prompt: rule.prompt, turns: rule.turns, cot: rule.cot, cotTag: ruleTag });
 	}
-	return { config: { default: mode, inherit, prompt, turns, rules: out, dir, path: null } };
+	return { config: { default: mode, inherit, prompt, turns, cot, cotTag, rules: out, dir, path: null } };
 }
 
 /** The first rule that matches, or the default. `ruleIndex` is -1 for the default. */
@@ -125,9 +149,9 @@ export function resolve(config, model) {
 		const rule = config.rules[ruleIndex];
 		if (rule.provider !== undefined && !globMatch(rule.provider, provider)) continue;
 		if (rule.model !== undefined && !globMatch(rule.model, id)) continue;
-		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, turns: rule.turns === undefined ? config.turns : rule.turns, ruleIndex };
+		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, turns: rule.turns === undefined ? config.turns : rule.turns, cot: rule.cot ?? config.cot, cotTag: rule.cotTag ?? config.cotTag, ruleIndex };
 	}
-	return { mode: config.default, prompt: config.prompt, turns: config.turns, ruleIndex: -1 };
+	return { mode: config.default, prompt: config.prompt, turns: config.turns, cot: config.cot, cotTag: config.cotTag, ruleIndex: -1 };
 }
 
 /**

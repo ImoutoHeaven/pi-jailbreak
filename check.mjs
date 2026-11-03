@@ -243,30 +243,40 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "normal",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
+		cot: "reasoning_content",
+		cotTag: "think",
 		ruleIndex: 0,
 	}, "the first match wins");
 	assert.deepEqual(resolveMode(config, { provider: "CLIProxy-Chat", id: "deepseek-pro" }), {
 		mode: "jailbreak",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
+		cot: "reasoning_content",
+		cotTag: "think",
 		ruleIndex: 1,
 	});
 	assert.deepEqual(resolveMode(config, { provider: "zhipu", id: "glm-5.3" }), {
 		mode: "jailbreak",
 		prompt: "prompts/glm.md",
 		turns: DEFAULT_TURNS,
+		cot: "reasoning_content",
+		cotTag: "think",
 		ruleIndex: 2,
 	}, "a missing provider matches any provider");
 	assert.deepEqual(resolveMode(config, { provider: "deepseek", id: "anything" }), {
 		mode: "jailbreak",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
+		cot: "reasoning_content",
+		cotTag: "think",
 		ruleIndex: 3,
 	}, "a missing model matches any model");
 	assert.deepEqual(resolveMode(config, { provider: "openai", id: "gpt-5" }), {
 		mode: "normal",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
+		cot: "reasoning_content",
+		cotTag: "think",
 		ruleIndex: -1,
 	}, "no match falls back to the default");
 	assert.equal(promptPath(config, "prompts/glm.md"), join("/cfg", "prompts", "glm.md"));
@@ -277,6 +287,24 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		"the default name always means the text that ships with the extension",
 	);
 }
+
+// The tag is configurable, and both spellings of one tag resolve to the same name.
+{
+	const bare = parseConfig(JSON.stringify({ rules: [] }), "/cfg");
+	assert.equal(bare.config.cotTag, "think", "the fence tag defaults to think");
+	const wrapped = parseConfig(JSON.stringify({ cotTag: "<think>" }), "/cfg");
+	assert.equal(wrapped.config.cotTag, "think", "angle brackets are not part of the name");
+	const named = parseConfig(JSON.stringify({ cotTag: " analysis ", rules: [{ mode: "jailbreak", provider: "a", model: "b", cotTag: "<reasoning>" }] }), "/cfg");
+	assert.equal(named.config.cotTag, "analysis", "a config-level tag is trimmed");
+	assert.equal(named.config.rules[0].cotTag, "reasoning", "a rule tag keeps the same normalization");
+	assert.equal(resolveMode(named.config, { provider: "x", id: "y" }).cotTag, "analysis", "the config value reaches a model no rule names");
+	assert.equal(resolveMode(named.config, { provider: "a", id: "b" }).cotTag, "reasoning", "a rule tag wins over the config value");
+	for (const bad of ["", "<>", "a b", "1tag", "<a><b>", "tag>"] ) {
+		assert.ok(parseConfig(JSON.stringify({ cotTag: bad }), "/cfg").error, `cotTag rejects ${JSON.stringify(bad)}`);
+		assert.ok(parseConfig(JSON.stringify({ rules: [{ mode: "jailbreak", cotTag: bad }] }), "/cfg").error, `a rule rejects ${JSON.stringify(bad)}`);
+	}
+}
+console.log("ok cot tag");
 
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-jailbreak-config-"));
@@ -494,10 +522,14 @@ console.log("ok turns cache");
 	assert.deepEqual(reasoning[2].usage, reasoning[1].usage, "every fabricated message carries the zero record");
 	assert.equal(reasoning[0].timestamp, 0);
 
-	const visible = toMessages(specs, { ...options, api: "anthropic-messages", cotMode: "text" });
-	assert.equal(visible[1].content[0].type, "text", "cotMode text folds the cot into the visible channel");
-	assert.equal(visible[1].content[0].text, "think");
+	const visible = toMessages(specs, { ...options, api: "anthropic-messages", cotMode: "content" });
+	assert.equal(visible[1].content[0].type, "text", "cotMode content folds the cot into the visible channel");
+	assert.equal(visible[1].content[0].text, "<think>\nthink\n</think>\n\nok", "fenced at the head of the reply");
 	assert.equal(visible[1].content.some((block) => block.type === "thinking"), false, "and builds no thinking block");
+	assert.equal(visible[1].content.length, 2, "the cot and the reply are one text block, plus the call");
+
+	const custom = toMessages(specs, { ...options, cotMode: "content", cotTag: "analysis" });
+	assert.equal(custom[1].content[0].text, "<analysis>\nthink\n</analysis>\n\nok", "the fence tag follows the config");
 }
 console.log("ok turns messages");
 
@@ -1000,7 +1032,7 @@ console.log("ok turns trailing shape");
 }
 console.log("ok turns nowhere to splice");
 
-// The api decides the channel the fabricated cot travels in, and the text channel is reported once.
+// The configured channel decides where the fabricated cot travels, and content mode is reported once.
 {
 	const reasoning = { provider: "deepseek", id: "deepseek-chat", api: "openai-completions" };
 	const plain = { provider: "anthropic", id: "claude", api: "anthropic-messages" };
@@ -1014,17 +1046,26 @@ console.log("ok turns nowhere to splice");
 	);
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: reasoning, ui: u });
-	assert.equal(u.notes.some(([, text]) => /sent as text/.test(text)), false, "the reasoning channel is not reported");
+	assert.equal(u.notes.some(([, text]) => /sent inside content/.test(text)), false, "the reasoning channel is not reported");
 	const block = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u }).messages;
 	assert.equal(block.at(-2).content[0].type, "thinking");
 	assert.equal(block.at(-2).content[0].thinkingSignature, "reasoning_content");
 
 	const u2 = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: plain, ui: u2 });
-	assert.ok(u2.notes.some(([type, text]) => type === "info" && /sent as text/.test(text)), "the text channel is reported once");
+	assert.ok(u2.notes.some(([type, text]) => type === "info" && /sent inside content/.test(text)), "the content channel is reported once");
 	const visible = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: plain, ui: u2 }).messages;
-	assert.equal(visible.at(-2).content[0].type, "text", "cotMode text produces no thinking block");
-	assert.equal(visible.at(-2).content[0].text, "think");
+	assert.equal(visible.at(-2).content[0].type, "text", "cotMode content produces no thinking block");
+	assert.equal(visible.at(-2).content[0].text, "<think>\nthink\n</think>\n\nok");
+
+	// A rule pins content mode on an api that could have carried reasoning.
+	writeConfig([{ provider: "deepseek", model: "deepseek-*", mode: "jailbreak", cot: "content" }], { turns: turnFile });
+	const u3 = ui();
+	await before({ systemPromptOptions: { sections: {} } }, { model: reasoning, ui: u3 });
+	assert.ok(u3.notes.some(([type, text]) => type === "info" && /sent inside content/.test(text)), "a pinned content channel is reported");
+	const pinned = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u3 }).messages;
+	assert.equal(pinned.at(-2).content[0].type, "text", "the pinned channel folds the cot into content");
+	assert.equal(pinned.at(-2).content[0].text, "<think>\nthink\n</think>\n\nok");
 }
 console.log("ok turns cot channel");
 
@@ -1270,6 +1311,52 @@ console.log("ok remember moves a shadowed rule");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
 }
 console.log("ok remember keeps the prompt in force");
+
+// Remembering carries a pinned channel, or the exact rule it writes would silently drop the channel
+// and the tag the wildcard rule gave the model.
+{
+	const command = commands.get("jailbreak");
+	const resolved = () => resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, JAIL);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cot: "content", cotTag: "reasoning" }]);
+	await command.handler("remember on", { model: JAIL, ui: ui() });
+	let data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].cot, "content", "the pinned channel is carried to the rule that takes over");
+	assert.equal(data.rules[0].cotTag, "reasoning", "and so is the tag");
+	assert.equal(resolved().cot, "content");
+	assert.equal(resolved().cotTag, "reasoning");
+
+	// A wildcard that leaves both keys absent still lets the new rule inherit the config level.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }], { cot: "content" });
+	await command.handler("remember on", { model: JAIL, ui: ui() });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].cot, undefined, "an absent key stays absent, so the config level still applies");
+	assert.equal(resolved().cot, "content");
+
+	// The update branch: an exact rule behind the wildcard moves up and takes the channel with it.
+	writeConfig([
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cot: "content", cotTag: "reasoning" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "normal" },
+	]);
+	await command.handler("remember on", { model: JAIL, ui: ui() });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules.length, 2, "the exact rule is moved, not duplicated");
+	assert.equal(data.rules[0].cot, "content", "the moved rule carries the channel the wildcard gave it");
+	assert.equal(data.rules[0].cotTag, "reasoning", "and the tag");
+	assert.equal(resolved().cot, "content");
+	assert.equal(resolved().cotTag, "reasoning");
+
+	// An exact rule that pins its own channel keeps it.
+	writeConfig([
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cot: "content", cotTag: "reasoning" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "normal", cot: "reasoning_content", cotTag: "analysis" },
+	]);
+	await command.handler("remember on", { model: JAIL, ui: ui() });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].cot, "reasoning_content", "a rule's own channel is not overwritten");
+	assert.equal(data.rules[0].cotTag, "analysis");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
+}
+console.log("ok remember keeps the cot channel in force");
 
 // Remembering carries the turns value the model resolves, including an explicit null: an absent key
 // would inherit a config-level default and turn injection back on.
