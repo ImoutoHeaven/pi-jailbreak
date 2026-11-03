@@ -506,8 +506,14 @@ console.log("ok turns messages");
 // ---------------------------------------------------------------------------
 const promptText = raw.trim();
 const PREAMBLE = "preamble";
-const STOCK_PREAMBLE =
+const STOCK_PREAMBLE_140 =
 	"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+const STOCK_PREAMBLE_150 =
+	"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+// Every wording pi has shipped. The extension withholds each of them, so both cases run below.
+const STOCK_PREAMBLES = [STOCK_PREAMBLE_140, STOCK_PREAMBLE_150];
+// The wording the fixtures below use: 1.5.0's, the newest known.
+const STOCK_PREAMBLE = STOCK_PREAMBLE_150;
 
 const tempDir = mkdtempSync(join(tmpdir(), "pi-jailbreak-"));
 process.on("exit", () => rmSync(tempDir, { recursive: true, force: true }));
@@ -666,6 +672,31 @@ console.log("ok decision follows the model");
 	assert.equal(guardRun([]), undefined, "an empty transcript is a no-op");
 }
 console.log("ok guard places the text");
+
+// Pi reworded the stock identity sentence in 1.5.0. Every known wording is withheld, so a session on
+// either release leaves the persona at the head of the prompt uncontradicted.
+{
+	await run(JAIL);
+	for (const stock of STOCK_PREAMBLES) {
+		const label = `the ${stock.length}-character sentence`;
+		const messages = [head("", { [PREAMBLE]: stock, cwd: "C" }), turn];
+		const result = guardRun(messages);
+		assert.equal(result.messages[0].content, promptText, `the text leads ahead of ${label}`);
+		assert.ok(!Object.hasOwn(result.messages[0].sections, PREAMBLE), `${label} is withheld`);
+		assert.equal(result.messages[0].sections.cwd, "C", "every other section survives");
+		const later = [head(""), { role: "system", content: "", sections: { [PREAMBLE]: stock, cwd: "C" }, timestamp: 2 }, turn];
+		const hoisted = guardRun(later);
+		assert.ok(!Object.hasOwn(hoisted.messages[1].sections, PREAMBLE), `${label} goes from a later system message too`);
+		assert.equal(hoisted.messages[1].sections.cwd, "C", "and the sections beside it stay");
+		const first = guardRun([head("", { [PREAMBLE]: stock }), turn]);
+		assert.equal(guardRun(first.messages), undefined, `a request cleaned of ${label} is aligned on the next pass`);
+	}
+	// The comparison is exact, so an edited copy of a stock sentence is the user's own text.
+	const near = `${STOCK_PREAMBLE_150} Extra.`;
+	assert.equal(guardRun([head("", { [PREAMBLE]: near }), turn]).messages[0].sections[PREAMBLE], near, "an edited copy of a stock sentence stays");
+	assert.equal(guardRun([head("", { [PREAMBLE]: STOCK_PREAMBLE_140.slice(0, -1) }), turn]).messages[0].sections[PREAMBLE], STOCK_PREAMBLE_140.slice(0, -1), "a truncated one stays too");
+}
+console.log("ok every known stock preamble is withheld");
 
 {
 	await run(JAIL);
@@ -1607,8 +1638,33 @@ function resolvePiPackage() {
 	return found[0];
 }
 
-// Drift guard: the exact stock preamble is what gets withheld, so a pi release that reworded it
-// would silently stop withholding anything. Fail loudly instead, across every installed version.
+// Drift guard: the exact stock preamble is what gets withheld, so a pi release that reworded it to a
+// wording the extension does not know would silently stop withholding anything. Installed releases
+// sit side by side and do not share one wording, so every file has to assign one of the known ones.
+/**
+ * Assert that one release assigns a stock preamble the extension knows. The literal it assigns is
+ * read and decoded, not any occurrence in the file, so a release that rewords the sentence while an
+ * old wording survives as a comment still fails. A file whose assignment the pattern does not
+ * recognize fails too: asking a human is better than passing quietly.
+ */
+function assertPreambleKnown(file) {
+	const pattern = /promptSections(?:\.preamble|\[\s*"preamble"\s*\])\s*=\s*"((?:[^"\\]|\\.)*)"/g;
+	const assigned = [...readFileSync(file, "utf8").matchAll(pattern)].map((match) => {
+		// The Set holds decoded text; an escape a bundler added is still the same sentence.
+		try {
+			return JSON.parse(`"${match[1]}"`);
+		} catch {
+			return match[1];
+		}
+	});
+	assert.ok(assigned.length > 0, `no preamble assignment in ${file}`);
+	assert.deepEqual(
+		assigned.filter((value) => !STOCK_PREAMBLES.includes(value)),
+		[],
+		`a stock preamble the extension does not know in ${file}`,
+	);
+}
+
 {
 	const releases = join(homedir(), ".pi", "agent", "install", "releases");
 	const files = existsSync(releases)
@@ -1622,11 +1678,53 @@ function resolvePiPackage() {
 	assert.ok(files.length > 0, `no installed pi release to check the stock preamble against (${releases})`);
 	const current = join(resolvePiPackage(), "dist", "core", "system-prompt.js");
 	assert.ok(existsSync(current), `the resolved pi package has no system prompt: ${current}`);
-	assert.ok(readFileSync(current, "utf8").includes(STOCK_PREAMBLE), `the stock preamble changed in ${current}`);
-	for (const file of files) {
-		assert.ok(readFileSync(file, "utf8").includes(STOCK_PREAMBLE), `the stock preamble changed in ${file}`);
-	}
+	assertPreambleKnown(current);
+	for (const file of files) assertPreambleKnown(file);
 }
+
+// The guard's own failure modes, so it cannot go quiet: an unknown assigned value, an old wording
+// that only survives as a comment or a dead branch, a file that assigns no recognizable literal,
+// and the spellings a known value legitimately takes.
+{
+	const write = (name, body) => {
+		const file = join(tempDir, name);
+		writeFileSync(file, body);
+		return file;
+	};
+	const unknown = write("preamble-unknown.js", 'promptSections.preamble = "You are a brand new assistant.";');
+	const commented = write(
+		"preamble-commented.js",
+		`// ${STOCK_PREAMBLE_140}\npromptSections.preamble = "You are a brand new assistant.";`,
+	);
+	const dead = write(
+		"preamble-dead.js",
+		`if (false) { promptSections.preamble = "${STOCK_PREAMBLE_140}"; }\npromptSections.preamble = "You are a brand new assistant.";`,
+	);
+	const missing = write("preamble-missing.js", "promptSections.preamble = customPrompt;");
+	const escapes = STOCK_PREAMBLE_150.replace(/\.$/, "\\u002e");
+	assert.throws(() => assertPreambleKnown(unknown), /a stock preamble the extension does not know/, "an unknown wording fails");
+	assert.throws(
+		() => assertPreambleKnown(commented),
+		/a stock preamble the extension does not know/,
+		"an old wording in a comment does not satisfy the guard",
+	);
+	assert.throws(
+		() => assertPreambleKnown(dead),
+		/a stock preamble the extension does not know/,
+		"an unknown assignment beside a known dead one fails",
+	);
+	assert.throws(() => assertPreambleKnown(missing), /no preamble assignment/, "a file that assigns no literal fails loudly");
+	assert.doesNotThrow(() => assertPreambleKnown(write("preamble-140.js", `promptSections.preamble = "${STOCK_PREAMBLE_140}";`)), "a known wording passes");
+	assert.doesNotThrow(
+		() => assertPreambleKnown(write("preamble-150.js", `promptSections["preamble"] = "${STOCK_PREAMBLE_150}";`)),
+		"the bracketed form passes",
+	);
+	assert.doesNotThrow(
+		() => assertPreambleKnown(write("preamble-escaped.js", `promptSections.preamble = "${escapes}";`)),
+		"an escaped literal is decoded before comparing",
+	);
+}
+console.log("ok drift guard fails on an unknown preamble");
 
 {
 	const validation = join(dirname(resolvePiPackage()), "pi-ai", "dist", "utils", "validation.js");

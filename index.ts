@@ -47,11 +47,17 @@ import { registerCommands } from "./commands.ts";
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
 // The raw, untagged section holding pi's stock identity sentence.
 const PREAMBLE = "preamble";
-// Pi's stock preamble, byte for byte (dist/core/system-prompt.js, identical in 1.3.0 and 1.4.0).
-// Only this exact value is withheld: a copied-and-edited default prompt is the user's own text and
-// stays, and an unrelated custom system prompt lives in the same section.
-const STOCK_PREAMBLE =
-	"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+// Pi's stock preamble, byte for byte (dist/core/system-prompt.js), for every wording pi has shipped.
+// Pi reworded it in 1.5.0, so a set rather than one string: an installed release matches whichever
+// entry it ships, and the check's drift guard fails when a release ships a wording not listed here.
+// Only these exact values are withheld: a copied-and-edited default prompt is the user's own text
+// and stays, and an unrelated custom system prompt lives in the same section.
+const STOCK_PREAMBLES = new Set([
+	// 1.3.0 through 1.4.0.
+	"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.",
+	// 1.5.0.
+	"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.",
+]);
 
 /**
  * A plain JSON Schema, not a typebox builder: a typebox schema is JSON Schema, so pi sends and
@@ -237,9 +243,9 @@ function leadingSystem(messages: any[]) {
 	return -1;
 }
 
-/** Whether a section value is pi's stock preamble, the only one the text replaces. */
+/** Whether a section value is one of pi's stock preambles, the only values the text replaces. */
 function isStockPreamble(value: any) {
-	return value === STOCK_PREAMBLE;
+	return STOCK_PREAMBLES.has(value);
 }
 
 /** A copy of `message` without `name` in its sections, dropping `sections` when it empties. */

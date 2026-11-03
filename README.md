@@ -128,10 +128,12 @@ Pi renders the prompt from, and the position where the text leads the request in
 earlier entry. A transcript that carries no system message has nowhere to put the text.
 
 While the text is in force pi's stock identity sentence is withheld: the same guard removes the
-`preamble` section from every system message whose value is exactly the 169-character sentence Pi
-ships, because that sentence contradicts the persona at the front of the same prompt. The comparison
-is exact, so any other value in `preamble` stays whole. The sentence returns the moment the text is
-not in force. Both are request-scoped, and neither is recorded in the transcript.
+`preamble` section from every system message whose value is one of the stock sentences Pi ships,
+because that sentence contradicts the persona at the front of the same prompt. Pi reworded it in
+1.5.0, so both are known: the 169-character sentence of 1.3.0 through 1.4.0 and the 126-character
+sentence of 1.5.0. The comparison is exact, so any other value in `preamble` stays whole.
+The sentence returns the moment the text is not in force. Both are request-scoped, and neither is
+recorded in the transcript.
 
 The extension makes one decision per run, and the guard reuses it until the model key or the session
 override changes. A steady conversation parses no config and reads no file, and sends byte-identical prompts
@@ -223,9 +225,13 @@ node check.mjs
 
 `node check.mjs` drives the registered handlers against a temp config. It pins the resolver, the
 channel payload, the guard's placement and preamble withholding, the config write, the gate rulings,
-the turn file's parse and injection, and the `prompt.md` invariants. A drift guard fails when an
-installed Pi release rewords the stock preamble, or when no release is installed at all; set
-`PI_PKG` to point the check at a pi package elsewhere.
+the turn file's parse and injection, and the `prompt.md` invariants. A drift guard reads the literal
+value each installed Pi release assigns to its preamble and fails when that value is not one the
+extension knows, or when no release is installed at all. It reads the assignment, not any occurrence
+in the file, so a release that rewords the sentence while an old wording survives as a comment still
+fails; it decodes the literal before comparing, and a file that assigns no recognizable literal fails
+rather than passes. Releases that sit side by side on different wordings both pass. Set `PI_PKG` to
+point the check at a pi package elsewhere.
 
 ## Attribution
 
