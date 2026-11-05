@@ -87,22 +87,36 @@ values are dropped).
 ## Precedence
 
 ```
-/jailbreak on|off   >   inherited value   >   config rule   >   default
+session setting   >   config rule   >   config level   >   default
+/jailbreak on|off >   inherited value   >   the config-resolved answer
 ```
 
-A session override lasts as long as the process, including `/new` and `/reload`, until
-`/jailbreak reset`. Nothing is written to disk unless `remember` asks for it. Each loaded instance
-keeps its own answer, decision, delivery record and gate activation, so two sessions in one process
-do not share them, and the mode the process set is what a new instance reads.
+The two lines are orthogonal: the settings decide what a jailbreak session sends, and `on`/`off`
+decide whether that answer is in force at all. `off` keeps the settings stored and inert, and
+`reset` drops both.
+
+An answer lasts as long as the process, including `/new` and `/reload`, until `/jailbreak reset`.
+Nothing is written to disk unless `remember` asks for it. Each loaded instance keeps its own answer,
+decision, delivery record and gate activation, so two sessions in one process do not share them, and
+the mode the process set is what a new instance reads. A model switch keeps the settings stored
+without applying them until the next command re-keys the answer to the live model, mode included.
+Under an effective
+`tree`, the first command creates the answer every model in the tree shares, so its mode is the one
+the live model resolves at that moment.
 
 ## Commands
 
 | Command | Effect |
 |---|---|
-| `/jailbreak` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the prompt file, the config file, and the inherited value if there is one |
-| `/jailbreak on` / `off` / `toggle` | Set the mode for this session |
-| `/jailbreak reset` | Drop the session answer, so the config decides again |
-| `/jailbreak remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, keep the prompt file that model already resolves to, and apply it now |
+| `/jailbreak` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the session settings it carries, the prompt file, the config file, and the inherited value if there is one |
+| `/jailbreak on` / `off` / `toggle` | Set the mode for this session, keeping its settings |
+| `/jailbreak reset` | Drop the session answer and its settings, so the config decides again |
+| `/jailbreak prompt <path>` / `prompt default` | Point the session at another prompt file, or back at the config |
+| `/jailbreak turns <path>` / `turns off` / `turns default` | Inject another turn file, turn the block off, or take the config value. `./off` names a file literally called `off` |
+| `/jailbreak cot reasoning_content\|content` / `cot default` | The channel the fabricated cot travels in |
+| `/jailbreak cotTag <tag>` / `cotTag default` | The tag that fences the cot in content mode; `think` and ` thinking` are one tag |
+| `/jailbreak inherit keyed\|tree\|none` / `inherit default` | What this session hands to the processes it starts |
+| `/jailbreak remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, carry the session setting or else the file that model already resolves to, and apply it now |
 
 The footer shows `JailBreak on` while the text is in force, `JailBreak off` while the mode is normal,
 and `JailBreak !` when the mode is jailbreak and the request carried nothing: the prompt file is
@@ -115,8 +129,11 @@ placed says so at once instead of showing on.
 A subagent is a Pi process launched with the parent's environment, so the parent writes its answer
 into `PI_JAILBREAK` and the child reads it. Neither extension knows the other exists.
 
-The value is JSON: `{"m":"on","k":"CLIProxy-Chat/glm-5.3","p":1234}`. `m` is the mode, `k` is the
-model key or `*`, `p` is the publisher pid. A child accepts it when `p` is its parent or itself, and
+The value is JSON: `{"m":"on","k":"CLIProxy-Chat/glm-5.3","p":1234}`, and an answer that carries
+session settings adds `"s"`, for example `"s":{"prompt":"/abs/alt.md","turns":null}`. `m` is the
+mode, `k` is the model key or `*`, `p` is the publisher pid, and `s` is the settings, absent when
+there are none. A malformed `s` rejects the whole payload, so a child resolves from the config rather
+than from half an answer. A child accepts it when `p` is its parent or itself, and
 rewrites it with its own pid so the next level reads the same answer, and narrows a `*` key to its
 own model once the config asks for `keyed`. Any other value, including one
 exported from a shell, is discarded and replaced.

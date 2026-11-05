@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import def from "./index.ts";
@@ -361,10 +361,13 @@ console.log("ok turns config");
 {
 	const shipped = loadTurns(join(PACKAGE_DIR, DEFAULT_TURNS));
 	assert.equal(shipped.error, undefined, `the shipped ${DEFAULT_TURNS} parses: ${shipped.error}`);
-	assert.deepEqual(shipped.specs.map((spec) => spec.role), ["user", "assistant", "user", "assistant"]);
+	assert.deepEqual(shipped.specs.map((spec) => spec.role), ["user", "assistant", "user", "assistant", "user", "assistant"]);
 	assert.ok(shipped.specs[0].text.includes("你是谁"), "the first turn asks who the model is");
 	assert.ok(shipped.specs[3].text.includes("ask_authorize_gate"), "the second turn answers the gate question");
-	assert.ok(shipped.specs[1].cot.trim().length > 0, "each fabricated reply carries its reasoning");
+	assert.ok(shipped.specs[4].text.includes("gate"), "the third turn asks when the gate is called");
+	for (const spec of shipped.specs.filter((spec) => spec.role === "assistant")) {
+		assert.ok(spec.cot.trim().length > 0, "each fabricated reply carries its reasoning");
+	}
 }
 console.log("ok shipped turns");
 
@@ -380,8 +383,8 @@ console.log("ok config path");
 {
 	const pid = process.pid;
 	const ppid = process.ppid;
-	assert.deepEqual(decode(encode({ mode: "on", key: "A/B" }, ppid), { ppid, pid }), { mode: "on", key: "A/B", self: false });
-	assert.deepEqual(decode(encode({ mode: "off", key: "*" }, pid), { ppid, pid }), { mode: "off", key: "*", self: true });
+	assert.deepEqual(decode(encode({ mode: "on", key: "A/B" }, ppid), { ppid, pid }), { mode: "on", key: "A/B", self: false, settings: {} });
+	assert.deepEqual(decode(encode({ mode: "off", key: "*" }, pid), { ppid, pid }), { mode: "off", key: "*", self: true, settings: {} });
 	assert.equal(decode(encode({ mode: "on", key: "A/B" }, pid + 1), { ppid, pid }), null, "a foreign publisher is rejected");
 	assert.equal(decode("on@A/B", { ppid, pid }), null, "a bare token is not the payload");
 	assert.equal(decode(`{"m":"maybe","k":"*","p":${pid}}`, { ppid, pid }), null);
@@ -923,7 +926,11 @@ const turnsConfig = (extra = {}) =>
 	assert.ok(result?.messages, "the shipped turn file is injected by default");
 	assert.equal(result.messages[1].role, "user");
 	assert.ok(result.messages[1].content[0].text.includes("你是谁"), "the first shipped turn leads the block");
-	assert.ok(result.messages.at(-2).content[0].text.includes("ask_authorize_gate"), "and the gate turn closes it");
+	assert.equal(result.messages.at(-2).role, "assistant", "and the last shipped turn is an assistant reply");
+	assert.ok(
+		result.messages.some((message) => message.role === "assistant" && message.content[0].text.includes("ask_authorize_gate")),
+		"the gate turn is in the block",
+	);
 }
 console.log("ok shipped turns injected by default");
 
@@ -1403,6 +1410,358 @@ console.log("ok remember refuses a broken file");
 	assert.equal(u.notes.at(-1)[1], "jailbreak on (config)");
 }
 console.log("ok reset reports the config mode");
+
+// ---------------------------------------------------------------------------
+// Session settings: prompt, turns, cot, cotTag, inherit
+// ---------------------------------------------------------------------------
+{
+	const command = commands.get("jailbreak");
+	const u = ui();
+	const ctx = { model: JAIL, ui: u };
+	const jail = [{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }];
+	const panel = async (model = JAIL) => {
+		await command.handler("", { model, ui: u });
+		return u.notes.at(-1)[1];
+	};
+	const cwd = process.cwd();
+	const altPrompt = join(tempDir, "alt.md");
+	writeFileSync(altPrompt, "ALT TEXT");
+	const spacedDir = join(tempDir, "dir with space");
+	mkdirSync(spacedDir, { recursive: true });
+	const spacedPrompt = join(spacedDir, "Alt File.md");
+	writeFileSync(spacedPrompt, "SPACED TEXT");
+	const sessionTurns = join(tempDir, "session-turn0.yml");
+	writeFileSync(sessionTurns, "- user: |\n    session first\n- assistant: |\n    ok\n");
+
+	writeConfig(jail);
+	await start({ type: "session_start", reason: "startup" }, {});
+	await command.handler("reset", ctx);
+
+	// The prompt file: an absolute path, the config again, a relative path, and one that is missing.
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	assert.equal(u.notes.at(-1)[1], `prompt ${altPrompt}`, "the receipt names the file");
+	await run(JAIL);
+	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "the guard head is the session file");
+	await command.handler("prompt default", ctx);
+	assert.equal(u.notes.at(-1)[1], "prompt default (config)");
+	await run(JAIL);
+	assert.equal(guardRun([head(""), turn]).messages[0].content, promptText, "default restores the package copy");
+	await command.handler(`prompt ${relative(cwd, altPrompt)}`, ctx);
+	assert.equal(u.notes.at(-1)[1], `prompt ${altPrompt}`, "a relative path is stored absolute");
+	await run(JAIL);
+	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"));
+	await command.handler(`prompt ${join(tempDir, "nope.md")}`, ctx);
+	assert.ok(u.notes.some(([type, text]) => type === "error" && /nope\.md unreadable/.test(text)), "a missing file is reported");
+	const missing = ui();
+	await select({ type: "model_select" }, { model: JAIL, ui: missing });
+	assert.equal(lastStatus(missing), "JailBreak !", "and shows in the footer");
+
+	// A path keeps its spaces and its case.
+	await command.handler(`prompt ${spacedPrompt}`, ctx);
+	assert.equal(u.notes.at(-1)[1], `prompt ${spacedPrompt}`, "the receipt is the value verbatim");
+	await run(JAIL);
+	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("SPACED TEXT"));
+
+	// The turn file: a session file, off, the config value, and a file literally named `off`.
+	await command.handler(`turns ${sessionTurns}`, ctx);
+	await run(JAIL);
+	assert.equal(guardRun([head(""), turn]).messages[1].content[0].text, "session first\n", "the session turn file is injected");
+	await command.handler("turns off", ctx);
+	assert.equal(u.notes.at(-1)[1], "turns off");
+	const off = ui();
+	await before({ systemPromptOptions: {} }, { model: JAIL, ui: off });
+	assert.equal(guardRun([head(""), turn]).messages.length, 2, "turns off injects nothing");
+	assert.notEqual(lastStatus(off), "JailBreak !", "and is not a loss");
+	assert.match(await panel(), /turns=off/, "the panel says the block is off");
+	writeConfig(jail, { turns: sessionTurns });
+	await command.handler("turns default", ctx);
+	assert.equal(u.notes.at(-1)[1], "turns default (config)");
+	await run(JAIL);
+	assert.equal(guardRun([head(""), turn]).messages[1].content[0].text, "session first\n", "default takes the config value");
+	writeFileSync(join(tempDir, "off"), "- user: |\n    off file\n- assistant: |\n    ok\n");
+	process.chdir(tempDir);
+	await command.handler("turns ./off", ctx);
+	process.chdir(cwd);
+	assert.equal(u.notes.at(-1)[1], `turns ${join(tempDir, "off")}`, "./off is a path, not the keyword");
+	await run(JAIL);
+	assert.equal(guardRun([head(""), turn]).messages[1].content[0].text, "off file\n");
+	await command.handler("turns off", ctx);
+	writeConfig(jail);
+
+	// inherit: tree covers every model in this process, the mode verbs keep it, keyed narrows, none
+	// publishes nothing.
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler("inherit tree", ctx);
+	assert.equal(u.notes.at(-1)[1], "inherit tree");
+	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid }).key, "*", "tree publishes the whole tree");
+	assert.match(await panel(), /on@\*/, "the row names the scope");
+	await command.handler("on", ctx);
+	assert.match(await panel(), /on@\*/, "a mode verb keeps the tree scope");
+	await select({ type: "model_select" }, { model: NORMAL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak on", "a tree answer covers the other model");
+	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("ALT TEXT"), "and its settings reach it");
+	await command.handler("inherit keyed", { model: NORMAL, ui: u });
+	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid }).key, modelKey(NORMAL), "keyed narrows to the live model");
+	await command.handler("inherit none", { model: NORMAL, ui: u });
+	assert.equal(ENV_NAME in process.env, false, "none publishes nothing");
+
+	// A settings verb keeps the mode the answer already carries, even when it widens the answer.
+	writeConfig(jail);
+	await command.handler("reset", ctx);
+	await command.handler("on", ctx);
+	await select({ type: "model_select" }, { model: NORMAL, ui: u });
+	await command.handler("inherit tree", { model: NORMAL, ui: u });
+	assert.equal(JSON.parse(process.env[ENV_NAME]).m, "on", "the answer keeps its own mode");
+	await run(JAIL);
+	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("This is YG's context."), "and the model that was on stays on");
+
+	// A keyed answer that does not govern this model never suppresses its payload.
+	writeConfig(jail);
+	process.env[ENV_NAME] = encode({ mode: "on", key: "other/model", settings: { inherit: "none" } }, process.ppid);
+	await start({ type: "session_start", reason: "startup" }, { model: JAIL, ui: u });
+	assert.equal(ENV_NAME in process.env, true, "another model's none setting does not delete this one's payload");
+
+	// A config-level tree covers every model even when the answer carries a model key.
+	const treePrompt = join(tempDir, "tree.md");
+	writeFileSync(treePrompt, "TREE TEXT");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }], { inherit: "tree", prompt: treePrompt });
+	process.env[ENV_NAME] = encode({ mode: "on", key: "other/model" }, process.ppid);
+	await start({ type: "session_start", reason: "startup" }, { model: JAIL, ui: u });
+	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("TREE TEXT"), "a config tree governs the other model");
+	await command.handler("reset", ctx);
+
+	// The cot channel and the tag that fences it.
+	writeFileSync(sessionTurns, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
+	writeConfig(jail, { turns: sessionTurns });
+	await command.handler("cot content", ctx);
+	assert.equal(u.notes.at(-1)[1], "cot content");
+	await command.handler("cotTag analysis", ctx);
+	assert.equal(u.notes.at(-1)[1], "cotTag analysis");
+	await run(JAIL);
+	assert.equal(guardRun([head(""), turn]).messages[2].content[0].text, "<analysis>\nthink\n</analysis>\n\nok", "the session tag fences the cot");
+	await command.handler("cot default", ctx);
+	await command.handler("cotTag default", ctx);
+	assert.equal(u.notes.at(-1)[1], "cotTag default (config)");
+
+	// remember writes what the session set, then the session stops repeating it.
+	writeConfig(jail);
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler("cot content", ctx);
+	assert.equal(u.notes.at(-1)[1], "cot content");
+	await command.handler("turns off", ctx);
+	await command.handler("inherit keyed", ctx);
+	await command.handler("remember on", ctx);
+	let data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].prompt, altPrompt, "the written rule carries the session prompt");
+	assert.equal(data.rules[0].cot, "content");
+	assert.equal(data.rules[0].turns, null, "an explicit null is written");
+	assert.equal(data.inherit, "keyed");
+	assert.doesNotMatch(await panel(), /^session\s/m, "the session row is gone once the file carries it");
+
+	// A config tree makes the answer govern this model, so remember writes its settings there.
+	writeConfig(jail);
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	writeConfig(jail, { inherit: "tree" });
+	await select({ type: "model_select" }, { model: NORMAL, ui: u });
+	await command.handler("remember on", { model: NORMAL, ui: u });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].model, "gpt-5");
+	assert.equal(data.rules[0].prompt, altPrompt, "a config tree makes the answer govern this model");
+
+	// A key the session set wins over a value the rule already pins.
+	writeConfig([
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cot: "reasoning_content", turns: "x.yml" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "jailbreak", cot: "reasoning_content", turns: "x.yml" },
+	]);
+	await command.handler("reset", ctx);
+	await command.handler("cot content", ctx);
+	assert.equal(u.notes.at(-1)[1], "cot content");
+	await command.handler("turns off", ctx);
+	await command.handler("remember on", ctx);
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules.length, 2, "the exact rule is updated, not duplicated");
+	assert.equal(data.rules[0].cot, "content", "a session key is written over the rule's own value");
+	assert.equal(data.rules[0].turns, null);
+
+	// A refused write changes nothing.
+	writeConfig(jail);
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	writeFileSync(configFile, "{ not json");
+	await command.handler("remember on", ctx);
+	assert.equal(u.notes.at(-1)[0], "error");
+	assert.ok((await panel()).includes(`prompt=${altPrompt}`), "a refused write leaves the session answer alone");
+	writeConfig(jail);
+
+	// A setting the answer did not carry is not written, and the re-key applies it here.
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	await select({ type: "model_select" }, { model: NORMAL, ui: u });
+	await command.handler("remember on", { model: NORMAL, ui: u });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].model, "gpt-5");
+	assert.equal(data.rules[0].prompt, undefined, "a setting the answer did not carry is not written");
+	await run(NORMAL);
+	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("ALT TEXT"), "the re-key applies the stored setting");
+	assert.doesNotMatch(await panel(NORMAL), /not applied/);
+	await command.handler("remember on", { model: NORMAL, ui: u });
+	data = JSON.parse(readFileSync(configFile, "utf8"));
+	assert.equal(data.rules[0].prompt, altPrompt, "a second remember persists it");
+
+	// The channel carries the settings, and rejects a malformed set whole.
+	{
+		const pid = process.pid;
+		const ppid = process.ppid;
+		const full = { prompt: "/abs/Alt.md", turns: null, cot: "content", cotTag: "analysis", inherit: "keyed" };
+		assert.deepEqual(decode(encode({ mode: "on", key: "A/B", settings: full }, pid), { ppid, pid }).settings, full);
+		assert.equal(
+			decode(encode({ mode: "on", key: "A/B", settings: { prompt: "rel/Alt.md" } }, pid), { ppid, pid }).settings.prompt,
+			resolve(process.cwd(), "rel/Alt.md"),
+			"a relative path is normalized on both entry points",
+		);
+		for (const bad of [{ s: null }, { s: [] }, { s: { nope: "x" } }, { s: { cot: "x" } }, { s: { turns: "" } }, { s: { prompt: "" } }]) {
+			assert.equal(decode(JSON.stringify({ m: "on", k: "*", p: pid, ...bad }), { ppid, pid }), null, `a malformed s is rejected whole: ${JSON.stringify(bad)}`);
+		}
+		assert.deepEqual(decode(JSON.stringify({ m: "on", k: "*", p: pid }), { ppid, pid }).settings, {});
+		assert.equal(encode({ mode: "on", key: "*", settings: {} }, pid), JSON.stringify({ m: "on", k: "*", p: pid }), "an empty set writes no s");
+	}
+
+	// A reload keeps the settings on the process; a malformed process answer is not trusted.
+	writeConfig(jail);
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	delete process.env[ENV_NAME];
+	await start({ type: "session_start", reason: "reload" }, {});
+	await run(JAIL);
+	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "a reload keeps the settings on the process");
+	globalThis[Symbol.for("pi-jailbreak.process-answer")] = { mode: "on", key: "A/B", settings: { cot: "bogus" } };
+	delete process.env[ENV_NAME];
+	await start({ type: "session_start", reason: "startup" }, {});
+	await run(JAIL);
+	assert.equal(guardRun([head(""), turn]).messages[0].content, promptText, "a malformed process answer resolves from the config");
+	await command.handler("reset", ctx);
+	globalThis[Symbol.for("pi-jailbreak.process-answer")] = { mode: "on", key: "*", settings: { prompt: relative(process.cwd(), altPrompt) } };
+	delete process.env[ENV_NAME];
+	await start({ type: "session_start", reason: "startup" }, {});
+	await run(JAIL);
+	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "a relative process-answer path is normalized");
+	await command.handler("reset", ctx);
+
+	// A child adopts a tree payload with its settings and narrows to its own model.
+	process.env[ENV_NAME] = encode({ mode: "on", key: "*", settings: { prompt: altPrompt } }, process.ppid);
+	await start({ type: "session_start", reason: "startup" }, { model: JAIL, ui: u });
+	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid }).key, modelKey(JAIL), "the child narrows the tree key");
+	await run(JAIL);
+	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "and keeps the settings");
+
+	// A rejected verb changes nothing at all.
+	writeConfig(jail);
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	for (const [args, pattern] of [
+		["cot nonsense", /cot must be/],
+		["cotTag 1bad", /cotTag must be/],
+		["inherit nope", /inherit must be/],
+		["prompt", /prompt needs a value/],
+		["turns", /turns needs a value/],
+	]) {
+		await command.handler(args, ctx);
+		assert.equal(u.notes.at(-1)[0], "error", `${args} is an error`);
+		assert.match(u.notes.at(-1)[1], pattern);
+	}
+	const row = await panel();
+	assert.ok(row.includes(`prompt=${altPrompt}`), "a rejected verb leaves the settings alone");
+	assert.doesNotMatch(row, /cot=/);
+	assert.doesNotMatch(row, /inherit=/);
+	await command.handler("cot content", { ui: u });
+	assert.equal(u.notes.at(-1)[1], "no model selected");
+
+	// reset drops the settings with the answer, and publishes nothing.
+	await command.handler("reset", ctx);
+	assert.doesNotMatch(await panel(), /^session\s/m);
+	assert.equal(ENV_NAME in process.env, false, "reset removes the published settings with the answer");
+	await run(JAIL);
+	assert.equal(guardRun([head(""), turn]).messages[0].content, promptText);
+
+	// A bare model switch leaves the settings stored and unapplied.
+	writeConfig([
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" },
+		{ provider: "openai", model: "gpt-*", mode: "jailbreak" },
+	]);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	await select({ type: "model_select" }, { model: NORMAL, ui: u });
+	assert.match(await panel(NORMAL), /\(not applied\)/, "a bare model switch leaves the settings unapplied");
+	await run(NORMAL);
+	assert.equal(guardRun([head(""), turn], NORMAL).messages[0].content, promptText, "and the config prompt is used");
+
+	// A settings verb never flips the mode.
+	writeConfig([{ provider: "openai", model: "gpt-*", mode: "normal" }]);
+	await command.handler("reset", { model: NORMAL, ui: u });
+	await command.handler("cot content", { model: NORMAL, ui: u });
+	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "a settings verb does not turn the mode on");
+	assert.equal(JSON.parse(process.env[ENV_NAME]).s.cot, "content", "the payload carries the setting");
+
+	// The mode verbs keep the settings.
+	writeConfig(jail);
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler("off", ctx);
+	await command.handler("on", ctx);
+	await run(JAIL);
+	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "on/off keeps the settings");
+
+	// A settings verb re-keys the answer to the model in front of the user.
+	writeConfig([
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" },
+		{ provider: "openai", model: "gpt-*", mode: "jailbreak" },
+	]);
+	await command.handler("reset", ctx);
+	await command.handler(`prompt ${altPrompt}`, ctx);
+	await select({ type: "model_select" }, { model: NORMAL, ui: u });
+	await command.handler(`prompt ${spacedPrompt}`, { model: NORMAL, ui: u });
+	await run(NORMAL);
+	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("SPACED TEXT"), "the verb applies on the live model");
+	assert.equal(JSON.parse(process.env[ENV_NAME]).k, modelKey(NORMAL), "and re-keys the answer to it");
+	assert.doesNotMatch(await panel(NORMAL), /not applied/);
+	assert.ok((await panel(NORMAL)).includes(`prompt=${spacedPrompt}`), "the newer value replaces the older one");
+
+	// A re-key carries the answer's mode, not the config's.
+	writeConfig([
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" },
+		{ provider: "openai", model: "gpt-*", mode: "normal" },
+	]);
+	await command.handler("reset", ctx);
+	await command.handler("on", ctx);
+	await select({ type: "model_select" }, { model: NORMAL, ui: u });
+	await run(NORMAL);
+	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "the config leaves the other model normal");
+	await command.handler("cot content", { model: NORMAL, ui: u });
+	await run(NORMAL);
+	assert.ok(
+		guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("This is YG's context."),
+		"the re-key carries the answer's mode",
+	);
+
+	// The completions list the verbs and their literals.
+	assert.deepEqual(command.getArgumentCompletions("cot "), [
+		{ value: "cot reasoning_content", label: "cot reasoning_content" },
+		{ value: "cot content", label: "cot content" },
+		{ value: "cotTag think", label: "cotTag think" },
+	]);
+	assert.deepEqual(command.getArgumentCompletions("inherit "), [
+		{ value: "inherit keyed", label: "inherit keyed" },
+		{ value: "inherit tree", label: "inherit tree" },
+		{ value: "inherit none", label: "inherit none" },
+	]);
+
+	await command.handler("reset", ctx);
+	writeConfig(jail);
+	await start({ type: "session_start", reason: "startup" }, {});
+}
+console.log("ok session settings");
 
 // The session answer survives a new session in the same process.
 {

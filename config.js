@@ -10,7 +10,7 @@
  */
 
 import { readFileSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
@@ -26,6 +26,9 @@ export const COTS = Object.freeze(["reasoning_content", "content"]);
 export const DEFAULT_COT = "reasoning_content";
 /** The tag that fences the cot in content mode. `<think>` and `think` name the same tag. */
 export const DEFAULT_COT_TAG = "think";
+
+/** The keys a session answer carries. `turns` is three-state, and the rest are single values. */
+export const SETTINGS_KEYS = Object.freeze(["prompt", "turns", "cot", "cotTag", "inherit"]);
 
 /** A tag name from either spelling, or null when the value is not one. A bracketed value has to be
  * exactly one tag, so a stray `>` or a second pair is rejected rather than trimmed away. */
@@ -152,6 +155,72 @@ export function resolve(config, model) {
 		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, turns: rule.turns === undefined ? config.turns : rule.turns, cot: rule.cot ?? config.cot, cotTag: rule.cotTag ?? config.cotTag, ruleIndex };
 	}
 	return { mode: config.default, prompt: config.prompt, turns: config.turns, cot: config.cot, cotTag: config.cotTag, ruleIndex: -1 };
+}
+
+/** A path a session setting names. A typed path means the session's cwd, and an absolute one stays. */
+function absolutePath(value) {
+	return isAbsolute(value) ? value : resolvePath(process.cwd(), value);
+}
+
+/** One key's value, or the reason it is not one. `undefined` removes the key. */
+function settingValue(key, value) {
+	if (value === undefined) return { value: undefined };
+	if (key === "prompt") {
+		if (typeof value !== "string" || !value.trim()) return { error: "prompt must be a non-empty path" };
+		return { value: absolutePath(value.trim()) };
+	}
+	if (key === "turns") {
+		if (value === null) return { value: null };
+		if (typeof value !== "string" || !value.trim()) return { error: "turns must be a non-empty path or null" };
+		return { value: absolutePath(value.trim()) };
+	}
+	if (key === "cot") {
+		const wanted = typeof value === "string" ? value.toLowerCase() : value;
+		if (!COTS.includes(wanted)) return { error: `cot must be ${COTS.join(" or ")}` };
+		return { value: wanted };
+	}
+	if (key === "cotTag") {
+		const tag = tagName(value);
+		if (!tag) return { error: "cotTag must be a tag name, such as think or  thinking" };
+		return { value: tag };
+	}
+	const wanted = typeof value === "string" ? value.toLowerCase() : value;
+	if (!INHERITS.includes(wanted)) return { error: `inherit must be ${INHERITS.join(", ")}` };
+	return { value: wanted };
+}
+
+/**
+ * A whole settings object, as the channel and the process answer carry it. Every key is checked and
+ * every path normalized, so a value written by one side names the same file on the other. Rejection
+ * is whole: a half-applied answer would publish a decision nobody wrote.
+ */
+export function sessionSettings(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return { error: "settings must be an object" };
+	const out = {};
+	for (const key of Object.keys(value)) {
+		if (!SETTINGS_KEYS.includes(key)) return { error: `settings carries ${key}, which it does not take` };
+		const read = settingValue(key, value[key]);
+		if (read.error) return { error: read.error };
+		if (read.value !== undefined) out[key] = read.value;
+	}
+	return { settings: out };
+}
+
+/**
+ * One assignment from the command. `default` removes the key, `off`/`none`/`null` turn injection
+ * off, and any other value is a path, so a file literally named `off` is `./off`.
+ */
+export function settingFromCommand(name, value) {
+	const key = name === "cottag" ? "cotTag" : name;
+	if (!SETTINGS_KEYS.includes(key)) return { error: `unknown setting: ${name}` };
+	const text = String(value ?? "").trim();
+	const keyword = text.toLowerCase();
+	if (keyword === "default") return { key, value: undefined };
+	if (key === "turns" && (keyword === "off" || keyword === "none" || keyword === "null")) return { key, value: null };
+	if (!text) return { error: `${key} needs a value` };
+	const read = settingValue(key, text);
+	if (read.error) return { error: read.error };
+	return { key, value: read.value };
 }
 
 /**

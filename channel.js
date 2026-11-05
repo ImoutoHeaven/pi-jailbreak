@@ -13,6 +13,8 @@
  * them.
  */
 
+import { sessionSettings } from "./config.js";
+
 export const ENV_NAME = "PI_JAILBREAK";
 
 /** `provider/id`, the key a rule matches and a value is published under. */
@@ -20,15 +22,22 @@ export function modelKey(model) {
 	return `${model?.provider ?? ""}/${model?.id ?? ""}`;
 }
 
-/** The payload for `value`, or null when the process holds no decision. */
+/** The payload for `value`, or null when the process holds no decision. An empty settings object
+ * writes no `s`, so a session that set nothing publishes the bytes it always published. */
 export function encode(value, pid) {
 	if (!value) return null;
-	return JSON.stringify({ m: value.mode, k: value.key, p: pid });
+	const out = { m: value.mode, k: value.key, p: pid };
+	const settings = value.settings && typeof value.settings === "object" ? value.settings : null;
+	if (settings && Object.keys(settings).length) out.s = { ...settings };
+	return JSON.stringify(out);
 }
 
 /**
  * Parse a value, or null when it is malformed or came from outside this process tree. `self`
  * marks a value this process wrote, which survives its own next session.
+ *
+ * The settings travel with the answer: an absent `s` is an empty set, and a malformed one rejects the
+ * whole payload, because a half-applied answer would publish a decision nobody wrote.
  */
 export function decode(raw, { ppid, pid }) {
 	if (!raw) return null;
@@ -42,7 +51,9 @@ export function decode(raw, { ppid, pid }) {
 	if (data.m !== "on" && data.m !== "off") return null;
 	if (typeof data.k !== "string" || !data.k) return null;
 	if (data.p !== ppid && data.p !== pid) return null;
-	return { mode: data.m, key: data.k, self: data.p === pid };
+	const read = sessionSettings(data.s === undefined ? {} : data.s);
+	if (read.error) return null;
+	return { mode: data.m, key: data.k, self: data.p === pid, settings: read.settings };
 }
 
 /** Write the process mirror: the decision, or nothing at all. */

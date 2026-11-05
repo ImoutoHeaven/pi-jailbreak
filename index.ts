@@ -39,7 +39,7 @@ import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { authorizeGate, GATE_FIELDS, GATE_TOOL, normalizeFields } from "./gate.js";
-import { configPath, loadConfig, parseConfig, promptPath, resolve, turnsPath } from "./config.js";
+import { configPath, loadConfig, parseConfig, promptPath, resolve, sessionSettings, settingFromCommand, turnsPath } from "./config.js";
 import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { cachedFile, loadTurns, toMessages } from "./turns.js";
 import { registerCommands } from "./commands.ts";
@@ -114,6 +114,18 @@ type Decision = {
 	error?: string;
 };
 
+/** What a session answer may carry on top of its mode. `turns` is three-state, as in the config. */
+type Settings = {
+	prompt?: string;
+	turns?: string | null;
+	cot?: "reasoning_content" | "content";
+	cotTag?: string;
+	inherit?: string;
+};
+
+/** A session's answer: the mode, the scope it governs, and the settings it carries. */
+type Answer = { mode: "on" | "off"; key: string; settings: Settings };
+
 /**
  * The answer this process set, so a new runtime in the same process keeps it. Pi loads the
  * extension again for `/new`, a fork or a session switch, and `/reload` re-evaluates this module,
@@ -121,14 +133,20 @@ type Decision = {
  */
 const PROCESS_ANSWER = Symbol.for("pi-jailbreak.process-answer");
 
-function readProcessAnswer(): { mode: "on" | "off"; key: string } | null {
+/** The process answer, or null when it is absent or the settings it carries are not ones we write. */
+function readProcessAnswer(): Answer | null {
 	const value = (globalThis as any)[PROCESS_ANSWER];
 	if (!value || typeof value !== "object") return null;
-	return value.mode === "on" || value.mode === "off" ? { mode: value.mode, key: String(value.key ?? "") } : null;
+	if (value.mode !== "on" && value.mode !== "off") return null;
+	// The second trust boundary for the same object: another install sharing the symbol writes here
+	// too, and a setting of the wrong shape would reach `buildDecision`.
+	const read = sessionSettings(value.settings ?? {});
+	if (read.error) return null;
+	return { mode: value.mode, key: String(value.key ?? ""), settings: read.settings as Settings };
 }
 
-function writeProcessAnswer(next: { mode: "on" | "off"; key: string } | null) {
-	(globalThis as any)[PROCESS_ANSWER] = next ? { ...next } : null;
+function writeProcessAnswer(next: Answer | null) {
+	(globalThis as any)[PROCESS_ANSWER] = next ? { ...next, settings: { ...next.settings } } : null;
 }
 
 /**
@@ -139,7 +157,7 @@ function writeProcessAnswer(next: { mode: "on" | "off"; key: string } | null) {
 type State = {
 	api: ExtensionAPI;
 	/** This session's own answer, mirrored into the environment for the processes it starts. */
-	override: { mode: "on" | "off"; key: string } | null;
+	override: Answer | null;
 	/** What the last request sent actually carried, keyed like a decision. */
 	delivery: { key: string; prompt: string; turns: string | null; delivered: boolean; injected: boolean } | null;
 	decision: Decision | null;
@@ -190,13 +208,18 @@ function buildDecision(s: State, ctx: any): Decision {
 	if (loaded.error) report(s, ctx, loaded.error);
 	const config = loaded.config;
 	const hit = resolve(config, ctx?.model);
-	// A tree answer covers every model in this process, which is what it publishes.
-	const session = s.override && (config.inherit === "tree" || applies(s.override, key)) ? s.override : null;
+	// A tree answer covers every model in this process, which is what it publishes. The answer's own
+	// `inherit` decides that when it has one; the config decides otherwise.
+	const tree = (s.override?.settings.inherit ?? config.inherit) === "tree";
+	const session = s.override && (tree || applies(s.override, key)) ? s.override : null;
+	// Session settings win over the rule, and an absent one leaves the config in charge.
+	const settings = session?.settings ?? {};
 	const mode = session ? (session.mode === "on" ? "jailbreak" : "normal") : hit.mode;
-	const prompt = promptPath(config, hit.prompt);
+	const prompt = settings.prompt ?? promptPath(config, hit.prompt);
 	const text = mode === "jailbreak" ? readPrompt(s, prompt, ctx) ?? null : null;
 	// The fabricated conversation is read only in a jailbreak session: a normal one never opens it.
-	const turnsFile = mode === "jailbreak" && hit.turns ? turnsPath(config, hit.turns) : null;
+	const turnsFile =
+		mode !== "jailbreak" ? null : settings.turns !== undefined ? settings.turns : hit.turns ? turnsPath(config, hit.turns) : null;
 	let turns: TurnSpec[] | null = null;
 	let turnsError: string | null = null;
 	if (turnsFile) {
@@ -208,7 +231,7 @@ function buildDecision(s: State, ctx: any): Decision {
 	}
 	// The configured channel, downgraded where the api has no replayable reasoning field: anthropic
 	// drops a signature-less thinking block, and openai-responses parses any signature as JSON.
-	const wanted = hit.cot ?? "reasoning_content";
+	const wanted = settings.cot ?? hit.cot ?? "reasoning_content";
 	const cotMode = wanted === "reasoning_content" && ctx?.model?.api === "openai-completions" ? "reasoning_content" : "content";
 	if (turns && cotMode === "content" && turns.some((spec) => spec.role === "assistant" && spec.cot)) {
 		report(s, ctx, `${basename(turnsFile ?? "")}: the chain of thought is sent inside content on ${ctx?.model?.api ?? "this api"}`, "info");
@@ -221,10 +244,10 @@ function buildDecision(s: State, ctx: any): Decision {
 		turnsError,
 		turnsPath: turnsFile,
 		cotMode,
-		cotTag: hit.cotTag,
+		cotTag: settings.cotTag ?? hit.cotTag,
 		prompt,
 		source: session ? "session" : hit.ruleIndex < 0 ? "default" : `rule ${hit.ruleIndex + 1}`,
-		inherit: config.inherit,
+		inherit: settings.inherit ?? config.inherit,
 		configPath: config.path,
 		error: loaded.error,
 	};
@@ -420,7 +443,7 @@ function forgetDelivery(s: State) {
 }
 
 /** Set this session's answer and the process answer that survives a new runtime. */
-function setAnswer(s: State, next: { mode: "on" | "off"; key: string } | null) {
+function setAnswer(s: State, next: Answer | null) {
 	s.override = next;
 	writeProcessAnswer(next);
 }
@@ -442,7 +465,7 @@ function syncChannel(s: State, ctx: any, inherit: string) {
 			publish(process.env, null, process.pid);
 			return;
 		}
-		s.override = { mode: s.override.mode, key: modelKey(ctx.model) };
+		s.override = { ...s.override, key: modelKey(ctx.model) };
 		writeProcessAnswer(s.override);
 	}
 	publish(process.env, inherit === "none" || !s.override ? null : { ...s.override, key: publishKey(inherit, s.override.key) }, process.pid);
@@ -460,7 +483,8 @@ function setOverride(s: State, ctx: any, mode: "on" | "off" | "toggle"): { mode:
 	const before = buildDecision(s, ctx);
 	const current = s.override && applies(s.override, key) ? s.override.mode : before.mode === "jailbreak" ? "on" : "off";
 	const next = mode === "toggle" ? (current === "on" ? "off" : "on") : mode;
-	setAnswer(s, { mode: next, key });
+	// Under a tree the stored key is the scope the answer governs, so the panel and the payload agree.
+	setAnswer(s, { mode: next, key: before.inherit === "tree" ? "*" : key, settings: s.override?.settings ?? {} });
 	// A mode change describes a request that has not been sent yet.
 	forgetDelivery(s);
 	// Rebuild first: the config may have changed since the decision was made, and its `inherit`
@@ -471,6 +495,40 @@ function setOverride(s: State, ctx: any, mode: "on" | "off" | "toggle"): { mode:
 	syncGate(s, after.text !== null, ctx);
 	updateStatus(s, ctx, after);
 	return { mode: next, applied: true };
+}
+
+/**
+ * Set one session setting and apply it now. A value that does not validate changes nothing at all:
+ * no decision reset, no publish, no status write.
+ *
+ * The answer is re-keyed to the live model, or to `*` under an effective tree, so the settings apply
+ * to the model in front of the user and a later `tree` to `keyed` flip narrows through the channel.
+ */
+function configure(s: State, ctx: any, name: string, value: string): { ok: boolean; message: string } {
+	if (!hasModel(ctx)) return { ok: false, message: "no model selected" };
+	const assignment = settingFromCommand(name, value);
+	if (assignment.error) return { ok: false, message: assignment.error };
+	const key = modelKey(ctx.model);
+	const settings: Settings = { ...(s.override?.settings ?? {}) };
+	if (assignment.value === undefined) delete (settings as any)[assignment.key];
+	else (settings as any)[assignment.key] = assignment.value;
+	// Read the config as it is now: a decision older than this command must not decide the mode.
+	s.decision = null;
+	const before = buildDecision(s, ctx);
+	const inheritAfter = settings.inherit ?? loadConfig(configPath(), PACKAGE_DIR).config.inherit;
+	const answerKey = inheritAfter === "tree" ? "*" : s.override && applies(s.override, key) ? s.override.key : key;
+	// The answer keeps its own mode: a setting is not a mode change, and re-keying must not flip it.
+	const mode = s.override ? s.override.mode : before.mode === "jailbreak" ? "on" : "off";
+	setAnswer(s, { mode, key: answerKey, settings });
+	forgetDelivery(s);
+	s.decision = null;
+	const after = buildDecision(s, ctx);
+	syncChannel(s, ctx, after.inherit);
+	syncGate(s, after.text !== null, ctx);
+	updateStatus(s, ctx, after);
+	if (assignment.value === undefined) return { ok: true, message: `${assignment.key} default (config)` };
+	if (assignment.value === null) return { ok: true, message: `${assignment.key} off` };
+	return { ok: true, message: `${assignment.key} ${assignment.value}` };
 }
 
 /** Drop this session's answer, so the config decides again. Returns the mode that now applies. */
@@ -506,14 +564,20 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// The rule that governs this model now. The rule this command writes takes over its text, or
 	// remembering a mode would silently switch the model to the default prompt file.
 	const applied = resolve(parsed.config, ctx?.model);
-	const carried = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].prompt : undefined;
+	// What this session set, and only while the answer governs this model: a model the answer does not
+	// cover reads the config, so its rule must not take settings the user never saw here.
+	const tree = (s.override?.settings.inherit ?? parsed.config.inherit) === "tree";
+	const s0: Settings = s.override && (tree || applies(s.override, modelKey(ctx.model))) ? s.override.settings : {};
+	// The rule this command writes takes over the text, or remembering a mode would silently switch
+	// the model to the default prompt file.
+	const carried = s0.prompt ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].prompt : undefined);
 	// The channel is carried the same way: a rule that pinned `content` or its own tag keeps it, and a
 	// rule that left the key absent still inherits the config level.
-	const carriedCot = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cot : undefined;
-	const carriedCotTag = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cotTag : undefined;
+	const carriedCot = s0.cot ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cot : undefined);
+	const carriedCotTag = s0.cotTag ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cotTag : undefined);
 	// The turns value the model resolves, written even when it is null: an absent key would inherit a
 	// config-level default and turn injection back on.
-	const carriedTurns = applied.turns;
+	const carriedTurns = s0.turns !== undefined ? s0.turns : applied.turns;
 	const rules = Array.isArray(data.rules) ? data.rules : [];
 	const at = rules.findIndex(
 		(rule: any) =>
@@ -527,13 +591,14 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// edited where it sits.
 	if (at >= 0) {
 		const [updated] = rules.splice(at, 1);
+		// A key the session set is written as it is; one it did not set keeps what the rule carries.
 		rules.unshift({
 			...updated,
 			mode: next,
-			...(updated.prompt === undefined && carried ? { prompt: carried } : {}),
-			...(updated.cot === undefined && carriedCot ? { cot: carriedCot } : {}),
-			...(updated.cotTag === undefined && carriedCotTag ? { cotTag: carriedCotTag } : {}),
-			...(updated.turns === undefined ? { turns: carriedTurns } : {}),
+			...(s0.prompt !== undefined ? { prompt: s0.prompt } : updated.prompt === undefined && carried ? { prompt: carried } : {}),
+			...(s0.cot !== undefined ? { cot: s0.cot } : updated.cot === undefined && carriedCot ? { cot: carriedCot } : {}),
+			...(s0.cotTag !== undefined ? { cotTag: s0.cotTag } : updated.cotTag === undefined && carriedCotTag ? { cotTag: carriedCotTag } : {}),
+			...(s0.turns !== undefined ? { turns: s0.turns } : updated.turns === undefined ? { turns: carriedTurns } : {}),
 		});
 	} else
 		rules.unshift({
@@ -548,7 +613,7 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	const out = {
 		...data,
 		default: data.default ?? "normal",
-		inherit: data.inherit ?? "keyed",
+		inherit: s0.inherit ?? data.inherit ?? "keyed",
 		prompt: data.prompt ?? "prompt.md",
 		rules,
 	};
@@ -565,6 +630,11 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 		}
 		return { ok: false, message: `${path}: ${error?.message ?? "write failed"}` };
 	}
+	// The file carries what the session set, so the session stops repeating it. A setting the write did
+	// not carry stays stored, and the re-key below applies it to the model in front of the user.
+	if (Object.keys(s0).length && s.override) s.override = { ...s.override, settings: {} };
+	// The file just changed: a decision taken before the write must not decide the key label below.
+	s.decision = null;
 	setOverride(s, ctx, mode);
 	return { ok: true, message: path };
 }
@@ -575,10 +645,16 @@ function panel(s: State, ctx: any) {
 	s.decision = null;
 	const current = buildDecision(s, ctx);
 	const inherited = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
+	// The session row lists what the answer carries, and says so when a model switch left it unapplied.
+	const settings = s.override?.settings ?? {};
+	const shown = Object.entries(settings)
+		.map(([name, value]) => `${name}=${value === null ? "off" : value}`)
+		.join(" ");
 	const rows: string[][] = [
 		["model", hasModel(ctx) ? current.key : "(none)"],
 		["mode", current.mode],
 		["source", current.source],
+		...(shown ? [["session", `${s.override?.mode === "on" ? "on" : "off"}@${s.override?.key ?? ""} ${shown}${current.source === "session" ? "" : " (not applied)"}`]] : []),
 		["prompt", current.prompt],
 		["turns", current.turnsPath ?? "off"],
 	];
@@ -633,6 +709,7 @@ export default function jailbreak(pi: ExtensionAPI) {
 		set: (ctx, mode) => setOverride(s, ctx, mode),
 		reset: (ctx) => clearOverride(s, ctx),
 		remember: (ctx, mode) => remember(s, ctx, mode),
+		configure: (ctx, name, value) => configure(s, ctx, name, value),
 		panel: (ctx) => panel(s, ctx),
 	});
 
@@ -649,7 +726,7 @@ export default function jailbreak(pi: ExtensionAPI) {
 		// process already holds stands.
 		const inherited = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
 		if (inherited && (config.inherit !== "none" || inherited.self)) {
-			s.override = { mode: inherited.mode, key: inherited.key };
+			s.override = { mode: inherited.mode, key: inherited.key, settings: inherited.settings };
 		} else if (config.inherit === "none" && inherited && !inherited.self) {
 			// A parent's answer is dropped when this tree does not inherit.
 			s.override = null;
