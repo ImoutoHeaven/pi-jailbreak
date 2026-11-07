@@ -39,7 +39,7 @@ import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { authorizeGate, GATE_FIELDS, GATE_TOOL, normalizeFields } from "./gate.js";
-import { configPath, loadConfig, parseConfig, promptPath, resolve, sessionSettings, settingFromCommand, turnsPath } from "./config.js";
+import { configPath, DEFAULT_COT, loadConfig, parseConfig, promptPath, resolve, sessionSettings, settingFromCommand, turnsPath } from "./config.js";
 import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { cachedFile, loadTurns, toMessages } from "./turns.js";
 import { registerCommands } from "./commands.ts";
@@ -231,7 +231,7 @@ function buildDecision(s: State, ctx: any): Decision {
 	}
 	// The configured channel, downgraded where the api has no replayable reasoning field: anthropic
 	// drops a signature-less thinking block, and openai-responses parses any signature as JSON.
-	const wanted = settings.cot ?? hit.cot ?? "reasoning_content";
+	const wanted = settings.cot ?? hit.cot ?? DEFAULT_COT;
 	const cotMode = wanted === "reasoning_content" && ctx?.model?.api === "openai-completions" ? "reasoning_content" : "content";
 	if (turns && cotMode === "content" && turns.some((spec) => spec.role === "assistant" && spec.cot)) {
 		report(s, ctx, `${basename(turnsFile ?? "")}: the chain of thought is sent inside content on ${ctx?.model?.api ?? "this api"}`, "info");

@@ -23,7 +23,7 @@ export const MODES = Object.freeze(["jailbreak", "normal"]);
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
 /** Where the fabricated chain of thought travels: the reasoning field, or fenced at the head of the reply. */
 export const COTS = Object.freeze(["reasoning_content", "content"]);
-export const DEFAULT_COT = "reasoning_content";
+export const DEFAULT_COT = "content";
 /** The tag that fences the cot in content mode. `<think>` and `think` name the same tag. */
 export const DEFAULT_COT_TAG = "think";
 

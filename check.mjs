@@ -243,7 +243,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "normal",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
-		cot: "reasoning_content",
+		cot: "content",
 		cotTag: "think",
 		ruleIndex: 0,
 	}, "the first match wins");
@@ -251,7 +251,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "jailbreak",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
-		cot: "reasoning_content",
+		cot: "content",
 		cotTag: "think",
 		ruleIndex: 1,
 	});
@@ -259,7 +259,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "jailbreak",
 		prompt: "prompts/glm.md",
 		turns: DEFAULT_TURNS,
-		cot: "reasoning_content",
+		cot: "content",
 		cotTag: "think",
 		ruleIndex: 2,
 	}, "a missing provider matches any provider");
@@ -267,7 +267,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "jailbreak",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
-		cot: "reasoning_content",
+		cot: "content",
 		cotTag: "think",
 		ruleIndex: 3,
 	}, "a missing model matches any model");
@@ -275,7 +275,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "normal",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
-		cot: "reasoning_content",
+		cot: "content",
 		cotTag: "think",
 		ruleIndex: -1,
 	}, "no match falls back to the default");
@@ -1046,7 +1046,7 @@ console.log("ok turns nowhere to splice");
 	writeFileSync(turnFile, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
 	writeConfig(
 		[
-			{ provider: "deepseek", model: "deepseek-*", mode: "jailbreak" },
+			{ provider: "deepseek", model: "deepseek-*", mode: "jailbreak", cot: "reasoning_content" },
 			{ provider: "anthropic", model: "claude*", mode: "jailbreak" },
 		],
 		{ turns: turnFile },
@@ -1073,6 +1073,14 @@ console.log("ok turns nowhere to splice");
 	const pinned = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u3 }).messages;
 	assert.equal(pinned.at(-2).content[0].type, "text", "the pinned channel folds the cot into content");
 	assert.equal(pinned.at(-2).content[0].text, "<think>\nthink\n</think>\n\nok");
+
+	// A config that names no channel folds the cot into content, even where reasoning could carry it.
+	writeConfig([{ provider: "deepseek", model: "deepseek-*", mode: "jailbreak" }], { turns: turnFile });
+	const u4 = ui();
+	await before({ systemPromptOptions: { sections: {} } }, { model: reasoning, ui: u4 });
+	const folded = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u4 }).messages;
+	assert.equal(folded.at(-2).content[0].type, "text", "the default channel emits no thinking block");
+	assert.equal(folded.at(-2).content[0].text, "<think>\nthink\n</think>\n\nok", "the default channel folds the cot into content");
 }
 console.log("ok turns cot channel");
 

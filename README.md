@@ -64,9 +64,9 @@ holding the config file.
 ```
 
 `cot` decides the channel the fabricated chain of thought travels in, and a rule's own value wins
-over the config-level one. `reasoning_content` is the default. `content` fences the cot in
-`<think>` tags at the head of the assistant reply, and every api that cannot replay a reasoning
-field uses it whatever the config says.
+over the config-level one. `content` is the default: it fences the cot in `<think>` tags at the
+head of the assistant reply. `reasoning_content` puts it in the reasoning field, and it holds only
+on an api that replays one; every other api uses `content` whatever the config says.
 
 `cotTag` names the tag that fences it. It defaults to `think`, and either spelling of one
 tag is the same tag: `think` and `<think>` both write `<think>` and `</think>`. A rule's own
@@ -74,9 +74,9 @@ value wins over the config-level one.
 
 ```json
 {
-	"cot": "reasoning_content",
+	"cot": "content",
 	"cotTag": "think",
-	"rules": [{ "provider": "CLIProxy-Chat", "model": "glm-*", "mode": "jailbreak", "cot": "content", "cotTag": "reasoning" }]
+	"rules": [{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "jailbreak", "cot": "reasoning_content", "cotTag": "reasoning" }]
 }
 ```
 
@@ -217,13 +217,13 @@ which is the shape to use when the fabricated turn carries a gate ruling. `user`
 unanswered turn, which Anthropic combines with the real request and the OpenAI-compatible apis send
 as written.
 
-The fabricated chain of thought travels in the channel `cot` selects. `reasoning_content`, the
-default, puts it in the field the OpenAI-compatible adapter writes a thinking block to. `content`
-puts it at the head of the assistant reply, fenced in `<think>` tags, so the turn reads as reasoning
-the assistant wrote down followed by what it said. `content` is the channel an api without a
-replayable reasoning field gets: `openai-responses` parses any thinking signature it is given, and
-Anthropic turns a signature-less block into text on its own. The extension reports the content
-channel once per session.
+The fabricated chain of thought travels in the channel `cot` selects. `content`, the default, puts
+it at the head of the assistant reply, fenced in `<think>` tags, so the turn reads as reasoning the
+assistant wrote down followed by what it said. `reasoning_content` puts it in the field the
+OpenAI-compatible adapter writes a thinking block to, on an api that replays one. `content` is the
+channel every api without a replayable reasoning field gets: `openai-responses` parses any thinking
+signature it is given, and Anthropic turns a signature-less block into text on its own. The
+extension reports the content channel once per session.
 
 A file that does not load injects nothing, reports once, and leaves the prompt text in force. The
 footer shows `JailBreak !` while a configured block is missing, and `/jailbreak` names the file and
