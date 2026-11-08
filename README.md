@@ -114,9 +114,9 @@ the live model resolves at that moment.
 
 The footer shows `JailBreak on` while the text is in force, `JailBreak off` while the mode is normal,
 and `JailBreak !` when the mode is jailbreak and the request carried nothing: the prompt file is
-missing or empty, the transcript has nowhere to put the text, or the configured turn file did not
-load. The third state follows the request that was actually sent, so a run whose text cannot be
-placed says so at once instead of showing on.
+missing or empty, the transcript has nowhere to put the text, the configured turn file did not load,
+or another extension replaced the system prompt. The third state follows the request that was
+actually sent, so a run whose text cannot be placed says so at once instead of showing on.
 
 ## Subagents
 
@@ -168,8 +168,11 @@ override changes. A steady conversation parses no config and reads no file, and 
 turn after turn, so the prompt prefix cache stays warm. Switching the mode, the model, or the prompt
 file changes the head and costs one cache miss.
 
-If another extension forces the system prompt, Pi sends that string as the whole prompt. The identity
-sentence goes with the sections it replaces, and the extension reports the text as undelivered. When
+If another extension forces the system prompt, Pi replaces the system messages with that string and
+keeps every message that is not one, so the fabricated conversation would reach the model under a
+prompt nobody wrote for it. The extension delivers neither: the text is reported as undelivered, the
+block is skipped, and the footer shows the loss. The force is read when the request is built, not
+when the run starts, because the extension that sets it may be loaded after this one. When
 the leading system message holds blocks Pi never puts there, or the transcript carries no system
 message at all, the extension places nothing: the text stays out, the identity sentence stays in, and
 the loss is reported.

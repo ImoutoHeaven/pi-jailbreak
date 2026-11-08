@@ -661,6 +661,7 @@ console.log("ok before_agent_start records no section");
 	for (let i = 0; i < 3; i++) {
 		const ev = { systemPromptOptions: { sections: {}, forceSystemPrompt: "FORCED" } };
 		await before(ev, ctx);
+		guard({ type: "context_with_system", messages: [head(""), turn] }, ctx);
 	}
 	assert.equal(notes.length, 1, "a forced prompt is reported exactly once");
 	assert.equal(notes[0][0], "warning");
@@ -858,7 +859,7 @@ console.log("ok a missing prompt is reported in the status");
 }
 console.log("ok status follows the request");
 
-// A forced prompt replaces the list after the guard, so that run carries nothing.
+// A forced prompt replaces the system messages after the guard, so that run carries nothing.
 {
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {}, forceSystemPrompt: "FORCED" } }, { model: JAIL, ui: u });
@@ -1086,7 +1087,7 @@ console.log("ok turns nowhere to splice");
 }
 console.log("ok turns fence");
 
-// A forced prompt replaces the list after the guard, so that run carries no fabricated block.
+// A forced prompt replaces the system messages after the guard, so that run carries no block.
 {
 	writeFileSync(turnFile, "- user: |\n    first\n- assistant: |\n    ok\n");
 	turnsConfig();
@@ -1099,6 +1100,56 @@ console.log("ok turns fence");
 	assert.equal(lastStatus(u), "JailBreak !", "a forced prompt shows as undelivered");
 }
 console.log("ok turns forced prompt");
+
+// Pi passes one options object to every before_agent_start handler, so a handler loaded after this
+// one can force the prompt after our handler has already run. The guard reads it where it matters.
+{
+	writeFileSync(turnFile, "- user: |\n    first\n- assistant: |\n    ok\n");
+	turnsConfig();
+	const u = ui();
+	// A new session, so the report set starts empty and the loss is not deduped by an earlier case.
+	await start({ type: "session_start", reason: "new" }, { model: JAIL, ui: u });
+	const ev = { systemPromptOptions: { sections: {} } };
+	await before(ev, { model: JAIL, ui: u });
+	assert.equal(ev.systemPromptOptions.forceSystemPrompt, undefined, "this handler forces nothing");
+	// The handler loaded after this one returns { systemPrompt }, which pi writes onto this object.
+	ev.systemPromptOptions.forceSystemPrompt = "FORCED LATE";
+	const result = guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: JAIL, ui: u });
+	assert.equal(result.messages.length, 2, "a late force carries no fabricated block");
+	assert.ok(u.notes.some(([type, text]) => type === "warning" && /replaced the system prompt/.test(text)), "the text is reported undelivered");
+	assert.equal(lastStatus(u), "JailBreak !", "and the run shows as undelivered");
+	// The next run without a force recovers, so the record is not sticky.
+	await run(JAIL);
+	guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: JAIL, ui: u });
+	assert.equal(lastStatus(u), "JailBreak on", "the next run without a force recovers");
+}
+console.log("ok a late forced prompt");
+
+// A forced prompt on a model with no text in force has no loss to report: the guard speaks only for
+// a text it was meant to place.
+{
+	writeConfig([{ provider: "openai", model: "gpt-*", mode: "normal" }]);
+	const u = ui();
+	await start({ type: "session_start", reason: "new" }, { model: NORMAL, ui: u });
+	await before({ systemPromptOptions: { sections: {}, forceSystemPrompt: "FORCED" } }, { model: NORMAL, ui: u });
+	guard({ type: "context_with_system", messages: [head(""), turn] }, { model: NORMAL, ui: u });
+	assert.equal(u.notes.length, 0, "no text in force, no loss to report");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
+}
+console.log("ok a forced prompt on a normal model reports nothing");
+
+// A new session carries no options from the last one, so a request before this session's own run
+// starts is not treated as forced.
+{
+	writeFileSync(turnFile, "- user: |\n    first\n- assistant: |\n    ok\n");
+	turnsConfig();
+	const u = ui();
+	await before({ systemPromptOptions: { sections: {}, forceSystemPrompt: "FORCED" } }, { model: JAIL, ui: u });
+	await start({ type: "session_start", reason: "new" }, { model: JAIL, ui: u });
+	const result = guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: JAIL, ui: u });
+	assert.equal(result.messages.length, 4, "a new session carries no force from the last one");
+}
+console.log("ok a new session drops the last options");
 
 // A turn file that does not load injects nothing and leaves the prompt text in force.
 {

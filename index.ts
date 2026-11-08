@@ -161,8 +161,10 @@ type State = {
 	decision: Decision | null;
 	reported: Set<string>;
 	gateBlocked: boolean;
-	/** Whether the run being prepared sends a forced prompt, which drops the text after the guard. */
-	forced: boolean;
+	/** The run's system prompt options, held by reference. Pi passes one object to every
+	 * `before_agent_start` handler, so a handler loaded after this one can still force the prompt, and
+	 * only the guard runs late enough to see that. */
+	options: any;
 };
 
 function report(s: State, ctx: any, message: string, type = "error") {
@@ -346,13 +348,13 @@ function syncGate(s: State, want: boolean, ctx: any) {
  * compaction time followed by the summary, and the run-start prompt patch sits ahead of both, so a
  * fixed index would land between them.
  */
-function injectTurns(s: State, ctx: any, current: Decision, messages: any[], next: any[] | undefined, at: number) {
+function injectTurns(s: State, ctx: any, current: Decision, messages: any[], next: any[] | undefined, at: number, forced: boolean) {
 	const specs = current.turns;
 	if (!specs) return { injected: false };
 	const file = basename(current.turnsPath ?? "");
-	// A forced prompt replaces the whole list after this handler, so the block would be dropped
-	// without a word.
-	if (s.forced) {
+	// A forced prompt replaces the system messages after this handler, so the block would sit under a
+	// prompt nobody wrote for it and be dropped without a word.
+	if (forced) {
 		report(s, ctx, `${file} is not injected (another extension replaced the system prompt)`, "warning");
 		return { injected: false };
 	}
@@ -657,7 +659,7 @@ function panel(s: State, ctx: any) {
 }
 
 export default function jailbreak(pi: ExtensionAPI) {
-	const s: State = { api: pi, override: null, delivery: null, decision: null, reported: new Set(), gateBlocked: false, forced: false };
+	const s: State = { api: pi, override: null, delivery: null, decision: null, reported: new Set(), gateBlocked: false, options: null };
 
 	pi.registerTool({
 		name: GATE_TOOL,
@@ -707,6 +709,7 @@ export default function jailbreak(pi: ExtensionAPI) {
 	// recorded for the previous session must not describe this one.
 	pi.on("session_start", (_event, ctx) => {
 		s.gateBlocked = false;
+		s.options = null;
 		s.reported.clear();
 		forgetDelivery(s);
 		const { config } = loadConfig(configPath(), PACKAGE_DIR);
@@ -744,16 +747,13 @@ export default function jailbreak(pi: ExtensionAPI) {
 		// One decision per run: a config edited since the last one is read again here.
 		s.decision = null;
 		const current = buildDecision(s, ctx);
-		// A forced prompt replaces the whole message list after the guard has run, so the text
-		// built there never reaches the request.
-		s.forced = options.forceSystemPrompt !== undefined;
+		// Kept by reference, because the force is read where it matters: a handler loaded after this
+		// one writes it onto this same object, and the guard is the handler that runs after all of them.
+		s.options = options;
 		// A run start is where an edited `inherit` reaches the channel.
 		syncChannel(s, ctx, current.inherit);
 		syncGate(s, current.text !== null, ctx);
 		updateStatus(s, ctx, current);
-		if (current.text && s.forced) {
-			report(s, ctx, `${basename(current.prompt)} is not delivered (another extension replaced the system prompt)`, "warning");
-		}
 	});
 
 	// The guard reads the live model each request. A model switch rebuilds the decision on its next
@@ -773,6 +773,13 @@ export default function jailbreak(pi: ExtensionAPI) {
 		const messages = event.messages;
 		if (!Array.isArray(messages) || messages.length === 0) return;
 		const current = buildDecision(s, ctx);
+		// A forced prompt replaces the system messages after this handler, so neither the text nor the
+		// block reaches the request. Read here, not at run start: the handler that forces the prompt may
+		// be loaded after this one and writes onto the options object this run handed out.
+		const forced = s.options?.forceSystemPrompt !== undefined;
+		if (current.text && forced) {
+			report(s, ctx, `${basename(current.prompt)} is not delivered (another extension replaced the system prompt)`, "warning");
+		}
 		let next = project(messages, current.text !== null);
 		// The leading system message, and where the splice leaves it: pi renders the prompt from
 		// index 0, and the fabricated block is anchored on the first message that is not a system one.
@@ -817,10 +824,10 @@ export default function jailbreak(pi: ExtensionAPI) {
 		}
 		// The fabricated conversation, spliced ahead of the first real user message. A run whose
 		// system prompt was replaced by another extension skips it and says so.
-		const spliced = injectTurns(s, ctx, current, messages, next, at);
+		const spliced = injectTurns(s, ctx, current, messages, next, at, forced);
 		if (spliced.messages) next = spliced.messages;
 		// The footer reports what the request carried, not only what the mode asked for.
-		if (current.text || current.turns) noteDelivery(s, ctx, current, delivered && !s.forced, spliced.injected);
+		if (current.text || current.turns) noteDelivery(s, ctx, current, delivered && !forced, spliced.injected);
 		else forgetDelivery(s);
 		// Aligned: return undefined so the request stays byte-identical and allocation-free.
 		return next === undefined ? undefined : { messages: next };
