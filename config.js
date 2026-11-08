@@ -21,14 +21,15 @@ export const DEFAULT_PROMPT = "prompt.md";
 export const DEFAULT_TURNS = "turn0.yml";
 export const MODES = Object.freeze(["jailbreak", "normal"]);
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
-/** Where the fabricated chain of thought travels: the reasoning field, or fenced at the head of the reply. */
-export const COTS = Object.freeze(["reasoning_content", "content"]);
-export const DEFAULT_COT = "content";
-/** The tag that fences the cot in content mode. `<think>` and `think` name the same tag. */
+/** The tag that fences the cot at the head of the reply. `<think>` and `think` name the same tag. */
 export const DEFAULT_COT_TAG = "think";
+/** The keys a config file and a rule carry. A file takes these and nothing else. */
+const CONFIG_KEYS = Object.freeze(["default", "inherit", "prompt", "turns", "cotTag", "rules"]);
+const RULE_KEYS = Object.freeze(["mode", "provider", "model", "prompt", "turns", "cotTag"]);
+const TAG_ERROR = "cotTag must be a tag name, such as think or <think>";
 
 /** The keys a session answer carries. `turns` is three-state, and the rest are single values. */
-export const SETTINGS_KEYS = Object.freeze(["prompt", "turns", "cot", "cotTag", "inherit"]);
+export const SETTINGS_KEYS = Object.freeze(["prompt", "turns", "cotTag", "inherit"]);
 
 /** A tag name from either spelling, or null when the value is not one. A bracketed value has to be
  * exactly one tag, so a stray `>` or a second pair is rejected rather than trimmed away. */
@@ -41,7 +42,7 @@ export function tagName(value) {
 
 /** What a session uses when no config file loads. */
 export function emptyConfig(dir) {
-	return { default: "normal", inherit: "keyed", prompt: DEFAULT_PROMPT, turns: DEFAULT_TURNS, cot: DEFAULT_COT, cotTag: DEFAULT_COT_TAG, rules: [], dir, path: null };
+	return { default: "normal", inherit: "keyed", prompt: DEFAULT_PROMPT, turns: DEFAULT_TURNS, cotTag: DEFAULT_COT_TAG, rules: [], dir, path: null };
 }
 
 /**
@@ -105,6 +106,9 @@ export function parseConfig(text, dir) {
 		return { error: `invalid JSON: ${error.message}` };
 	}
 	if (!data || typeof data !== "object" || Array.isArray(data)) return { error: "not an object" };
+	for (const key of Object.keys(data)) {
+		if (!CONFIG_KEYS.includes(key)) return { error: `${key} is not a config key (${CONFIG_KEYS.join(", ")})` };
+	}
 	const mode = data.default ?? "normal";
 	if (!MODES.includes(mode)) return { error: `default must be ${MODES.join(" or ")}` };
 	const inherit = data.inherit ?? "keyed";
@@ -115,19 +119,19 @@ export function parseConfig(text, dir) {
 	// config turns it off with `null`.
 	const turns = data.turns === undefined ? DEFAULT_TURNS : data.turns;
 	if (!turnsValue(turns)) return { error: "turns must be a non-empty string or null" };
-	// An api string says nothing about whether the upstream replays a reasoning block, so the channel
-	// is a config value: a rule pins it when the default is wrong for that model.
-	const cot = data.cot ?? DEFAULT_COT;
-	if (!COTS.includes(cot)) return { error: `cot must be ${COTS.join(" or ")}` };
-	// The tag names the fence content mode writes, and either spelling of it is the same tag.
+	// The tag names the fence the fabricated cot is written in, and either spelling of it is the
+	// same tag.
 	const cotTag = data.cotTag === undefined ? DEFAULT_COT_TAG : tagName(data.cotTag);
-	if (!cotTag) return { error: "cotTag must be a tag name, such as think or <think>" };
+	if (!cotTag) return { error: TAG_ERROR };
 	const rules = data.rules ?? [];
 	if (!Array.isArray(rules)) return { error: "rules must be an array" };
 	const out = [];
 	for (const [index, rule] of rules.entries()) {
 		const at = `rule ${index + 1}`;
 		if (!rule || typeof rule !== "object" || Array.isArray(rule)) return { error: `${at} is not an object` };
+		for (const key of Object.keys(rule)) {
+			if (!RULE_KEYS.includes(key)) return { error: `${at}: ${key} is not a rule key (${RULE_KEYS.join(", ")})` };
+		}
 		if (!MODES.includes(rule.mode)) return { error: `${at} needs mode: ${MODES.join(" or ")}` };
 		for (const field of ["provider", "model", "prompt"]) {
 			if (rule[field] === undefined) continue;
@@ -136,12 +140,11 @@ export function parseConfig(text, dir) {
 		// A rule keeps `undefined` apart from `null`: the first inherits the config-level value, the
 		// second turns injection off even when the config names a file.
 		if (rule.turns !== undefined && !turnsValue(rule.turns)) return { error: `${at}: turns must be a non-empty string or null` };
-		if (rule.cot !== undefined && !COTS.includes(rule.cot)) return { error: `${at}: cot must be ${COTS.join(" or ")}` };
 		const ruleTag = rule.cotTag === undefined ? undefined : tagName(rule.cotTag);
-		if (rule.cotTag !== undefined && !ruleTag) return { error: `${at}: cotTag must be a tag name, such as think or <think>` };
-		out.push({ mode: rule.mode, provider: rule.provider, model: rule.model, prompt: rule.prompt, turns: rule.turns, cot: rule.cot, cotTag: ruleTag });
+		if (rule.cotTag !== undefined && !ruleTag) return { error: `${at}: ${TAG_ERROR}` };
+		out.push({ mode: rule.mode, provider: rule.provider, model: rule.model, prompt: rule.prompt, turns: rule.turns, cotTag: ruleTag });
 	}
-	return { config: { default: mode, inherit, prompt, turns, cot, cotTag, rules: out, dir, path: null } };
+	return { config: { default: mode, inherit, prompt, turns, cotTag, rules: out, dir, path: null } };
 }
 
 /** The first rule that matches, or the default. `ruleIndex` is -1 for the default. */
@@ -152,9 +155,9 @@ export function resolve(config, model) {
 		const rule = config.rules[ruleIndex];
 		if (rule.provider !== undefined && !globMatch(rule.provider, provider)) continue;
 		if (rule.model !== undefined && !globMatch(rule.model, id)) continue;
-		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, turns: rule.turns === undefined ? config.turns : rule.turns, cot: rule.cot ?? config.cot, cotTag: rule.cotTag ?? config.cotTag, ruleIndex };
+		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, turns: rule.turns === undefined ? config.turns : rule.turns, cotTag: rule.cotTag ?? config.cotTag, ruleIndex };
 	}
-	return { mode: config.default, prompt: config.prompt, turns: config.turns, cot: config.cot, cotTag: config.cotTag, ruleIndex: -1 };
+	return { mode: config.default, prompt: config.prompt, turns: config.turns, cotTag: config.cotTag, ruleIndex: -1 };
 }
 
 /** A path a session setting names. A typed path means the session's cwd, and an absolute one stays. */
@@ -174,19 +177,19 @@ function settingValue(key, value) {
 		if (typeof value !== "string" || !value.trim()) return { error: "turns must be a non-empty path or null" };
 		return { value: absolutePath(value.trim()) };
 	}
-	if (key === "cot") {
-		const wanted = typeof value === "string" ? value.toLowerCase() : value;
-		if (!COTS.includes(wanted)) return { error: `cot must be ${COTS.join(" or ")}` };
-		return { value: wanted };
-	}
 	if (key === "cotTag") {
 		const tag = tagName(value);
-		if (!tag) return { error: "cotTag must be a tag name, such as think or  thinking" };
+		if (!tag) return { error: TAG_ERROR };
 		return { value: tag };
 	}
-	const wanted = typeof value === "string" ? value.toLowerCase() : value;
-	if (!INHERITS.includes(wanted)) return { error: `inherit must be ${INHERITS.join(", ")}` };
-	return { value: wanted };
+	if (key === "inherit") {
+		const wanted = typeof value === "string" ? value.toLowerCase() : value;
+		if (!INHERITS.includes(wanted)) return { error: `inherit must be ${INHERITS.join(", ")}` };
+		return { value: wanted };
+	}
+	// A key the list above does not name has no value, so a key added to `SETTINGS_KEYS` without a
+	// branch here is rejected instead of validating as something it is not.
+	return { error: `unknown setting: ${key}` };
 }
 
 /**

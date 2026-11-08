@@ -2,7 +2,7 @@
  * `on`, `off` and `toggle` set this session, and `reset` drops that answer. `remember` writes it
  * into the config file, so the next process resolves the same way without the environment channel.
  *
- * `prompt`, `turns`, `cot`, `cotTag` and `inherit` set one session setting each. They last as long as
+ * `prompt`, `turns`, `cotTag` and `inherit` set one session setting each. They last as long as
  * the process, are written only by `remember`, and never touch the mode.
  */
 
@@ -26,8 +26,6 @@ const ARGS = [
 	"prompt",
 	"turns",
 	"turns off",
-	"cot reasoning_content",
-	"cot content",
 	"cotTag think",
 	"inherit keyed",
 	"inherit tree",
@@ -35,10 +33,10 @@ const ARGS = [
 ];
 
 const USAGE =
-	"on | off | toggle | reset | remember on | remember off | prompt <path> | turns <path|off> | cot reasoning_content|content | cotTag <tag> | inherit keyed|tree|none";
+	"on | off | toggle | reset | remember on | remember off | prompt <path> | turns <path|off> | cotTag <tag> | inherit keyed|tree|none";
 
 /** The verbs that set one session setting. The first token is lowercased, so `cotTag` arrives as `cottag`. */
-const SETTINGS = ["prompt", "turns", "cot", "cottag", "inherit"];
+const SETTINGS = ["prompt", "turns", "cottag", "inherit"];
 
 function say(ctx: any, text: string, type: "info" | "error" = "info") {
 	try {
@@ -50,7 +48,7 @@ function say(ctx: any, text: string, type: "info" | "error" = "info") {
 
 export function registerCommands(pi: ExtensionAPI, hooks: Hooks) {
 	pi.registerCommand("jailbreak", {
-		description: "Show or set the mode and the session settings: on, off, toggle, reset, remember, prompt, turns, cot, cotTag, inherit",
+		description: "Show or set the mode and the session settings: on, off, toggle, reset, remember, prompt, turns, cotTag, inherit",
 		getArgumentCompletions: (prefix: string) => {
 			const typed = String(prefix ?? "").trim().toLowerCase();
 			const items = ARGS.filter((value) => value.toLowerCase().startsWith(typed));

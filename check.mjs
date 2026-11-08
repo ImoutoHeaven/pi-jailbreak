@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import def from "./index.ts";
 import { authorizeGate, CSAM_FIELD, GATE_FIELDS, GATE_TOOL } from "./gate.js";
-import { configPath, DEFAULT_TURNS, emptyConfig, globMatch, loadConfig, parseConfig, promptPath, resolve as resolveMode, turnsPath } from "./config.js";
+import { configPath, DEFAULT_TURNS, emptyConfig, globMatch, loadConfig, parseConfig, promptPath, resolve as resolveMode, sessionSettings, SETTINGS_KEYS, turnsPath } from "./config.js";
 import { applies, decode, encode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { loadTurns, parseTurns, toMessages } from "./turns.js";
 
@@ -243,7 +243,6 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "normal",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
-		cot: "content",
 		cotTag: "think",
 		ruleIndex: 0,
 	}, "the first match wins");
@@ -251,7 +250,6 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "jailbreak",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
-		cot: "content",
 		cotTag: "think",
 		ruleIndex: 1,
 	});
@@ -259,7 +257,6 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "jailbreak",
 		prompt: "prompts/glm.md",
 		turns: DEFAULT_TURNS,
-		cot: "content",
 		cotTag: "think",
 		ruleIndex: 2,
 	}, "a missing provider matches any provider");
@@ -267,7 +264,6 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "jailbreak",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
-		cot: "content",
 		cotTag: "think",
 		ruleIndex: 3,
 	}, "a missing model matches any model");
@@ -275,7 +271,6 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		mode: "normal",
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
-		cot: "content",
 		cotTag: "think",
 		ruleIndex: -1,
 	}, "no match falls back to the default");
@@ -305,6 +300,15 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 	}
 }
 console.log("ok cot tag");
+
+// The file takes the keys it names and nothing else: one that still carries the removed channel is
+// rejected whole rather than silently ignored.
+{
+	assert.match(parseConfig(JSON.stringify({ cot: "content" }), "/cfg").error, /cot is not a config key \(default, inherit, prompt, turns, cotTag, rules\)/);
+	assert.match(parseConfig(JSON.stringify({ rules: [{ mode: "jailbreak", cot: "content" }] }), "/cfg").error, /cot is not a rule key \(mode, provider, model, prompt, turns, cotTag\)/);
+	assert.equal(parseConfig(JSON.stringify({ cotTag: "think", rules: [{ mode: "jailbreak", cotTag: "analysis" }] }), "/cfg").error, undefined);
+}
+console.log("ok config keys");
 
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-jailbreak-config-"));
@@ -498,6 +502,9 @@ console.log("ok turns parse");
 }
 console.log("ok turns cache");
 
+/** The fenced cot a fabricated reply leads with: the tag, the cot, the closing tag, then the text. */
+const fenced = (tag, cot, text) => "<" + tag + ">\n" + cot + "\n</" + tag + ">\n\n" + text;
+
 // The mapping to messages: pure, so two builds are identical byte for byte.
 {
 	const specs = [
@@ -506,33 +513,35 @@ console.log("ok turns cache");
 		{ role: "toolResult", name: "gate", text: "ruling" },
 		{ role: "assistant", cot: "", text: "done", call: null },
 	];
-	const options = { provider: "deepseek", api: "openai-completions", model: "deepseek-chat", cotMode: "reasoning_content" };
-	const reasoning = toMessages(specs, options);
+	const options = { provider: "deepseek", api: "openai-completions", model: "deepseek-chat" };
+	const built = toMessages(specs, options);
 	const again = toMessages(specs, options);
-	assert.deepEqual(reasoning, again, "two builds produce identical messages");
-	assert.equal(JSON.stringify(reasoning), JSON.stringify(again));
-	for (const message of reasoning) {
+	assert.deepEqual(built, again, "two builds produce identical messages");
+	assert.equal(JSON.stringify(built), JSON.stringify(again));
+	for (const message of built) {
 		if (message.role !== "assistant") continue;
 		assert.equal(message.provider, "deepseek", "every fabricated assistant carries the live provider");
 		assert.equal(message.api, "openai-completions");
 		assert.equal(message.model, "deepseek-chat");
 	}
-	assert.deepEqual(reasoning[1].content[0], { type: "thinking", thinking: "think", thinkingSignature: "reasoning_content" });
-	assert.equal(reasoning[1].stopReason, "toolUse", "a call is a toolUse turn");
-	assert.equal(reasoning[3].stopReason, "stop");
-	assert.equal(reasoning[2].toolCallId, reasoning[1].content.at(-1).id, "the result answers the call before it");
-	assert.equal(reasoning[2].toolName, "gate");
-	assert.deepEqual(reasoning[2].usage, reasoning[1].usage, "every fabricated message carries the zero record");
-	assert.equal(reasoning[0].timestamp, 0);
+	// The cot is the first text block, fenced; nothing else rides along.
+	assert.deepEqual(built[1].content[0], { type: "text", text: fenced("think", "think", "ok") }, "the cot is fenced at the head of the reply");
+	assert.equal(built[1].content.length, 2, "the fence and the reply are one text block, plus the call");
+	assert.equal(built[1].stopReason, "toolUse", "a call is a toolUse turn");
+	assert.equal(built[3].stopReason, "stop");
+	assert.equal(built[2].toolCallId, built[1].content.at(-1).id, "the result answers the call before it");
+	assert.equal(built[2].toolName, "gate");
+	assert.deepEqual(built[2].usage, built[1].usage, "every fabricated message carries the zero record");
+	assert.equal(built[0].timestamp, 0);
 
-	const visible = toMessages(specs, { ...options, api: "anthropic-messages", cotMode: "content" });
-	assert.equal(visible[1].content[0].type, "text", "cotMode content folds the cot into the visible channel");
-	assert.equal(visible[1].content[0].text, "<think>\nthink\n</think>\n\nok", "fenced at the head of the reply");
-	assert.equal(visible[1].content.some((block) => block.type === "thinking"), false, "and builds no thinking block");
-	assert.equal(visible[1].content.length, 2, "the cot and the reply are one text block, plus the call");
-
-	const custom = toMessages(specs, { ...options, cotMode: "content", cotTag: "analysis" });
-	assert.equal(custom[1].content[0].text, "<analysis>\nthink\n</analysis>\n\nok", "the fence tag follows the config");
+	// The fence is not a protocol: every api gets the same text block, and none gets a thinking block.
+	for (const api of ["anthropic-messages", "openai-responses", "openai-completions"]) {
+		const content = toMessages(specs, { ...options, api }).map((message) => message.content);
+		assert.deepEqual(content, built.map((message) => message.content), `the block is the same on ${api}`);
+		assert.equal(content.some((blocks) => blocks.some((block) => block.type === "thinking")), false, `regression guard: no thinking block on ${api}`);
+	}
+	const custom = toMessages(specs, { ...options, cotTag: "analysis" });
+	assert.equal(custom[1].content[0].text, fenced("analysis", "think", "ok"), "the fence tag follows the config");
 }
 console.log("ok turns messages");
 
@@ -1039,50 +1048,43 @@ console.log("ok turns trailing shape");
 }
 console.log("ok turns nowhere to splice");
 
-// The configured channel decides where the fabricated cot travels, and content mode is reported once.
+// The fence is the format: the same turn file produces the same block on every model, and the
+// extension reports nothing about it.
 {
 	const reasoning = { provider: "deepseek", id: "deepseek-chat", api: "openai-completions" };
 	const plain = { provider: "anthropic", id: "claude", api: "anthropic-messages" };
 	writeFileSync(turnFile, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
 	writeConfig(
 		[
-			{ provider: "deepseek", model: "deepseek-*", mode: "jailbreak", cot: "reasoning_content" },
-			{ provider: "anthropic", model: "claude*", mode: "jailbreak" },
+			{ provider: "deepseek", model: "deepseek-*", mode: "jailbreak" },
+			{ provider: "anthropic", model: "claude*", mode: "jailbreak", cotTag: "analysis" },
 		],
 		{ turns: turnFile },
 	);
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: reasoning, ui: u });
-	assert.equal(u.notes.some(([, text]) => /sent inside content/.test(text)), false, "the reasoning channel is not reported");
 	const block = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u }).messages;
-	assert.equal(block.at(-2).content[0].type, "thinking");
-	assert.equal(block.at(-2).content[0].thinkingSignature, "reasoning_content");
+	assert.equal(block.at(-2).content[0].type, "text", "the cot is a text block");
+	assert.equal(block.at(-2).content[0].text, fenced("think", "think", "ok"), "fenced in the default tag");
+	assert.equal(u.notes.some(([, text]) => /chain of thought|sent inside/.test(text)), false, "regression guard: the extension narrates nothing about the fence");
 
 	const u2 = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: plain, ui: u2 });
-	assert.ok(u2.notes.some(([type, text]) => type === "info" && /sent inside content/.test(text)), "the content channel is reported once");
-	const visible = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: plain, ui: u2 }).messages;
-	assert.equal(visible.at(-2).content[0].type, "text", "cotMode content produces no thinking block");
-	assert.equal(visible.at(-2).content[0].text, "<think>\nthink\n</think>\n\nok");
+	const tagged = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: plain, ui: u2 }).messages;
+	assert.equal(tagged.at(-2).content[0].type, "text", "a different api changes nothing about the shape");
+	assert.equal(tagged.at(-2).content[0].text, fenced("analysis", "think", "ok"), "the rule's tag fences it");
 
-	// A rule pins content mode on an api that could have carried reasoning.
-	writeConfig([{ provider: "deepseek", model: "deepseek-*", mode: "jailbreak", cot: "content" }], { turns: turnFile });
+	// One tag, two models: the spliced content is the same, and only the message stamps differ.
+	writeConfig([{ model: "*", mode: "jailbreak" }], { turns: turnFile, cotTag: "think" });
 	const u3 = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: reasoning, ui: u3 });
-	assert.ok(u3.notes.some(([type, text]) => type === "info" && /sent inside content/.test(text)), "a pinned content channel is reported");
-	const pinned = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u3 }).messages;
-	assert.equal(pinned.at(-2).content[0].type, "text", "the pinned channel folds the cot into content");
-	assert.equal(pinned.at(-2).content[0].text, "<think>\nthink\n</think>\n\nok");
-
-	// A config that names no channel folds the cot into content, even where reasoning could carry it.
-	writeConfig([{ provider: "deepseek", model: "deepseek-*", mode: "jailbreak" }], { turns: turnFile });
+	const deep = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u3 }).messages;
 	const u4 = ui();
-	await before({ systemPromptOptions: { sections: {} } }, { model: reasoning, ui: u4 });
-	const folded = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u4 }).messages;
-	assert.equal(folded.at(-2).content[0].type, "text", "the default channel emits no thinking block");
-	assert.equal(folded.at(-2).content[0].text, "<think>\nthink\n</think>\n\nok", "the default channel folds the cot into content");
+	await before({ systemPromptOptions: { sections: {} } }, { model: plain, ui: u4 });
+	const other = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: plain, ui: u4 }).messages;
+	assert.deepEqual(deep.map((message) => message.content), other.map((message) => message.content), "one tag, the same content on every model");
 }
-console.log("ok turns cot channel");
+console.log("ok turns fence");
 
 // A forced prompt replaces the list after the guard, so that run carries no fabricated block.
 {
@@ -1226,26 +1228,23 @@ console.log("ok panel names no model");
 }
 console.log("ok remember refuses without a model");
 
-// Keys the extension does not own survive a write.
+// A file the extension cannot read whole is one it does not rewrite.
 {
 	const command = commands.get("jailbreak");
-	writeFileSync(
-		configFile,
-		JSON.stringify({
-			note: "mine",
-			default: "normal",
-			rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", label: "keep" }],
-		}),
-	);
-	await command.handler("remember on", { model: JAIL, ui: ui() });
-	const data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.note, "mine", "a foreign top-level key survives");
-	assert.equal(data.rules[0].model, "deepseek-flash", "the exact rule goes first");
-	assert.equal(data.rules[1].label, "keep", "a foreign rule key survives");
-	assert.equal(data.rules[1].mode, "jailbreak");
+	const text = JSON.stringify({
+		note: "mine",
+		default: "normal",
+		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }],
+	});
+	writeFileSync(configFile, text);
+	const u = ui();
+	await command.handler("remember on", { model: JAIL, ui: u });
+	assert.equal(u.notes.at(-1)[0], "error", "a key the extension does not take is refused");
+	assert.match(u.notes.at(-1)[1], /note is not a config key/);
+	assert.equal(readFileSync(configFile, "utf8"), text, "and the file is left as it was");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
 }
-console.log("ok remember keeps foreign keys");
+console.log("ok remember refuses a file it cannot read whole");
 
 // A rule the wildcard above it shadows is moved to the front, so the next process resolves it.
 {
@@ -1327,62 +1326,60 @@ console.log("ok remember moves a shadowed rule");
 }
 console.log("ok remember keeps the prompt in force");
 
-// Remembering carries a pinned channel, or the exact rule it writes would silently drop the channel
-// and the tag the wildcard rule gave the model.
+// Remembering carries the tag, or the exact rule it writes would silently drop what the wildcard
+// rule gave the model.
 {
 	const command = commands.get("jailbreak");
 	const resolved = () => resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, JAIL);
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cot: "content", cotTag: "reasoning" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cotTag: "reasoning" }]);
 	await command.handler("remember on", { model: JAIL, ui: ui() });
 	let data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].cot, "content", "the pinned channel is carried to the rule that takes over");
-	assert.equal(data.rules[0].cotTag, "reasoning", "and so is the tag");
-	assert.equal(resolved().cot, "content");
+	assert.equal(data.rules[0].cotTag, "reasoning", "the tag is carried to the rule that takes over");
 	assert.equal(resolved().cotTag, "reasoning");
 
-	// A wildcard that leaves both keys absent still lets the new rule inherit the config level.
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }], { cot: "content" });
+	// A wildcard that leaves the key absent still lets the new rule inherit the config level.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }], { cotTag: "analysis" });
 	await command.handler("remember on", { model: JAIL, ui: ui() });
 	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].cot, undefined, "an absent key stays absent, so the config level still applies");
-	assert.equal(resolved().cot, "content");
+	assert.equal(data.rules[0].cotTag, undefined, "an absent key stays absent, so the config level still applies");
+	assert.equal(resolved().cotTag, "analysis");
 
-	// The update branch: an exact rule behind the wildcard moves up and takes the channel with it.
+	// The update branch: an exact rule behind the wildcard moves up and takes the tag with it.
 	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cot: "content", cotTag: "reasoning" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cotTag: "reasoning" },
 		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "normal" },
 	]);
 	await command.handler("remember on", { model: JAIL, ui: ui() });
 	data = JSON.parse(readFileSync(configFile, "utf8"));
 	assert.equal(data.rules.length, 2, "the exact rule is moved, not duplicated");
-	assert.equal(data.rules[0].cot, "content", "the moved rule carries the channel the wildcard gave it");
-	assert.equal(data.rules[0].cotTag, "reasoning", "and the tag");
-	assert.equal(resolved().cot, "content");
+	assert.equal(data.rules[0].cotTag, "reasoning", "the moved rule carries the tag the wildcard gave it");
 	assert.equal(resolved().cotTag, "reasoning");
 
-	// An exact rule that pins its own channel keeps it.
+	// An exact rule that pins its own tag keeps it.
 	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cot: "content", cotTag: "reasoning" },
-		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "normal", cot: "reasoning_content", cotTag: "analysis" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cotTag: "reasoning" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "normal", cotTag: "analysis" },
 	]);
 	await command.handler("remember on", { model: JAIL, ui: ui() });
 	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].cot, "reasoning_content", "a rule's own channel is not overwritten");
-	assert.equal(data.rules[0].cotTag, "analysis");
+	assert.equal(data.rules[0].cotTag, "analysis", "a rule's own tag is not overwritten");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
 }
-console.log("ok remember keeps the cot channel in force");
+console.log("ok remember keeps the cot tag in force");
 
 // Remembering carries the turns value the model resolves, including an explicit null: an absent key
 // would inherit a config-level default and turn injection back on.
 {
 	const command = commands.get("jailbreak");
 	const inForce = join(tempDir, "ds-turn0.yml");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", turns: null }], { turns: inForce });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", turns: null }], { turns: inForce, cotTag: "analysis" });
 	await command.handler("remember on", { model: JAIL, ui: ui() });
 	let data = JSON.parse(readFileSync(configFile, "utf8"));
 	assert.equal(data.rules[0].turns, null, "an explicit null is written, so the new rule does not inherit the default");
 	assert.equal(data.rules[1].turns, null, "and the rule it shadows keeps its own value");
+	assert.equal(data.turns, inForce, "the config-level turns value survives the write");
+	assert.equal(data.cotTag, "analysis", "and so does the config-level tag");
+	assert.equal(data.rules[0].cotTag, undefined, "a tag the session did not set is not pinned on the rule");
 
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", turns: "ds/turn0.yml" }]);
 	await command.handler("remember on", { model: JAIL, ui: ui() });
@@ -1401,6 +1398,7 @@ console.log("ok remember keeps the turns in force");
 	await command.handler("remember on", { model: JAIL, ui: u });
 	assert.equal(u.notes.at(-1)[0], "error");
 	assert.match(u.notes.at(-1)[1], /jailbreak\.json/);
+	assert.match(u.notes.at(-1)[1], /invalid JSON/, "the message comes from the parser the loader uses");
 	assert.equal(readFileSync(configFile, "utf8"), before_, "the broken file is untouched");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak" }]);
 }
@@ -1420,7 +1418,7 @@ console.log("ok remember refuses a broken file");
 console.log("ok reset reports the config mode");
 
 // ---------------------------------------------------------------------------
-// Session settings: prompt, turns, cot, cotTag, inherit
+// Session settings: prompt, turns, cotTag, inherit
 // ---------------------------------------------------------------------------
 {
 	const command = commands.get("jailbreak");
@@ -1539,16 +1537,13 @@ console.log("ok reset reports the config mode");
 	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("TREE TEXT"), "a config tree governs the other model");
 	await command.handler("reset", ctx);
 
-	// The cot channel and the tag that fences it.
+	// The tag that fences the cot.
 	writeFileSync(sessionTurns, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
 	writeConfig(jail, { turns: sessionTurns });
-	await command.handler("cot content", ctx);
-	assert.equal(u.notes.at(-1)[1], "cot content");
 	await command.handler("cotTag analysis", ctx);
 	assert.equal(u.notes.at(-1)[1], "cotTag analysis");
 	await run(JAIL);
-	assert.equal(guardRun([head(""), turn]).messages[2].content[0].text, "<analysis>\nthink\n</analysis>\n\nok", "the session tag fences the cot");
-	await command.handler("cot default", ctx);
+	assert.equal(guardRun([head(""), turn]).messages[2].content[0].text, fenced("analysis", "think", "ok"), "the session tag fences the cot");
 	await command.handler("cotTag default", ctx);
 	assert.equal(u.notes.at(-1)[1], "cotTag default (config)");
 
@@ -1556,14 +1551,14 @@ console.log("ok reset reports the config mode");
 	writeConfig(jail);
 	await command.handler("reset", ctx);
 	await command.handler(`prompt ${altPrompt}`, ctx);
-	await command.handler("cot content", ctx);
-	assert.equal(u.notes.at(-1)[1], "cot content");
+	await command.handler("cotTag analysis", ctx);
+	assert.equal(u.notes.at(-1)[1], "cotTag analysis");
 	await command.handler("turns off", ctx);
 	await command.handler("inherit keyed", ctx);
 	await command.handler("remember on", ctx);
 	let data = JSON.parse(readFileSync(configFile, "utf8"));
 	assert.equal(data.rules[0].prompt, altPrompt, "the written rule carries the session prompt");
-	assert.equal(data.rules[0].cot, "content");
+	assert.equal(data.rules[0].cotTag, "analysis");
 	assert.equal(data.rules[0].turns, null, "an explicit null is written");
 	assert.equal(data.inherit, "keyed");
 	assert.doesNotMatch(await panel(), /^session\s/m, "the session row is gone once the file carries it");
@@ -1581,17 +1576,17 @@ console.log("ok reset reports the config mode");
 
 	// A key the session set wins over a value the rule already pins.
 	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cot: "reasoning_content", turns: "x.yml" },
-		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "jailbreak", cot: "reasoning_content", turns: "x.yml" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "jailbreak", cotTag: "reasoning", turns: "x.yml" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "jailbreak", cotTag: "reasoning", turns: "x.yml" },
 	]);
 	await command.handler("reset", ctx);
-	await command.handler("cot content", ctx);
-	assert.equal(u.notes.at(-1)[1], "cot content");
+	await command.handler("cotTag analysis", ctx);
+	assert.equal(u.notes.at(-1)[1], "cotTag analysis");
 	await command.handler("turns off", ctx);
 	await command.handler("remember on", ctx);
 	data = JSON.parse(readFileSync(configFile, "utf8"));
 	assert.equal(data.rules.length, 2, "the exact rule is updated, not duplicated");
-	assert.equal(data.rules[0].cot, "content", "a session key is written over the rule's own value");
+	assert.equal(data.rules[0].cotTag, "analysis", "a session key is written over the rule's own value");
 	assert.equal(data.rules[0].turns, null);
 
 	// A refused write changes nothing.
@@ -1623,18 +1618,28 @@ console.log("ok reset reports the config mode");
 	{
 		const pid = process.pid;
 		const ppid = process.ppid;
-		const full = { prompt: "/abs/Alt.md", turns: null, cot: "content", cotTag: "analysis", inherit: "keyed" };
+		const full = { prompt: "/abs/Alt.md", turns: null, cotTag: "analysis", inherit: "keyed" };
 		assert.deepEqual(decode(encode({ mode: "on", key: "A/B", settings: full }, pid), { ppid, pid }).settings, full);
 		assert.equal(
 			decode(encode({ mode: "on", key: "A/B", settings: { prompt: "rel/Alt.md" } }, pid), { ppid, pid }).settings.prompt,
 			resolve(process.cwd(), "rel/Alt.md"),
 			"a relative path is normalized on both entry points",
 		);
-		for (const bad of [{ s: null }, { s: [] }, { s: { nope: "x" } }, { s: { cot: "x" } }, { s: { turns: "" } }, { s: { prompt: "" } }]) {
+		for (const bad of [{ s: null }, { s: [] }, { s: { nope: "x" } }, { s: { cot: "keyed" } }, { s: { cotTag: "1bad" } }, { s: { turns: "" } }, { s: { prompt: "" } }]) {
 			assert.equal(decode(JSON.stringify({ m: "on", k: "*", p: pid, ...bad }), { ppid, pid }), null, `a malformed s is rejected whole: ${JSON.stringify(bad)}`);
 		}
 		assert.deepEqual(decode(JSON.stringify({ m: "on", k: "*", p: pid }), { ppid, pid }).settings, {});
 		assert.equal(encode({ mode: "on", key: "*", settings: {} }, pid), JSON.stringify({ m: "on", k: "*", p: pid }), "an empty set writes no s");
+	}
+
+	// Every key the list names is a setting that can be set: a key with no branch of its own would be a
+	// dead entry that rejects every value it is given.
+	{
+		const sample = { prompt: "p.md", turns: null, cotTag: "think", inherit: "keyed" };
+		assert.deepEqual(Object.keys(sample).sort(), [...SETTINGS_KEYS].sort(), "the sample covers the list and nothing else");
+		for (const key of SETTINGS_KEYS) {
+			assert.equal(sessionSettings({ [key]: sample[key] }).error, undefined, `${key} is settable`);
+		}
 	}
 
 	// A reload keeps the settings on the process; a malformed process answer is not trusted.
@@ -1645,7 +1650,7 @@ console.log("ok reset reports the config mode");
 	await start({ type: "session_start", reason: "reload" }, {});
 	await run(JAIL);
 	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "a reload keeps the settings on the process");
-	globalThis[Symbol.for("pi-jailbreak.process-answer")] = { mode: "on", key: "A/B", settings: { cot: "bogus" } };
+	globalThis[Symbol.for("pi-jailbreak.process-answer")] = { mode: "on", key: "A/B", settings: { cotTag: "1bad" } };
 	delete process.env[ENV_NAME];
 	await start({ type: "session_start", reason: "startup" }, {});
 	await run(JAIL);
@@ -1670,7 +1675,6 @@ console.log("ok reset reports the config mode");
 	await command.handler("reset", ctx);
 	await command.handler(`prompt ${altPrompt}`, ctx);
 	for (const [args, pattern] of [
-		["cot nonsense", /cot must be/],
 		["cotTag 1bad", /cotTag must be/],
 		["inherit nope", /inherit must be/],
 		["prompt", /prompt needs a value/],
@@ -1680,11 +1684,15 @@ console.log("ok reset reports the config mode");
 		assert.equal(u.notes.at(-1)[0], "error", `${args} is an error`);
 		assert.match(u.notes.at(-1)[1], pattern);
 	}
+	// The removed verb is not a verb: it prints the usage and changes nothing.
+	await command.handler("cot content", ctx);
+	assert.equal(u.notes.at(-1)[0], "info", "an unknown verb is not an error");
+	assert.match(u.notes.at(-1)[1], /prompt <path>/, "it prints the usage");
+	assert.equal(/cot(?![A-Za-z])/.test(u.notes.at(-1)[1]), false, "the usage names no removed verb");
 	const row = await panel();
 	assert.ok(row.includes(`prompt=${altPrompt}`), "a rejected verb leaves the settings alone");
-	assert.doesNotMatch(row, /cot=/);
 	assert.doesNotMatch(row, /inherit=/);
-	await command.handler("cot content", { ui: u });
+	await command.handler("cotTag analysis", { ui: u });
 	assert.equal(u.notes.at(-1)[1], "no model selected");
 
 	// reset drops the settings with the answer, and publishes nothing.
@@ -1708,9 +1716,9 @@ console.log("ok reset reports the config mode");
 	// A settings verb never flips the mode.
 	writeConfig([{ provider: "openai", model: "gpt-*", mode: "normal" }]);
 	await command.handler("reset", { model: NORMAL, ui: u });
-	await command.handler("cot content", { model: NORMAL, ui: u });
+	await command.handler("cotTag analysis", { model: NORMAL, ui: u });
 	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "a settings verb does not turn the mode on");
-	assert.equal(JSON.parse(process.env[ENV_NAME]).s.cot, "content", "the payload carries the setting");
+	assert.equal(JSON.parse(process.env[ENV_NAME]).s.cotTag, "analysis", "the payload carries the setting");
 
 	// The mode verbs keep the settings.
 	writeConfig(jail);
@@ -1746,7 +1754,7 @@ console.log("ok reset reports the config mode");
 	await select({ type: "model_select" }, { model: NORMAL, ui: u });
 	await run(NORMAL);
 	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "the config leaves the other model normal");
-	await command.handler("cot content", { model: NORMAL, ui: u });
+	await command.handler("cotTag analysis", { model: NORMAL, ui: u });
 	await run(NORMAL);
 	assert.ok(
 		guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("This is YG's context."),
@@ -1754,11 +1762,8 @@ console.log("ok reset reports the config mode");
 	);
 
 	// The completions list the verbs and their literals.
-	assert.deepEqual(command.getArgumentCompletions("cot "), [
-		{ value: "cot reasoning_content", label: "cot reasoning_content" },
-		{ value: "cot content", label: "cot content" },
-		{ value: "cotTag think", label: "cotTag think" },
-	]);
+	assert.deepEqual(command.getArgumentCompletions("cot"), [{ value: "cotTag think", label: "cotTag think" }]);
+	assert.deepEqual(command.getArgumentCompletions("cot "), [{ value: "cotTag think", label: "cotTag think" }], "the trailing space is the same prefix");
 	assert.deepEqual(command.getArgumentCompletions("inherit "), [
 		{ value: "inherit keyed", label: "inherit keyed" },
 		{ value: "inherit tree", label: "inherit tree" },

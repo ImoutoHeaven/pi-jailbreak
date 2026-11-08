@@ -6,9 +6,9 @@
  * rebuilt from the file on every request: the transcript records nothing for it.
  *
  * Rejection is whole. A file with one bad item injects nothing, because a half-fabricated history
- * would leave the model an assistant turn nobody answered. The structural rules are the ones the
- * provider adapters need: a `result` answers the `call` before it, the sequence begins with `user`,
- * and no assistant is left with empty content, which all three adapters silently drop.
+ * would leave the model an assistant turn nobody answered. The structural rules are the ones a
+ * transcript needs: a `result` answers the `call` before it, the sequence begins with `user`,
+ * and no assistant is left with empty content, which pi drops from a transcript.
  *
  * Pure functions and one cache. `toMessages` is the only one that runs per request.
  */
@@ -207,14 +207,15 @@ function zeroUsage() {
  * The specs as pi messages. Pure object construction: nothing here reads the clock, the transcript
  * or the file, so two calls with the same specs produce identical bytes.
  *
- * `cotMode` decides the channel the fabricated chain of thought travels in. `reasoning_content` is
- * the field the OpenAI-compatible adapter writes a thinking block to, so a block carrying that
- * signature reaches the model as reasoning. `content` puts the cot at the head of the reply, fenced
- * in the tag `cotTag` names, which is the shape to use where the api has no replayable reasoning
- * field: `anthropic` converts a signature-less block to text on its own, and `openai-responses`
- * parses any signature it is given, so a bare block is unsafe there.
+ * The fabricated cot is written at the head of the reply, fenced in the tag `cotTag` names, so the
+ * turn reads as reasoning the assistant wrote down followed by what it said. The fence is text and
+ * nothing else: a text block is the one block every message carries unchanged, so the same file
+ * produces the same bytes whatever the model behind it.
+ *
+ * The messages are stamped with the live model, so pi reads them as that model's own earlier turns
+ * rather than as history carried over from somewhere else.
  */
-export function toMessages(specs, { provider, api, model, cotMode, cotTag }) {
+export function toMessages(specs, { provider, api, model, cotTag }) {
 	const messages = [];
 	// The id of the last call, which the result after it answers.
 	let lastCall = null;
@@ -237,14 +238,10 @@ export function toMessages(specs, { provider, api, model, cotMode, cotTag }) {
 			continue;
 		}
 		const content = [];
-		if (cotMode === "reasoning_content" && spec.cot) {
-			content.push({ type: "thinking", thinking: spec.cot, thinkingSignature: "reasoning_content" });
-		}
-		// In content mode the cot leads the reply, fenced so it reads as reasoning the assistant wrote
-		// down rather than as a second thing it said. One block, because the responses adapter emits a
-		// separate message item per text block.
+		// The cot leads the reply, fenced so it reads as reasoning the assistant wrote down rather
+		// than as a second thing it said. One block, so the fence and the reply stay one turn.
 		const tag = cotTag || "think";
-		const lead = cotMode === "content" && spec.cot ? `<${tag}>\n${spec.cot}\n</${tag}>` : "";
+		const lead = spec.cot ? `<${tag}>\n${spec.cot}\n</${tag}>` : "";
 		const visible = [lead, spec.text].filter(Boolean).join("\n\n");
 		if (visible) content.push({ type: "text", text: visible });
 		if (spec.call) {

@@ -39,7 +39,7 @@ import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { authorizeGate, GATE_FIELDS, GATE_TOOL, normalizeFields } from "./gate.js";
-import { configPath, DEFAULT_COT, loadConfig, parseConfig, promptPath, resolve, sessionSettings, settingFromCommand, turnsPath } from "./config.js";
+import { configPath, loadConfig, parseConfig, promptPath, resolve, sessionSettings, settingFromCommand, turnsPath } from "./config.js";
 import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { cachedFile, loadTurns, toMessages } from "./turns.js";
 import { registerCommands } from "./commands.ts";
@@ -105,7 +105,6 @@ type Decision = {
 	turns: TurnSpec[] | null;
 	turnsError: string | null;
 	turnsPath: string | null;
-	cotMode: "reasoning_content" | "content";
 	cotTag: string;
 	prompt: string;
 	source: string;
@@ -118,7 +117,6 @@ type Decision = {
 type Settings = {
 	prompt?: string;
 	turns?: string | null;
-	cot?: "reasoning_content" | "content";
 	cotTag?: string;
 	inherit?: string;
 };
@@ -229,13 +227,6 @@ function buildDecision(s: State, ctx: any): Decision {
 			report(s, ctx, file.error, "warning");
 		} else turns = file.specs;
 	}
-	// The configured channel, downgraded where the api has no replayable reasoning field: anthropic
-	// drops a signature-less thinking block, and openai-responses parses any signature as JSON.
-	const wanted = settings.cot ?? hit.cot ?? DEFAULT_COT;
-	const cotMode = wanted === "reasoning_content" && ctx?.model?.api === "openai-completions" ? "reasoning_content" : "content";
-	if (turns && cotMode === "content" && turns.some((spec) => spec.role === "assistant" && spec.cot)) {
-		report(s, ctx, `${basename(turnsFile ?? "")}: the chain of thought is sent inside content on ${ctx?.model?.api ?? "this api"}`, "info");
-	}
 	s.decision = {
 		key,
 		mode,
@@ -243,7 +234,6 @@ function buildDecision(s: State, ctx: any): Decision {
 		turns,
 		turnsError,
 		turnsPath: turnsFile,
-		cotMode,
 		cotTag: settings.cotTag ?? hit.cotTag,
 		prompt,
 		source: session ? "session" : hit.ruleIndex < 0 ? "default" : `rule ${hit.ruleIndex + 1}`,
@@ -377,7 +367,6 @@ function injectTurns(s: State, ctx: any, current: Decision, messages: any[], nex
 		provider: ctx?.model?.provider,
 		api: ctx?.model?.api,
 		model: ctx?.model?.id,
-		cotMode: current.cotMode,
 		cotTag: current.cotTag,
 	});
 	// Two points, so a pasted message that happens to match one fabricated one does not pass for a
@@ -553,14 +542,17 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	const id = String(ctx?.model?.id ?? "");
 	if (!hasModel(ctx)) return { ok: false, message: "nothing written: no model selected" };
 	const path = configPath();
-	let data: any = {};
+	let text = "{}";
 	try {
-		data = JSON.parse(readFileSync(path, "utf8"));
+		text = readFileSync(path, "utf8");
 	} catch (error: any) {
 		if (error?.code !== "ENOENT") return { ok: false, message: `${path}: ${error?.message ?? "unreadable"}` };
 	}
-	const parsed = parseConfig(JSON.stringify(data), dirname(path));
+	// The bytes go through the same parse the loader uses, so a broken file reads the same way from
+	// both surfaces. A file that parses is an object, and the write below starts from it.
+	const parsed = parseConfig(text, dirname(path));
 	if (parsed.error) return { ok: false, message: `${path}: ${parsed.error}` };
+	const data = JSON.parse(text);
 	// The rule that governs this model now. The rule this command writes takes over its text, or
 	// remembering a mode would silently switch the model to the default prompt file.
 	const applied = resolve(parsed.config, ctx?.model);
@@ -571,9 +563,8 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// The rule this command writes takes over the text, or remembering a mode would silently switch
 	// the model to the default prompt file.
 	const carried = s0.prompt ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].prompt : undefined);
-	// The channel is carried the same way: a rule that pinned `content` or its own tag keeps it, and a
-	// rule that left the key absent still inherits the config level.
-	const carriedCot = s0.cot ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cot : undefined);
+	// The tag is carried the same way: a rule that pinned its own keeps it, and a rule that left the
+	// key absent still inherits the config level.
 	const carriedCotTag = s0.cotTag ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cotTag : undefined);
 	// The turns value the model resolves, written even when it is null: an absent key would inherit a
 	// config-level default and turn injection back on.
@@ -596,7 +587,6 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 			...updated,
 			mode: next,
 			...(s0.prompt !== undefined ? { prompt: s0.prompt } : updated.prompt === undefined && carried ? { prompt: carried } : {}),
-			...(s0.cot !== undefined ? { cot: s0.cot } : updated.cot === undefined && carriedCot ? { cot: carriedCot } : {}),
 			...(s0.cotTag !== undefined ? { cotTag: s0.cotTag } : updated.cotTag === undefined && carriedCotTag ? { cotTag: carriedCotTag } : {}),
 			...(s0.turns !== undefined ? { turns: s0.turns } : updated.turns === undefined ? { turns: carriedTurns } : {}),
 		});
@@ -606,7 +596,6 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 			model: id,
 			mode: next,
 			...(carried ? { prompt: carried } : {}),
-			...(carriedCot ? { cot: carriedCot } : {}),
 			...(carriedCotTag ? { cotTag: carriedCotTag } : {}),
 			turns: carriedTurns,
 		});

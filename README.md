@@ -47,7 +47,8 @@ A model takes the first rule whose `provider` and `model` both match. A missing 
 anything. A pattern without `*` is exact, `*` matches any run of characters, and matching ignores
 case. `mode` is `jailbreak` or `normal`. `prompt.md` is the text that ships with the extension; any
 other `prompt` path is relative to the config file. A file with one bad value is rejected whole and
-reported once, and the empty config applies instead.
+reported once, and the empty config applies instead. A key the extension does not take is one of
+those values, so a typo or a key from another version fails loudly instead of being ignored.
 
 `turns` names the YAML file whose messages are spliced ahead of the first real user message. It has
 three states: absent takes `turn0.yml`, the file that ships with the extension, `null` turns the
@@ -63,20 +64,14 @@ holding the config file.
 }
 ```
 
-`cot` decides the channel the fabricated chain of thought travels in, and a rule's own value wins
-over the config-level one. `content` is the default: it fences the cot in `<think>` tags at the
-head of the assistant reply. `reasoning_content` puts it in the reasoning field, and it holds only
-on an api that replays one; every other api uses `content` whatever the config says.
-
-`cotTag` names the tag that fences it. It defaults to `think`, and either spelling of one
-tag is the same tag: `think` and `<think>` both write `<think>` and `</think>`. A rule's own
-value wins over the config-level one.
+`cotTag` names the tag the fabricated cot is fenced in at the head of the assistant reply. It
+defaults to `think`, and either spelling of one tag is the same tag: `think` and `<think>` both
+write `<think>` and `</think>`. A rule's own value wins over the config-level one.
 
 ```json
 {
-	"cot": "content",
 	"cotTag": "think",
-	"rules": [{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "jailbreak", "cot": "reasoning_content", "cotTag": "reasoning" }]
+	"rules": [{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "jailbreak", "cotTag": "reasoning" }]
 }
 ```
 
@@ -108,13 +103,12 @@ the live model resolves at that moment.
 
 | Command | Effect |
 |---|---|
-| `/jailbreak` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the session settings it carries, the prompt file, the config file, and the inherited value if there is one |
+| `/jailbreak` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the session settings it carries, the prompt file, the turn file, the config file, and the inherited value if there is one |
 | `/jailbreak on` / `off` / `toggle` | Set the mode for this session, keeping its settings |
 | `/jailbreak reset` | Drop the session answer and its settings, so the config decides again |
 | `/jailbreak prompt <path>` / `prompt default` | Point the session at another prompt file, or back at the config |
 | `/jailbreak turns <path>` / `turns off` / `turns default` | Inject another turn file, turn the block off, or take the config value. `./off` names a file literally called `off` |
-| `/jailbreak cot reasoning_content\|content` / `cot default` | The channel the fabricated cot travels in |
-| `/jailbreak cotTag <tag>` / `cotTag default` | The tag that fences the cot in content mode; `think` and ` thinking` are one tag |
+| `/jailbreak cotTag <tag>` / `cotTag default` | The tag that fences the fabricated cot; `think` and `<think>` are one tag |
 | `/jailbreak inherit keyed\|tree\|none` / `inherit default` | What this session hands to the processes it starts |
 | `/jailbreak remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, carry the session setting or else the file that model already resolves to, and apply it now |
 
@@ -209,21 +203,16 @@ The block is spliced before the first message that is not a system message, so i
 prompt and after a compaction summary, and the leading system message moves to index 0 with it. It
 is rebuilt from the file on every request, so the transcript records nothing: a model switch, a
 fork, a reload or a new session leaves nothing to clean up. The bytes depend on the file, the model,
-and the resolved `cot` and `cotTag`, so the block stays inside the provider's prompt cache.
+and the resolved `cotTag`, so the block stays inside the provider's prompt cache.
 
 The last item decides what the model reads immediately before the real request. `assistant` closes
 the block with a reply, and the request follows as a new turn. `result` closes it with tool output,
 which is the shape to use when the fabricated turn carries a gate ruling. `user` closes it with an
-unanswered turn, which Anthropic combines with the real request and the OpenAI-compatible apis send
-as written.
+unanswered turn, so the block ends on a question the model answers together with the real request.
 
-The fabricated chain of thought travels in the channel `cot` selects. `content`, the default, puts
-it at the head of the assistant reply, fenced in `<think>` tags, so the turn reads as reasoning the
-assistant wrote down followed by what it said. `reasoning_content` puts it in the field the
-OpenAI-compatible adapter writes a thinking block to, on an api that replays one. `content` is the
-channel every api without a replayable reasoning field gets: `openai-responses` parses any thinking
-signature it is given, and Anthropic turns a signature-less block into text on its own. The
-extension reports the content channel once per session.
+The fabricated chain of thought sits at the head of the assistant reply, fenced in `cotTag` tags,
+so the turn reads as reasoning the assistant wrote down followed by what it said. The fence is
+ordinary text: one text block, and the same block on every model.
 
 A file that does not load injects nothing, reports once, and leaves the prompt text in force. The
 footer shows `JailBreak !` while a configured block is missing, and `/jailbreak` names the file and
