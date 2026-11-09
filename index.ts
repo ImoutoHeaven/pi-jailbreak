@@ -129,7 +129,7 @@ type Answer = { mode: "on" | "off"; key: string; settings: Settings };
  * extension again for `/new`, a fork or a session switch, and `/reload` re-evaluates this module,
  * so the value lives on the process instead of in module memory.
  */
-const PROCESS_ANSWER = Symbol.for("pi-jailbreak.process-answer");
+const PROCESS_ANSWER = Symbol.for("pi-leviathan.process-answer");
 
 /** The process answer, or null when it is absent or the settings it carries are not ones we write. */
 function readProcessAnswer(): Answer | null {
@@ -174,7 +174,7 @@ function report(s: State, ctx: any, message: string, type = "error") {
 		const ui = ctx?.ui;
 		// A headless session carries a UI that shows nothing, so the message waits for one that does.
 		if (!ui || ctx?.hasUI === false) return;
-		ui.notify(`pi-jailbreak: ${message}`, type);
+		ui.notify(`pi-leviathan: ${message}`, type);
 		// Recorded only once it is shown, so a UI that throws is told again rather than silenced.
 		s.reported.add(key);
 	} catch {

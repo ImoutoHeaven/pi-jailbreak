@@ -27,7 +27,7 @@ try {
 	YAML = null;
 }
 
-const MISSING = "the yaml package is not installed (run npm install in the pi-jailbreak directory)";
+const MISSING = "the yaml package is not installed (run npm install in the pi-leviathan directory)";
 const KEYS = ["user", "assistant", "result"];
 /** The keys each role's mapping may carry. `result` takes a string and no mapping at all. */
 const TAKES = { user: ["text"], assistant: ["text", "cot", "call"] };

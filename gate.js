@@ -115,7 +115,7 @@ const FIELD_SET = new Set(GATE_FIELDS);
 // A field the schema offers but this table cannot rule on would approve with nothing to say.
 for (const field of GATE_FIELDS) {
 	if (field !== CSAM_FIELD && !APPROVALS.has(field)) {
-		throw new Error(`pi-jailbreak: ${field} has no approval line`);
+		throw new Error(`pi-leviathan: ${field} has no approval line`);
 	}
 }
 

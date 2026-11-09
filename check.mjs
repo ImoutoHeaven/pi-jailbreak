@@ -311,7 +311,7 @@ console.log("ok cot tag");
 console.log("ok config keys");
 
 {
-	const dir = mkdtempSync(join(tmpdir(), "pi-jailbreak-config-"));
+	const dir = mkdtempSync(join(tmpdir(), "pi-leviathan-config-"));
 	const file = join(dir, "jailbreak.json");
 	writeFileSync(file, JSON.stringify({ rules: [{ model: "*", mode: "jailbreak" }] }));
 	const first = loadConfig(file, dir);
@@ -485,7 +485,7 @@ console.log("ok turns parse");
 
 // The cache holds the error beside the specs, so a revision parses once either way.
 {
-	const dir = mkdtempSync(join(tmpdir(), "pi-jailbreak-turns-"));
+	const dir = mkdtempSync(join(tmpdir(), "pi-leviathan-turns-"));
 	const file = join(dir, "turn0.yml");
 	writeFileSync(file, "- user: a\n- assistant: b\n");
 	const first = loadTurns(file);
@@ -559,7 +559,7 @@ const STOCK_PREAMBLES = [STOCK_PREAMBLE_140, STOCK_PREAMBLE_150];
 // The wording the fixtures below use: 1.5.0's, the newest known.
 const STOCK_PREAMBLE = STOCK_PREAMBLE_150;
 
-const tempDir = mkdtempSync(join(tmpdir(), "pi-jailbreak-"));
+const tempDir = mkdtempSync(join(tmpdir(), "pi-leviathan-"));
 process.on("exit", () => rmSync(tempDir, { recursive: true, force: true }));
 const configFile = join(tempDir, "jailbreak.json");
 process.env.PI_JAILBREAK_CONFIG = configFile;
@@ -1158,7 +1158,7 @@ console.log("ok a new session drops the last options");
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: JAIL, ui: u });
 	assert.equal(lastStatus(u), "JailBreak !", "a turn file that does not load shows in the footer");
-	assert.ok(u.notes.some(([type, text]) => type === "warning" && /^pi-jailbreak: turn0\.yml: item 2: note is not one of/.test(text)), "the report names the file and the item");
+	assert.ok(u.notes.some(([type, text]) => type === "warning" && /^pi-leviathan: turn0\.yml: item 2: note is not one of/.test(text)), "the report names the file and the item");
 	const result = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: JAIL, ui: u });
 	assert.equal(result.messages[0].content, promptText, "the prompt text is delivered either way");
 	assert.equal(result.messages.length, 2, "and nothing is injected");
@@ -1701,13 +1701,13 @@ console.log("ok reset reports the config mode");
 	await start({ type: "session_start", reason: "reload" }, {});
 	await run(JAIL);
 	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "a reload keeps the settings on the process");
-	globalThis[Symbol.for("pi-jailbreak.process-answer")] = { mode: "on", key: "A/B", settings: { cotTag: "1bad" } };
+	globalThis[Symbol.for("pi-leviathan.process-answer")] = { mode: "on", key: "A/B", settings: { cotTag: "1bad" } };
 	delete process.env[ENV_NAME];
 	await start({ type: "session_start", reason: "startup" }, {});
 	await run(JAIL);
 	assert.equal(guardRun([head(""), turn]).messages[0].content, promptText, "a malformed process answer resolves from the config");
 	await command.handler("reset", ctx);
-	globalThis[Symbol.for("pi-jailbreak.process-answer")] = { mode: "on", key: "*", settings: { prompt: relative(process.cwd(), altPrompt) } };
+	globalThis[Symbol.for("pi-leviathan.process-answer")] = { mode: "on", key: "*", settings: { prompt: relative(process.cwd(), altPrompt) } };
 	delete process.env[ENV_NAME];
 	await start({ type: "session_start", reason: "startup" }, {});
 	await run(JAIL);
@@ -2026,7 +2026,7 @@ console.log("ok an inherited tree answer narrows");
 	assert.equal(process.env[ENV_NAME], before_, "a context without a model writes nothing");
 	assert.ok(u.notes.some(([type, message]) => type === "warning" && /no model/.test(message)));
 	assert.equal(u.notes.at(-1)[1], "jailbreak off (unchanged)", "the command says nothing changed");
-	assert.ok(u.notes.some(([type, message]) => type === "warning" && /^pi-jailbreak: no model selected$/.test(message)));
+	assert.ok(u.notes.some(([type, message]) => type === "warning" && /^pi-leviathan: no model selected$/.test(message)));
 }
 console.log("ok no model publishes nothing");
 

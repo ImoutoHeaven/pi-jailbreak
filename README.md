@@ -1,4 +1,4 @@
-# pi-jailbreak
+# pi-leviathan
 
 A Pi extension that puts the text of `prompt.md` at the head of the system prompt for the sessions a
 rule selects, splices a fabricated conversation ahead of the first real user message for the
@@ -15,7 +15,7 @@ directory first:
 
 ```bash
 npm install --no-audit --no-fund
-pi install /path/to/pi-jailbreak
+pi install /path/to/pi-leviathan
 ```
 
 `pi -e ./index.ts` loads it for one run. The extension reads its own directory, so `prompt.md`,
