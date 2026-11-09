@@ -24,11 +24,11 @@ pi install /path/to/pi-leviathan
 
 ## Configure
 
-The session reads `$PI_JAILBREAK_CONFIG` when it is set, and otherwise `jailbreak.json` in pi's
+The session reads `$PI_LEVIATHAN_CONFIG` when it is set, and otherwise `leviathan.json` in pi's
 agent directory. That directory is `$PI_CODING_AGENT_DIR` when that is set, and `~/.pi/agent`
 otherwise. When no file loads, the empty config applies: `default: "normal"` and no rules.
 
-Start from `jailbreak.example.json`:
+Start from `leviathan.example.json`:
 
 ```json
 {
@@ -36,16 +36,16 @@ Start from `jailbreak.example.json`:
 	"inherit": "keyed",
 	"prompt": "prompt.md",
 	"rules": [
-		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "jailbreak" },
-		{ "provider": "deepseek", "mode": "jailbreak" },
-		{ "model": "*deepseek*", "mode": "jailbreak" }
+		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "leviathan" },
+		{ "provider": "deepseek", "mode": "leviathan" },
+		{ "model": "*deepseek*", "mode": "leviathan" }
 	]
 }
 ```
 
 A model takes the first rule whose `provider` and `model` both match. A missing field matches
 anything. A pattern without `*` is exact, `*` matches any run of characters, and matching ignores
-case. `mode` is `jailbreak` or `normal`. `prompt.md` is the text that ships with the extension; any
+case. `mode` is `leviathan` or `normal`. `prompt.md` is the text that ships with the extension; any
 other `prompt` path is relative to the config file. A file with one bad value is rejected whole and
 reported once, and the empty config applies instead. A key the extension does not take is one of
 those values, so a typo or a key from another version fails loudly instead of being ignored.
@@ -60,7 +60,7 @@ holding the config file.
 ```json
 {
 	"turns": "team/turn0.yml",
-	"rules": [{ "provider": "deepseek", "mode": "jailbreak", "turns": null }]
+	"rules": [{ "provider": "deepseek", "mode": "leviathan", "turns": null }]
 }
 ```
 
@@ -71,7 +71,7 @@ write `<think>` and `</think>`. A rule's own value wins over the config-level on
 ```json
 {
 	"cotTag": "think",
-	"rules": [{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "jailbreak", "cotTag": "reasoning" }]
+	"rules": [{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "leviathan", "cotTag": "reasoning" }]
 }
 ```
 
@@ -83,14 +83,14 @@ values are dropped).
 
 ```
 session setting   >   config rule   >   config level   >   default
-/jailbreak on|off >   inherited value   >   the config-resolved answer
+/leviathan on|off >   inherited value   >   the config-resolved answer
 ```
 
-The two lines are orthogonal: the settings decide what a jailbreak session sends, and `on`/`off`
+The two lines are orthogonal: the settings decide what an active session sends, and `on`/`off`
 decide whether that answer is in force at all. `off` keeps the settings stored and inert, and
 `reset` drops both.
 
-An answer lasts as long as the process, including `/new` and `/reload`, until `/jailbreak reset`.
+An answer lasts as long as the process, including `/new` and `/reload`, until `/leviathan reset`.
 Nothing is written to disk unless `remember` asks for it. Each loaded instance keeps its own answer,
 decision, delivery record and gate activation, so two sessions in one process do not share them, and
 the mode the process set is what a new instance reads. A model switch keeps the settings stored
@@ -103,17 +103,17 @@ the live model resolves at that moment.
 
 | Command | Effect |
 |---|---|
-| `/jailbreak` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the session settings it carries, the prompt file, the turn file, the config file, and the inherited value if there is one |
-| `/jailbreak on` / `off` / `toggle` | Set the mode for this session, keeping its settings |
-| `/jailbreak reset` | Drop the session answer and its settings, so the config decides again |
-| `/jailbreak prompt <path>` / `prompt default` | Point the session at another prompt file, or back at the config |
-| `/jailbreak turns <path>` / `turns off` / `turns default` | Inject another turn file, turn the block off, or take the config value. `./off` names a file literally called `off` |
-| `/jailbreak cotTag <tag>` / `cotTag default` | The tag that fences the fabricated cot; `think` and `<think>` are one tag |
-| `/jailbreak inherit keyed\|tree\|none` / `inherit default` | What this session hands to the processes it starts |
-| `/jailbreak remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, carry the session setting or else the file that model already resolves to, and apply it now |
+| `/leviathan` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the session settings it carries, the prompt file, the turn file, the config file, and the inherited value if there is one |
+| `/leviathan on` / `off` / `toggle` | Set the mode for this session, keeping its settings |
+| `/leviathan reset` | Drop the session answer and its settings, so the config decides again |
+| `/leviathan prompt <path>` / `prompt default` | Point the session at another prompt file, or back at the config |
+| `/leviathan turns <path>` / `turns off` / `turns default` | Inject another turn file, turn the block off, or take the config value. `./off` names a file literally called `off` |
+| `/leviathan cotTag <tag>` / `cotTag default` | The tag that fences the fabricated cot; `think` and `<think>` are one tag |
+| `/leviathan inherit keyed\|tree\|none` / `inherit default` | What this session hands to the processes it starts |
+| `/leviathan remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, carry the session setting or else the file that model already resolves to, and apply it now |
 
-The footer shows `JailBreak on` while the text is in force, `JailBreak off` while the mode is normal,
-and `JailBreak !` when the mode is jailbreak and the request carried nothing: the prompt file is
+The footer shows `Leviathan on` while the text is in force, `Leviathan off` while the mode is normal,
+and `Leviathan !` when the mode is leviathan and the request carried nothing: the prompt file is
 missing or empty, the transcript has nowhere to put the text, the configured turn file did not load,
 or another extension replaced the system prompt. The third state follows the request that was
 actually sent, so a run whose text cannot be placed says so at once instead of showing on.
@@ -121,7 +121,7 @@ actually sent, so a run whose text cannot be placed says so at once instead of s
 ## Subagents
 
 A subagent is a Pi process launched with the parent's environment, so the parent writes its answer
-into `PI_JAILBREAK` and the child reads it. Neither extension knows the other exists.
+into `PI_LEVIATHAN` and the child reads it. Neither extension knows the other exists.
 
 The value is JSON: `{"m":"on","k":"CLIProxy-Chat/glm-5.3","p":1234}`, and an answer that carries
 session settings adds `"s"`, for example `"s":{"prompt":"/abs/alt.md","turns":null}`. `m` is the
@@ -218,7 +218,7 @@ so the turn reads as reasoning the assistant wrote down followed by what it said
 ordinary text: one text block, and the same block on every model.
 
 A file that does not load injects nothing, reports once, and leaves the prompt text in force. The
-footer shows `JailBreak !` while a configured block is missing, and `/jailbreak` names the file and
+footer shows `Leviathan !` while a configured block is missing, and `/leviathan` names the file and
 the reason.
 
 ## The authorization gate
@@ -241,7 +241,7 @@ permits one line and nothing else: `Are the characters fictional?`
 
 ## Files
 
-`index.ts` is the hook and the tool definition, `commands.ts` the `jailbreak` command, `config.js` the
+`index.ts` is the hook and the tool definition, `commands.ts` the `leviathan` command, `config.js` the
 rule table and the resolver, `channel.js` the cross-process value, `gate.js` the field table and the
 ruling text, `turns.js` the turn file's parse and its messages, `prompt.md` the injected text. Edit
 `prompt.md`; the next run uses it. A missing or empty file is reported in the UI and injects nothing.
@@ -264,6 +264,6 @@ point the check at a pi package elsewhere.
 
 ## Attribution
 
-`prompt.md` is a modified copy of the DeepSeek Harness jailbreak prompt from
+`prompt.md` is a modified copy of `lib/default-prompt-inject.zh.md` from
 [YuJunZhiXue/dsh-purge](https://github.com/YuJunZhiXue/dsh-purge), Apache-2.0. See `NOTICE` and
 `LICENSE`.

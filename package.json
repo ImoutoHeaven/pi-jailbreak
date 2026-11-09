@@ -3,7 +3,7 @@
 	"version": "0.3.0",
 	"private": true,
 	"type": "module",
-	"description": "Puts a jailbreak prompt at the head of the system prompt in the sessions a rule selects, and declares ask_authorize_gate while that text is in force.",
+	"description": "Puts a leviathan prompt at the head of the system prompt in the sessions a rule selects, and declares ask_authorize_gate while that text is in force.",
 	"license": "Apache-2.0",
 	"pi": {
 		"extensions": [

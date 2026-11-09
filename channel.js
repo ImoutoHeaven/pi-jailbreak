@@ -15,7 +15,7 @@
 
 import { sessionSettings } from "./config.js";
 
-export const ENV_NAME = "PI_JAILBREAK";
+export const ENV_NAME = "PI_LEVIATHAN";
 
 /** `provider/id`, the key a rule matches and a value is published under. */
 export function modelKey(model) {

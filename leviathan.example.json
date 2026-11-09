@@ -1,0 +1,10 @@
+{
+	"default": "normal",
+	"inherit": "keyed",
+	"prompt": "prompt.md",
+	"rules": [
+		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "leviathan" },
+		{ "provider": "deepseek", "mode": "leviathan" },
+		{ "model": "*deepseek*", "mode": "leviathan" }
+	]
+}

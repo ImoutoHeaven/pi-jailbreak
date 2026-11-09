@@ -47,7 +47,7 @@ function say(ctx: any, text: string, type: "info" | "error" = "info") {
 }
 
 export function registerCommands(pi: ExtensionAPI, hooks: Hooks) {
-	pi.registerCommand("jailbreak", {
+	pi.registerCommand("leviathan", {
 		description: "Show or set the mode and the session settings: on, off, toggle, reset, remember, prompt, turns, cotTag, inherit",
 		getArgumentCompletions: (prefix: string) => {
 			const typed = String(prefix ?? "").trim().toLowerCase();
@@ -66,11 +66,11 @@ export function registerCommands(pi: ExtensionAPI, hooks: Hooks) {
 			const value = cut < 0 ? "" : raw.slice(cut + 1).trim();
 			if (first === "on" || first === "off" || first === "toggle") {
 				const result = hooks.set(ctx, first);
-				say(ctx, result.applied ? `jailbreak ${result.mode}` : `jailbreak ${result.mode} (unchanged)`);
+				say(ctx, result.applied ? `leviathan ${result.mode}` : `leviathan ${result.mode} (unchanged)`);
 				return;
 			}
 			if (first === "reset") {
-				say(ctx, `jailbreak ${hooks.reset(ctx)} (config)`);
+				say(ctx, `leviathan ${hooks.reset(ctx)} (config)`);
 				return;
 			}
 			if (first === "remember") {
@@ -80,7 +80,7 @@ export function registerCommands(pi: ExtensionAPI, hooks: Hooks) {
 					return;
 				}
 				const result = hooks.remember(ctx, mode);
-				say(ctx, result.ok ? `remembered: jailbreak ${mode} in ${result.message}` : result.message, result.ok ? "info" : "error");
+				say(ctx, result.ok ? `remembered: leviathan ${mode} in ${result.message}` : result.message, result.ok ? "info" : "error");
 				return;
 			}
 			if (SETTINGS.includes(first)) {

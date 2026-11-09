@@ -1,5 +1,5 @@
 /**
- * Injects the jailbreak text into the system prompt of the sessions a rule selects, and a fabricated
+ * Injects the leviathan text into the system prompt of the sessions a rule selects, and a fabricated
  * conversation ahead of the first real user message in the sessions a turn file selects.
  *
  * The text goes in as the head of the leading system message's `content`, ahead of every section,
@@ -100,7 +100,7 @@ type TurnSpec =
  */
 type Decision = {
 	key: string;
-	mode: "jailbreak" | "normal";
+	mode: "leviathan" | "normal";
 	text: string | null;
 	turns: TurnSpec[] | null;
 	turnsError: string | null;
@@ -214,12 +214,12 @@ function buildDecision(s: State, ctx: any): Decision {
 	const session = s.override && (tree || applies(s.override, key)) ? s.override : null;
 	// Session settings win over the rule, and an absent one leaves the config in charge.
 	const settings = session?.settings ?? {};
-	const mode = session ? (session.mode === "on" ? "jailbreak" : "normal") : hit.mode;
+	const mode = session ? (session.mode === "on" ? "leviathan" : "normal") : hit.mode;
 	const prompt = settings.prompt ?? promptPath(config, hit.prompt);
-	const text = mode === "jailbreak" ? readPrompt(s, prompt, ctx) ?? null : null;
-	// The fabricated conversation is read only in a jailbreak session: a normal one never opens it.
+	const text = mode === "leviathan" ? readPrompt(s, prompt, ctx) ?? null : null;
+	// The fabricated conversation is read only in a leviathan session: a normal one never opens it.
 	const turnsFile =
-		mode !== "jailbreak" ? null : settings.turns !== undefined ? settings.turns : hit.turns ? turnsPath(config, hit.turns) : null;
+		mode !== "leviathan" ? null : settings.turns !== undefined ? settings.turns : hit.turns ? turnsPath(config, hit.turns) : null;
 	let turns: TurnSpec[] | null = null;
 	let turnsError: string | null = null;
 	if (turnsFile) {
@@ -399,14 +399,14 @@ function updateStatus(s: State, ctx: any, current: Decision) {
 		s.delivery.prompt === current.prompt &&
 		(!s.delivery.delivered || (s.delivery.turns !== null && !s.delivery.injected));
 	const state = !current.text
-		? current.mode === "jailbreak"
-			? "JailBreak !"
-			: "JailBreak off"
+		? current.mode === "leviathan"
+			? "Leviathan !"
+			: "Leviathan off"
 		: lost || current.turnsError
-			? "JailBreak !"
-			: "JailBreak on";
+			? "Leviathan !"
+			: "Leviathan on";
 	try {
-		ctx?.ui?.setStatus?.("jailbreak", state);
+		ctx?.ui?.setStatus?.("leviathan", state);
 	} catch {
 		// Status is decoration; a mode without a terminal must not fail a run.
 	}
@@ -468,11 +468,11 @@ function setOverride(s: State, ctx: any, mode: "on" | "off" | "toggle"): { mode:
 		report(s, ctx, "no model selected", "warning");
 		s.decision = null;
 		const now = buildDecision(s, ctx);
-		return { mode: now.mode === "jailbreak" ? "on" : "off", applied: false };
+		return { mode: now.mode === "leviathan" ? "on" : "off", applied: false };
 	}
 	const key = modelKey(ctx?.model);
 	const before = buildDecision(s, ctx);
-	const current = s.override && applies(s.override, key) ? s.override.mode : before.mode === "jailbreak" ? "on" : "off";
+	const current = s.override && applies(s.override, key) ? s.override.mode : before.mode === "leviathan" ? "on" : "off";
 	const next = mode === "toggle" ? (current === "on" ? "off" : "on") : mode;
 	// Under a tree the stored key is the scope the answer governs, so the panel and the payload agree.
 	setAnswer(s, { mode: next, key: before.inherit === "tree" ? "*" : key, settings: s.override?.settings ?? {} });
@@ -509,7 +509,7 @@ function configure(s: State, ctx: any, name: string, value: string): { ok: boole
 	const inheritAfter = settings.inherit ?? loadConfig(configPath(), PACKAGE_DIR).config.inherit;
 	const answerKey = inheritAfter === "tree" ? "*" : s.override && applies(s.override, key) ? s.override.key : key;
 	// The answer keeps its own mode: a setting is not a mode change, and re-keying must not flip it.
-	const mode = s.override ? s.override.mode : before.mode === "jailbreak" ? "on" : "off";
+	const mode = s.override ? s.override.mode : before.mode === "leviathan" ? "on" : "off";
 	setAnswer(s, { mode, key: answerKey, settings });
 	forgetDelivery(s);
 	s.decision = null;
@@ -531,7 +531,7 @@ function clearOverride(s: State, ctx: any): "on" | "off" {
 	const current = buildDecision(s, ctx);
 	syncGate(s, current.text !== null, ctx);
 	updateStatus(s, ctx, current);
-	return current.mode === "jailbreak" ? "on" : "off";
+	return current.mode === "leviathan" ? "on" : "off";
 }
 
 /**
@@ -579,7 +579,7 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 			rule.provider.toLowerCase() === provider.toLowerCase() &&
 			rule.model.toLowerCase() === id.toLowerCase(),
 	);
-	const next = mode === "on" ? "jailbreak" : "normal";
+	const next = mode === "on" ? "leviathan" : "normal";
 	// The first matching rule wins, so an exact rule behind a wildcard has to move up, not be
 	// edited where it sits.
 	if (at >= 0) {
@@ -649,7 +649,7 @@ function panel(s: State, ctx: any) {
 		["prompt", current.prompt],
 		["turns", current.turnsPath ?? "off"],
 	];
-	if (current.mode === "jailbreak" && !current.text) rows.push(["text", "missing"]);
+	if (current.mode === "leviathan" && !current.text) rows.push(["text", "missing"]);
 	rows.push(["inherit", current.inherit], ["config", current.configPath ?? "none"]);
 	if (inherited) rows.push(["env", `${inherited.mode}@${inherited.key} ${applies(inherited, current.key) ? "applied" : "ignored"}`]);
 	if (current.error) rows.push(["error", current.error]);
@@ -658,7 +658,7 @@ function panel(s: State, ctx: any) {
 	return rows.map(([name, value]) => `${name.padEnd(width)}${value}`).join("\n");
 }
 
-export default function jailbreak(pi: ExtensionAPI) {
+export default function leviathan(pi: ExtensionAPI) {
 	const s: State = { api: pi, override: null, delivery: null, decision: null, reported: new Set(), gateBlocked: false, options: null };
 
 	pi.registerTool({

@@ -16,10 +16,10 @@ import { homedir } from "node:os";
 
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
 
-export const CONFIG_NAME = "jailbreak.json";
+export const CONFIG_NAME = "leviathan.json";
 export const DEFAULT_PROMPT = "prompt.md";
 export const DEFAULT_TURNS = "turn0.yml";
-export const MODES = Object.freeze(["jailbreak", "normal"]);
+export const MODES = Object.freeze(["leviathan", "normal"]);
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
 /** The tag that fences the cot at the head of the reply. `<think>` and `think` name the same tag. */
 export const DEFAULT_COT_TAG = "think";
@@ -50,7 +50,7 @@ export function emptyConfig(dir) {
  * session, and a repository copy would decide what the model gets for everyone who opens it.
  */
 export function configPath(env = process.env, home = homedir()) {
-	if (env?.PI_JAILBREAK_CONFIG) return env.PI_JAILBREAK_CONFIG;
+	if (env?.PI_LEVIATHAN_CONFIG) return env.PI_LEVIATHAN_CONFIG;
 	// Pi's own override decides where the agent directory is, and the config sits in it.
 	const agentDir = env?.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
 	return join(agentDir, CONFIG_NAME);
