@@ -28,16 +28,16 @@ const ARGS = [
 	"turns off",
 	"cotTag think",
 	"forge auto",
-	"forge always",
 	"forge off",
-	"forgeMaxChars 4000",
+	"forgeMaxChars 1200",
+	"forgeMaxChars none",
 	"inherit keyed",
 	"inherit tree",
 	"inherit none",
 ];
 
 const USAGE =
-	"on | off | toggle | reset | remember on | remember off | prompt <path> | turns <path|off> | cotTag <tag> | forge auto|always|off | forgeMaxChars <n> | inherit keyed|tree|none";
+	"on | off | toggle | reset | remember on | remember off | prompt <path> | turns <path|off> | cotTag <tag> | forge auto|off | forgeMaxChars <n|none> | inherit keyed|tree|none";
 
 /** The verbs that set one session setting. The first token is lowercased, so `cotTag` arrives as `cottag`. */
 const SETTINGS = ["prompt", "turns", "cottag", "forge", "forgemaxchars", "inherit"];

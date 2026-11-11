@@ -119,7 +119,8 @@ type Decision = {
 	turnsPath: string | null;
 	cotTag: string;
 	forge: string;
-	forgeMaxChars: number;
+	// `null` is no bound, so it is a value the decision carries rather than an absence.
+	forgeMaxChars: number | null;
 	prompt: string;
 	source: string;
 	inherit: string;
@@ -133,7 +134,7 @@ type Settings = {
 	turns?: string | null;
 	cotTag?: string;
 	forge?: string;
-	forgeMaxChars?: number;
+	forgeMaxChars?: number | null;
 	inherit?: string;
 };
 
@@ -254,7 +255,9 @@ function buildDecision(s: State, ctx: any): Decision {
 		turnsPath: turnsFile,
 		cotTag: settings.cotTag ?? hit.cotTag,
 		forge: settings.forge ?? hit.forge,
-		forgeMaxChars: settings.forgeMaxChars ?? hit.forgeMaxChars,
+		// `null` is a session asking for no bound, so it is a value: `??` would read it as an unset
+		// key and hand the config's bound back, which is the one thing the session said not to do.
+		forgeMaxChars: settings.forgeMaxChars !== undefined ? settings.forgeMaxChars : hit.forgeMaxChars,
 		prompt,
 		source: session ? "session" : hit.ruleIndex < 0 ? "default" : `rule ${hit.ruleIndex + 1}`,
 		inherit: settings.inherit ?? config.inherit,
@@ -536,7 +539,8 @@ function configure(s: State, ctx: any, name: string, value: string): { ok: boole
 	syncGate(s, after.text !== null, ctx);
 	updateStatus(s, ctx, after);
 	if (assignment.value === undefined) return { ok: true, message: `${assignment.key} default (config)` };
-	if (assignment.value === null) return { ok: true, message: `${assignment.key} off` };
+	// `null` is two things: injection off for `turns`, and no bound for `forgeMaxChars`.
+	if (assignment.value === null) return { ok: true, message: `${assignment.key} ${assignment.key === "forgeMaxChars" ? "none" : "off"}` };
 	return { ok: true, message: `${assignment.key} ${assignment.value}` };
 }
 
@@ -593,7 +597,7 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// writing it is harmless and a rule that never carried the key stays clean.
 	const carriedForge = s0.forge ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].forge : undefined);
 	const carriedForgeMaxChars =
-		s0.forgeMaxChars ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].forgeMaxChars : undefined);
+		s0.forgeMaxChars !== undefined ? s0.forgeMaxChars : applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].forgeMaxChars : undefined;
 	const rules = Array.isArray(data.rules) ? data.rules : [];
 	const at = rules.findIndex(
 		(rule: any) =>
@@ -616,7 +620,7 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 			...(s0.forge !== undefined ? { forge: s0.forge } : updated.forge === undefined && carriedForge ? { forge: carriedForge } : {}),
 			...(s0.forgeMaxChars !== undefined
 				? { forgeMaxChars: s0.forgeMaxChars }
-				: updated.forgeMaxChars === undefined && carriedForgeMaxChars
+				: updated.forgeMaxChars === undefined && carriedForgeMaxChars !== undefined
 					? { forgeMaxChars: carriedForgeMaxChars }
 					: {}),
 			...(s0.turns !== undefined ? { turns: s0.turns } : updated.turns === undefined ? { turns: carriedTurns } : {}),
@@ -629,7 +633,8 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 			...(carried ? { prompt: carried } : {}),
 			...(carriedCotTag ? { cotTag: carriedCotTag } : {}),
 			...(carriedForge ? { forge: carriedForge } : {}),
-			...(carriedForgeMaxChars ? { forgeMaxChars: carriedForgeMaxChars } : {}),
+			// Written even when it is `null`: an absent key would inherit the config's bound.
+			...(carriedForgeMaxChars !== undefined ? { forgeMaxChars: carriedForgeMaxChars } : {}),
 			turns: carriedTurns,
 		});
 	}
@@ -671,7 +676,7 @@ function panel(s: State, ctx: any) {
 	// The session row lists what the answer carries, and says so when a model switch left it unapplied.
 	const settings = s.override?.settings ?? {};
 	const shown = Object.entries(settings)
-		.map(([name, value]) => `${name}=${value === null ? "off" : value}`)
+		.map(([name, value]) => `${name}=${value === null ? (name === "forgeMaxChars" ? "none" : "off") : value}`)
 		.join(" ");
 	const rows: string[][] = [
 		["model", hasModel(ctx) ? current.key : "(none)"],
@@ -680,7 +685,7 @@ function panel(s: State, ctx: any) {
 		...(shown ? [["session", `${s.override?.mode === "on" ? "on" : "off"}@${s.override?.key ?? ""} ${shown}${current.source === "session" ? "" : " (not applied)"}`]] : []),
 		["prompt", current.prompt],
 		["turns", current.turnsPath ?? "off"],
-		["forge", `${current.forge} (${current.forgeMaxChars < 0 ? "no bound" : `${current.forgeMaxChars} chars`})`],
+		["forge", `${current.forge} (${current.forgeMaxChars === null ? "no bound" : `${current.forgeMaxChars} chars`})`],
 	];
 	if (current.mode === "leviathan" && !current.text) rows.push(["text", "missing"]);
 	rows.push(["inherit", current.inherit], ["config", current.configPath ?? "none"]);
@@ -822,13 +827,7 @@ export default function leviathan(pi: ExtensionAPI) {
 		const forged =
 			current.forge === "off" || !hasModel(ctx) || routed
 				? messages
-				: forgeHistory(
-						messages,
-						{ provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id },
-						current.cotTag,
-						current.forgeMaxChars,
-						current.forge === "always",
-					);
+				: forgeHistory(messages, { provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id }, current.cotTag, current.forgeMaxChars);
 		// 2) The prompt head, then the fabricated block. `project` only ever removes a section key
 		// from a system message, which forge never touched.
 		let next = project(forged, current.text !== null);

@@ -25,19 +25,16 @@ export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
 export const DEFAULT_COT_TAG = "think";
 /**
  * How a message whose CoT pi drops is refilled. `auto` follows pi, which is the only setting that
- * keeps the two predicates complements; `always` also fences a message pi would carry, which shows
- * a double trace and is worth having only to diagnose one; `off` refills nothing.
+ * keeps the two predicates complements; `off` refills nothing.
  */
-export const FORGE_MODES = Object.freeze(["auto", "always", "off"]);
+export const FORGE_MODES = Object.freeze(["auto", "off"]);
 export const DEFAULT_FORGE = "auto";
-/** The most CoT characters a refilled turn may carry, so a long trace cannot dominate a request. */
-export const DEFAULT_FORGE_MAX_CHARS = 4000;
 /** The keys a config file and a rule carry. A file takes these and nothing else. */
 const CONFIG_KEYS = Object.freeze(["default", "inherit", "prompt", "turns", "cotTag", "forge", "forgeMaxChars", "rules"]);
 const RULE_KEYS = Object.freeze(["mode", "provider", "model", "prompt", "turns", "cotTag", "forge", "forgeMaxChars"]);
 const TAG_ERROR = "cotTag must be a tag name, such as think or <think>";
 const FORGE_ERROR = `forge must be ${FORGE_MODES.join(", ")}`;
-const FORGE_MAX_CHARS_ERROR = "forgeMaxChars must be a whole number other than 0, or negative for no bound";
+const FORGE_MAX_CHARS_ERROR = "forgeMaxChars must be a positive whole number, or null for no bound";
 
 /** The keys a session answer carries. `turns` is three-state, and the rest are single values. */
 export const SETTINGS_KEYS = Object.freeze(["prompt", "turns", "cotTag", "forge", "forgeMaxChars", "inherit"]);
@@ -60,7 +57,9 @@ export function emptyConfig(dir) {
 		turns: DEFAULT_TURNS,
 		cotTag: DEFAULT_COT_TAG,
 		forge: DEFAULT_FORGE,
-		forgeMaxChars: DEFAULT_FORGE_MAX_CHARS,
+		// Nothing is cut unless a config asks for it: a truncated trace is not the reasoning the turn
+		// wrote, and a model reading a cut-off version of its own thinking has reason to distrust it.
+		forgeMaxChars: null,
 		rules: [],
 		dir,
 		path: null,
@@ -73,10 +72,12 @@ export function forgeMode(value) {
 	return FORGE_MODES.includes(wanted) ? wanted : null;
 }
 
-/** A character budget for the refilled CoT. A negative value means no bound, which is how a
- * session asks for the whole trace. */
+/** A character bound for the refilled CoT as `{ chars }`, where `chars: null` is no bound at all.
+ * `null` is the only value outside the bound, and a value that is neither is rejected rather than
+ * read as one of the two. */
 export function forgeChars(value) {
-	return Number.isSafeInteger(value) && value !== 0 ? value : null;
+	if (value === null) return { chars: null };
+	return Number.isSafeInteger(value) && value > 0 ? { chars: value } : null;
 }
 
 /**
@@ -161,7 +162,7 @@ export function parseConfig(text, dir) {
 	// reads as `auto` and silently changes what a request carries.
 	const forge = data.forge === undefined ? DEFAULT_FORGE : forgeMode(data.forge);
 	if (!forge) return { error: FORGE_ERROR };
-	const forgeMaxChars = data.forgeMaxChars === undefined ? DEFAULT_FORGE_MAX_CHARS : forgeChars(data.forgeMaxChars);
+	const forgeMaxChars = data.forgeMaxChars === undefined ? { chars: null } : forgeChars(data.forgeMaxChars);
 	if (!forgeMaxChars) return { error: FORGE_MAX_CHARS_ERROR };
 	const rules = data.rules ?? [];
 	if (!Array.isArray(rules)) return { error: "rules must be an array" };
@@ -194,10 +195,10 @@ export function parseConfig(text, dir) {
 			turns: rule.turns,
 			cotTag: ruleTag,
 			forge: ruleForge,
-			forgeMaxChars: ruleForgeChars,
+			forgeMaxChars: ruleForgeChars?.chars,
 		});
 	}
-	return { config: { default: mode, inherit, prompt, turns, cotTag, forge, forgeMaxChars, rules: out, dir, path: null } };
+	return { config: { default: mode, inherit, prompt, turns, cotTag, forge, forgeMaxChars: forgeMaxChars.chars, rules: out, dir, path: null } };
 }
 
 /** The first rule that matches, or the default. `ruleIndex` is -1 for the default. */
@@ -214,7 +215,8 @@ export function resolve(config, model) {
 			turns: rule.turns === undefined ? config.turns : rule.turns,
 			cotTag: rule.cotTag ?? config.cotTag,
 			forge: rule.forge ?? config.forge,
-			forgeMaxChars: rule.forgeMaxChars ?? config.forgeMaxChars,
+			// `null` is a value here, not an absence: a rule turns the bound off by naming it.
+			forgeMaxChars: rule.forgeMaxChars === undefined ? config.forgeMaxChars : rule.forgeMaxChars,
 			ruleIndex,
 		};
 	}
@@ -257,11 +259,12 @@ function settingValue(key, value) {
 		return { value: mode };
 	}
 	if (key === "forgeMaxChars") {
-		// A command line carries text, so a numeric string is read as the number it spells.
-		const digits = typeof value === "string" ? Number(value.trim()) : value;
-		const chars = forgeChars(digits);
-		if (!chars) return { error: FORGE_MAX_CHARS_ERROR };
-		return { value: chars };
+		// A command line carries text, so a numeric string is read as the number it spells, and the
+		// two words for no bound are read as the absence of one.
+		const lower = typeof value === "string" ? value.trim().toLowerCase() : value;
+		const bound = lower === "none" || lower === "null" ? { chars: null } : forgeChars(typeof lower === "string" ? Number(lower) : lower);
+		if (!bound) return { error: FORGE_MAX_CHARS_ERROR };
+		return { value: bound.chars };
 	}
 	if (key === "inherit") {
 		const wanted = typeof value === "string" ? value.toLowerCase() : value;

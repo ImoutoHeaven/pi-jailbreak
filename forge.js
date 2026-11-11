@@ -24,8 +24,8 @@
  *    answer is what keeps a grown conversation byte-identical at every position it already sent, so
  *    the provider's prompt cache keeps hitting.
  * 2. No re-stamp. The forged message keeps its original `provider`, `api` and `model`. Re-stamping
- *    would make pi treat the message as the live model's own, and the native thinking block would
- *    survive next to our fence, giving one turn two reasoning traces.
+ *    would make pi treat the message as the live model's own and carry its thinking block as well,
+ *    giving one turn two reasoning traces.
  * 3. No floor and no run boundary. Skipping the messages at or after the last user message looks
  *    like it protects the live run, but the boundary slides: a message past the floor in one request
  *    enters the forge region in the next, and bytes already sent change under it. Purity covers the
@@ -34,10 +34,10 @@
  * 4. Add only. The forged turn is the original with the fence written in front of its visible text.
  *    Nothing else about the message changes.
  *
- * The fence goes inside the first text block rather than in a block of its own. `openai-completions`
- * serializes an assistant's text blocks with `.join("")`, so two blocks would concatenate the fence
- * and the reply with no separator between them. One block, `\n\n` between the fence and the reply,
- * is the shape the turn file already writes.
+ * The fence goes inside the first text block rather than in a block of its own. An assistant's text
+ * blocks are joined with no separator between them, so two blocks would concatenate the fence and
+ * the reply; one block, `\n\n` between the fence and the reply, is the shape the turn file already
+ * writes.
  *
  * Nothing here reads or writes the session, and nothing here knows about any other extension.
  */
@@ -54,9 +54,9 @@ export function isSameModel(message, live) {
  * `redacted` flag is checked as well as the placeholder text, so a block that carries the flag
  * without the placeholder is still treated as unreadable rather than replayed.
  *
- * A provider that reports a reasoning field instead of a block (`reasoning_content`, `reasoning`,
- * `reasoning_text`) has already been read into a thinking block by `openai-completions`, and a
- * summarized trace arrives the same way, so both are covered without a second reader.
+ * A provider that reports a reasoning field instead of a block has already been read into a thinking
+ * block before this module runs, and a summarized trace arrives the same way, so both are covered
+ * without a second reader.
  */
 export function ownCot(message) {
 	const parts = [];
@@ -91,21 +91,28 @@ function fenced(text, tag) {
 /**
  * One assistant message's forged form, or null when it is left exactly as it is.
  *
- * `force` is `forge: "always"`: it refills a turn pi would carry as well, which shows the turn two
- * reasoning traces. It exists to diagnose a double fence and is never the right setting for a run.
- *
- * `maxChars` bounds the refilled CoT so a long trace cannot dominate a request. A negative value
- * means no bound. The bound is applied before the fence is built, so it is part of the pure answer
- * rather than a second pass.
+ * `maxChars` bounds the refilled CoT, and `null` means no bound, which is the default: a truncated
+ * trace is not the reasoning the turn wrote, and a model that reads a cut-off version of its own
+ * thinking has reason to distrust the turn it is being shown. The bound is applied before the fence
+ * is built, so it is part of the pure answer rather than a second pass.
  */
-export function forgeOne(message, live, tag, maxChars = 4000, force = false) {
+export function forgeOne(message, live, tag, maxChars = null) {
 	if (message?.role !== "assistant") return null;
-	// Pi carries this message's CoT already, so we touch nothing unless the caller forced it.
-	if (!force && isSameModel(message, live)) return null;
+	// Pi carries this message's CoT already, so the turn is left exactly as it is.
+	if (isSameModel(message, live)) return null;
 	let cot = ownCot(message);
 	if (!cot) return null;
-	const limit = Number.isFinite(maxChars) ? maxChars : 4000;
-	if (limit >= 0 && cot.length > limit) cot = `${cot.slice(0, limit)}\n[... reasoning truncated]`;
+	if (Number.isSafeInteger(maxChars) && maxChars > 0 && cot.length > maxChars) {
+		// A cut inside a surrogate pair would leave a lone code unit in the request bytes, and the whole
+		// design leans on those bytes being reproducible. Backing off a pair that starts the trace would
+		// leave nothing, so the pair is kept whole instead: an empty fence with only a marker reads as a
+		// reasoning block the turn never wrote.
+		let cut = maxChars;
+		if (/[\uD800-\uDBFF]/.test(cot[cut - 1])) cut = cut > 1 ? cut - 1 : 2;
+		// Keeping a leading pair whole can reach the end of a short trace, and a marker on a trace that is
+		// entirely present would tell the model its reasoning was cut when none of it was.
+		cot = cut < cot.length ? `${cot.slice(0, cut)}\n[... reasoning truncated]` : cot.slice(0, cut);
+	}
 	const content = Array.isArray(message.content) ? message.content : [];
 	const lead = content.findIndex((block) => block?.type === "text");
 	// Already fenced, by us on an earlier request or by a pasted message: idempotent.
@@ -113,7 +120,7 @@ export function forgeOne(message, live, tag, maxChars = 4000, force = false) {
 	const fence = `<${tag}>\n${cot}\n</${tag}>`;
 	const next = content.slice();
 	if (lead >= 0) {
-		// One block: the provider joins an assistant's text blocks with no separator.
+		// One block: an assistant's text blocks are joined with no separator.
 		next[lead] = { ...content[lead], text: `${fence}\n\n${content[lead].text ?? ""}` };
 	} else {
 		// A turn with no visible text at all still carries its reasoning, and the block goes after any
@@ -131,11 +138,11 @@ export function forgeOne(message, live, tag, maxChars = 4000, force = false) {
  * The whole message list, forged. Returns the input array itself when nothing changed, so a request
  * with nothing to refill allocates nothing and stays byte-identical.
  */
-export function forgeHistory(messages, live, tag, maxChars = 4000, force = false) {
+export function forgeHistory(messages, live, tag, maxChars = null) {
 	if (!Array.isArray(messages) || !live?.provider || !live?.id) return messages;
 	let changed = false;
 	const out = messages.map((message) => {
-		const forged = forgeOne(message, live, tag, maxChars, force);
+		const forged = forgeOne(message, live, tag, maxChars);
 		if (!forged) return message;
 		changed = true;
 		return forged;

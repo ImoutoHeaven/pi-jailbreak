@@ -81,19 +81,26 @@ write `<think>` and `</think>`. A rule's own value wins over the config-level on
 turn's thinking block whenever the request targets a different model, which leaves the conversation
 reading as if the reasoning had never happened. `auto`, the default, refills a turn exactly when pi
 drops it: the turn's own cot goes back in, fenced in `cotTag`, and the turn keeps the model stamp
-that says it came from elsewhere. `always` refills even a turn pi would carry, which shows two
-reasoning traces and is worth having only to diagnose one. `off` refills nothing.
+that says it came from elsewhere. `off` refills nothing. The mode has no third state: whether a turn
+is refilled is pi's answer to give, and a switch that refills a turn pi carries would put two
+reasoning traces in one turn.
 
 ```json
 {
 	"forge": "auto",
-	"forgeMaxChars": 4000,
-	"rules": [{ "provider": "CLIProxy-Chat", "mode": "leviathan", "forge": "always" }]
+	"forgeMaxChars": null,
+	"rules": [{ "provider": "CLIProxy-Chat", "mode": "leviathan", "forgeMaxChars": 1200 }]
 }
 ```
 
-`forgeMaxChars` bounds the refilled cot so a long trace cannot dominate a request; a negative value
-leaves it unbounded. Both keys sit at the config level and on a rule, and a rule's own value wins.
+`forgeMaxChars` bounds the refilled cot and defaults to no bound. A trace is cut only when a config
+asks for it, because a truncated trace is not the reasoning the turn wrote, and a model shown a
+cut-off version of its own thinking has a reason to distrust the turn. A cut that was backed off to
+keep a character whole and so reached the end of a short trace states no truncation: the marker is
+written only when something was actually dropped. The value is a positive whole number or `null`.
+Both keys sit at the config level and on a rule, and a rule's own value wins: a rule names `null` to
+lift a bound the config sets.
+
 The refill is a pure function of the message's own bytes, so a grown conversation keeps every
 already-sent position byte-identical: switching a model costs one cache miss, and the turns after it
 stay on the same prefix.
@@ -132,8 +139,8 @@ the live model resolves at that moment.
 | `/leviathan prompt <path>` / `prompt default` | Point the session at another prompt file, or back at the config |
 | `/leviathan turns <path>` / `turns off` / `turns default` | Inject another turn file, turn the block off, or take the config value. `./off` names a file literally called `off` |
 | `/leviathan cotTag <tag>` / `cotTag default` | The tag that fences the fabricated cot; `think` and `<think>` are one tag |
-| `/leviathan forge auto\|always\|off` / `forge default` | What a request refills for an assistant turn another model wrote |
-| `/leviathan forgeMaxChars <n>` / `forgeMaxChars default` | The bound on a refilled cot; a negative value is unbounded |
+| `/leviathan forge auto\|off` / `forge default` | What a request refills for an assistant turn another model wrote |
+| `/leviathan forgeMaxChars <n>` / `forgeMaxChars none` / `forgeMaxChars default` | The bound on a refilled cot; `none` leaves it whole, and no bound is the default |
 | `/leviathan inherit keyed\|tree\|none` / `inherit default` | What this session hands to the processes it starts |
 | `/leviathan remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, carry the session setting or else the file that model already resolves to, and apply it now |
 
@@ -224,14 +231,12 @@ The `turns` file is a YAML sequence, and one item is one message. Three keys:
     ...
 ```
 
-`assistant` also takes a bare string, which is its `text`, and one more key, `native`, which names
-a reasoning field such as `reasoning_content`. With `native` the cot becomes a real thinking block
-whose signature is that field name, so `openai-completions` puts it on the wire as
-`reasoning_content` instead of as fenced text. The block is emitted only for that one adapter, which
-replays a thinking block whose signature is a field name; every other adapter would either send the
-string as a real signature and have the request rejected, or parse it and fail, so it gets the text
-fence instead. A fabricated turn is stamped with the live model, so pi reads a block it does decode
-as this model's own reasoning and keeps it. `result` answers the `call` of the assistant before it,
+`assistant` also takes a bare string, which is its `text`. The cot is written as the first text block
+of the reply, fenced in the tag `cotTag` names, so the turn reads as reasoning the assistant wrote
+down followed by what it said. The fence is ordinary text and nothing else: an assistant's own reply
+is the one thing every provider carries back unchanged, and no reasoning field is written by hand.
+A fabricated turn is stamped with the live model, so pi reads it as this model's own earlier turn.
+`result` answers the `call` of the assistant before it,
 so every `call` has exactly one `result`, and the sequence begins with `user`.
 A file with one bad item injects nothing: a half-fabricated history would leave the model an
 assistant turn nobody answered.
@@ -257,7 +262,7 @@ happened.
 The extension answers that per message, with pi's own test: it copies pi's predicate (a message
 belongs to the live model when `provider`, `api` and `model` all match) and refills a turn exactly
 when pi would drop it. A turn pi carries is left byte for byte as it is, so the two never disagree
-and no turn ever shows two reasoning traces. `forge: "always"` overrides that for diagnosis.
+and no turn ever shows two reasoning traces.
 
 The refill is the turn's own cot, fenced in `cotTag` inside its first text block. It is added in
 the request and never written to the session, so a fork, a reload or a resumed session has nothing
@@ -280,12 +285,18 @@ extension has run, so there is no triple to compare against; pi carries a turn's
 the route produces that turn's model.
 
 A turn keeps the model stamp that says it came from elsewhere. Re-stamping it as the live model
-would make pi carry its native thinking block too, and the turn would show its reasoning twice.
+would make pi carry its thinking block as well, and the turn would show its reasoning twice.
 
 The fabricated chain of thought sits at the head of the assistant reply, fenced in `cotTag` tags,
 so the turn reads as reasoning the assistant wrote down followed by what it said. The fence is
-ordinary text: one text block, and the same block on every model that is not handed the `native`
-form described above.
+ordinary text: one text block, the same bytes on every model, and no provider's reasoning field is
+written by hand.
+
+What a request actually carries, and whether the provider accepted it, is a property of the wire
+rather than of this extension. A provider entry whose model-level `baseUrl` points at a local reverse
+proxy records the serialized request and response as plain HTTP while forwarding to the real
+endpoint over HTTPS, which shows the fenced turns, the model stamps and the provider's own reaction
+in one place and needs no switch here.
 
 A file that does not load injects nothing, reports once, and leaves the prompt text in force. The
 footer shows `Leviathan !` while a configured block is missing, and `/leviathan` names the file and
@@ -326,9 +337,14 @@ node check.mjs
 `node check.mjs` drives the registered handlers against a temp config. It pins the resolver, the
 channel payload, the guard's placement and preamble withholding, the config write, the gate rulings,
 the turn file's parse and injection, the cot refill's predicate, purity, idempotence and prefix
-stability, and the `prompt.md` invariants. A drift guard reads the literal
-value each installed Pi release assigns to its preamble and fails when that value is not one the
-extension knows, or when no release is installed at all. It reads the assignment, not any occurrence
+stability, the cot budget's three states, and the `prompt.md` invariants. One guard reads every
+source file in the package and fails when one of them names a provider's api family, and a second
+pass over those files fails when a line asks an api value what it is: a method call, an index, a
+comparison against a literal, a coercion, or a hand-off to an equality helper. Holding an api and
+passing it along is what the extension does; asking it what provider answered is the scope it does
+not take. A drift guard reads the literal value each installed Pi release assigns to its preamble
+and fails when that value is not one the extension knows, or when no release is installed at all. It
+reads the assignment, not any occurrence
 in the file, so a release that rewords the sentence while an old wording survives as a comment still
 fails; it decodes the literal before comparing, and a file that assigns no recognizable literal fails
 rather than passes. Releases that sit side by side on different wordings both pass. Set `PI_PKG` to

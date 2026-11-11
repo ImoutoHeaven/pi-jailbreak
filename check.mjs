@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import def from "./index.ts";
 import { authorizeGate, CSAM_FIELD, GATE_FIELDS, GATE_TOOL } from "./gate.js";
-import { configPath, DEFAULT_TURNS, emptyConfig, globMatch, loadConfig, parseConfig, promptPath, resolve as resolveMode, sessionSettings, SETTINGS_KEYS, turnsPath } from "./config.js";
+import { configPath, DEFAULT_TURNS, emptyConfig, globMatch, loadConfig, parseConfig, promptPath, resolve as resolveMode, sessionSettings, settingFromCommand, SETTINGS_KEYS, turnsPath } from "./config.js";
 import { applies, decode, encode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { loadTurns, parseTurns, toMessages } from "./turns.js";
 import { forgeHistory, forgeOne, isSameModel, ownCot, prefixStable } from "./forge.js";
@@ -246,7 +246,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
 		forge: "auto",
-		forgeMaxChars: 4000,
+		forgeMaxChars: null,
 		ruleIndex: 0,
 	}, "the first match wins");
 	assert.deepEqual(resolveMode(config, { provider: "CLIProxy-Chat", id: "deepseek-pro" }), {
@@ -255,7 +255,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
 		forge: "auto",
-		forgeMaxChars: 4000,
+		forgeMaxChars: null,
 		ruleIndex: 1,
 	});
 	assert.deepEqual(resolveMode(config, { provider: "zhipu", id: "glm-5.3" }), {
@@ -264,7 +264,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
 		forge: "auto",
-		forgeMaxChars: 4000,
+		forgeMaxChars: null,
 		ruleIndex: 2,
 	}, "a missing provider matches any provider");
 	assert.deepEqual(resolveMode(config, { provider: "deepseek", id: "anything" }), {
@@ -273,7 +273,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
 		forge: "auto",
-		forgeMaxChars: 4000,
+		forgeMaxChars: null,
 		ruleIndex: 3,
 	}, "a missing model matches any model");
 	assert.deepEqual(resolveMode(config, { provider: "openai", id: "gpt-5" }), {
@@ -282,7 +282,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
 		forge: "auto",
-		forgeMaxChars: 4000,
+		forgeMaxChars: null,
 		ruleIndex: -1,
 	}, "no match falls back to the default");
 	assert.equal(promptPath(config, "prompts/glm.md"), join("/cfg", "prompts", "glm.md"));
@@ -324,8 +324,54 @@ console.log("ok cot tag");
 		/cot is not a rule key \(mode, provider, model, prompt, turns, cotTag, forge, forgeMaxChars\)/,
 	);
 	assert.equal(parseConfig(JSON.stringify({ cotTag: "think", rules: [{ mode: "leviathan", cotTag: "analysis" }] }), "/cfg").error, undefined);
+	// A mode outside the set rejects the file whole. The removed mode is the one that matters: reading
+	// it as `auto` would change what a request carries without a word.
+	assert.equal(parseConfig(JSON.stringify({ forge: "always" }), "/cfg").error, "forge must be auto, off");
+	assert.equal(parseConfig(JSON.stringify({ forge: "ALWAYS" }), "/cfg").error, "forge must be auto, off", "the check is on the lowered value, not the spelling");
+	assert.equal(
+		parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", forge: "always" }] }), "/cfg").error,
+		"rule 1: forge must be auto, off",
+		"a rule reports the rule it is in",
+	);
+	assert.equal(parseConfig(JSON.stringify({ forge: "off" }), "/cfg").config.forge, "off", "a mode in the set loads as itself");
 }
 console.log("ok config keys");
+
+// The cot budget is off unless it is asked for, and asking for it is the only way it is on. A cut
+// trace is not the reasoning the turn wrote, and a model handed a truncated version of its own
+// thinking has a reason to distrust the turn, which is worth more than any request-size saving.
+{
+	const bound = (value) => parseConfig(JSON.stringify(value === undefined ? {} : { forgeMaxChars: value }), "/cfg");
+	assert.equal(bound(undefined).config.forgeMaxChars, null, "the default is no bound");
+	assert.equal(bound(null).config.forgeMaxChars, null, "null is no bound, spelled out");
+	assert.equal(bound(1200).config.forgeMaxChars, 1200, "a positive integer bounds the trace");
+	for (const bad of [0, -1, -4000, 1.5, "1200", true]) {
+		assert.match(bound(bad).error ?? "", /forgeMaxChars must be a positive whole number, or null for no bound/, `rejected: ${JSON.stringify(bad)}`);
+	}
+	// A rule carries the same three states, and `null` is a value there: it turns the bound off even
+	// when the config names one.
+	const rooted = parseConfig(
+		JSON.stringify({ forgeMaxChars: 800, rules: [{ mode: "leviathan", model: "a", forgeMaxChars: null }, { mode: "leviathan", model: "b", forgeMaxChars: 100 }] }),
+		"/cfg",
+	).config;
+	assert.equal(resolveMode(rooted, { provider: "x", id: "a" }).forgeMaxChars, null, "a rule turns the bound off");
+	assert.equal(resolveMode(rooted, { provider: "x", id: "b" }).forgeMaxChars, 100, "a rule sets its own bound");
+	assert.equal(resolveMode(rooted, { provider: "x", id: "c" }).forgeMaxChars, 800, "and the config value reaches a rule that does not name one");
+	assert.match(
+		parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", forgeMaxChars: 0 }] }), "/cfg").error ?? "",
+		/rule 1: forgeMaxChars must be a positive whole number/,
+	);
+	// The command spells no bound as `none` or `null`, and a bare number as itself.
+	assert.deepEqual(settingFromCommand("forgeMaxChars", "none"), { key: "forgeMaxChars", value: null });
+	assert.deepEqual(settingFromCommand("forgeMaxChars", "null"), { key: "forgeMaxChars", value: null });
+	assert.deepEqual(settingFromCommand("forgeMaxChars", "1200"), { key: "forgeMaxChars", value: 1200 });
+	for (const bad of ["0", "-4000", "1.5", "lots"]) {
+		assert.ok(settingFromCommand("forgeMaxChars", bad).error, `the command rejects ${bad}`);
+	}
+	// And a session answer carries the three states as they are.
+	assert.deepEqual(sessionSettings({ forgeMaxChars: null }).settings, { forgeMaxChars: null }, "no bound travels as a value, not an absence");
+}
+console.log("ok forge budget config");
 
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-leviathan-config-"));
@@ -659,11 +705,47 @@ console.log("ok turns messages");
 	}
 	console.log("ok forge idempotence");
 
-	// The budget is part of the pure answer.
+	// The budget is part of the pure answer, and its default is no bound at all.
 	{
+		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think").content[1].text, fenced("think", "abcdef", "reply A"), "no bound unless one is asked for");
 		assert.match(forgeOne(foreign("abcdef"), LIVE, "think", 3).content[1].text, /^<think>\nabc\n\[\.\.\. reasoning truncated\]\n<\/think>/);
-		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", -1).content[1].text, fenced("think", "abcdef", "reply A"), "a negative bound means none");
+		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", null).content[1].text, fenced("think", "abcdef", "reply A"), "null is no bound");
 		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", 999).content[1].text, fenced("think", "abcdef", "reply A"), "a bound above the length changes nothing");
+		// Only a positive integer bounds. The config refuses these values, so the only way one arrives is
+		// a caller that built it, and the safe reading is the one that keeps the trace whole.
+		for (const value of [0, -1, -4000]) {
+			assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", value).content[1].text, fenced("think", "abcdef", "reply A"), `nothing bounds: ${value}`);
+		}
+		// A cut never lands inside a surrogate pair: half of one is not text, and the request bytes are
+		// what the whole design leans on.
+		const pair = "ab\u{1F600}cd";
+		const cut = forgeOne(foreign(pair), LIVE, "think", 3).content[1].text;
+		assert.equal(cut, "<think>\nab\n[... reasoning truncated]\n</think>\n\nreply A", "the cut backs off a split pair");
+		assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cut), false, "no lone high surrogate survives");
+		assert.equal(forgeOne(foreign(pair), LIVE, "think", 4).content[1].text, "<think>\nab\u{1F600}\n[... reasoning truncated]\n</think>\n\nreply A", "a cut between the pair's halves keeps the pair whole");
+		assert.equal(forgeOne(foreign(pair), LIVE, "think", 6).content[1].text, fenced("think", pair, "reply A"), "a bound at the full length changes nothing");
+		// A trace that starts with a pair cannot back off to nothing: an empty fence with only the
+		// marker reads as a reasoning block the turn never wrote. The pair is kept whole instead.
+		const leading = "\u{1F600}abcd";
+		for (const [bound, kept] of [[1, "\u{1F600}"], [2, "\u{1F600}"], [3, "\u{1F600}a"], [4, "\u{1F600}ab"]]) {
+			assert.equal(
+				forgeOne(foreign(leading), LIVE, "think", bound).content[1].text,
+				`<think>\n${kept}\n[... reasoning truncated]\n</think>\n\nreply A`,
+				`a bound of ${bound} keeps the leading pair whole`,
+			);
+		}
+		// A marker states a truncation that happened. Keeping a pair whole can reach the end of the
+		// trace, and a marker there would tell the model its reasoning was cut when all of it is present.
+		assert.equal(
+			forgeOne(foreign("\u{1F600}"), LIVE, "think", 1).content[1].text,
+			"<think>\n\u{1F600}\n</think>\n\nreply A",
+			"the whole trace carries no truncation marker",
+		);
+		assert.equal(
+			forgeOne(foreign("\u{1F600}\u{1F600}"), LIVE, "think", 1).content[1].text,
+			"<think>\n\u{1F600}\n[... reasoning truncated]\n</think>\n\nreply A",
+			"a trace with more after the pair still carries the marker",
+		);
 	}
 	console.log("ok forge budget");
 
@@ -733,32 +815,105 @@ console.log("ok turns messages");
 	}
 	console.log("ok forge mixed history");
 
-	// `native` puts the cot in a real thinking block instead of a fence, and only on the one adapter
-	// that replays it that way. Every other adapter carries a non-empty signature as a real signature:
-	// anthropic-messages sends it to the provider, which rejects the request, and
-	// openai-responses-shared JSON.parses it without a catch. So the emission rule is pinned per api.
+	// The extension works on pi's message list and never on what an adapter does with it. The one
+	// thing that must not come back is a branch on which api serializes the request, so the guard
+	// names the mechanisms a branch is made of rather than the phrases a sanctioned line happens to
+	// contain: holding an api is fine, asking it what it is is not. A phrase list is the wrong tool
+	// twice over. It excuses a whole line that merely contains a sanctioned phrase, and it fails an
+	// honest line that holds an api in a shape nobody wrote down. The set of files is read from the
+	// package rather than listed, because a list is exactly what a new file falls outside of.
+	//
+	// What it does not catch is a branch hidden behind a helper defined elsewhere, or a property name
+	// assembled at run time. Neither is a shape a provider-aware extension would need, and a line
+	// scan is the wrong instrument for both.
 	{
-		const stamp = { provider: "CLIProxy-Chat", model: "deepseek-flash" };
-		const badYaml = (yaml, pattern) => {
-			const read = parseTurns(yaml);
-			assert.ok(read.error, `the file must be rejected: ${yaml}`);
-			assert.match(read.error, pattern);
-		};
-		const nativeSpecs = [{ role: "user", text: "a" }, { role: "assistant", cot: "COT", text: "reply", call: null, native: "reasoning_content" }];
-		const blocksFor = (api) => toMessages(nativeSpecs, { ...stamp, api })[1].content;
-		assert.deepEqual(blocksFor("openai-completions"), [
-			{ type: "thinking", thinking: "COT", thinkingSignature: "reasoning_content" },
-			{ type: "text", text: "reply" },
-		], "the one adapter that reads a reasoning field gets the block");
-		for (const api of ["anthropic-messages", "openai-responses", "google-generative-ai", "mistral-conversations"]) {
-			assert.deepEqual(blocksFor(api), [{ type: "text", text: fenced("think", "COT", "reply") }], `every other adapter gets the fence: ${api}`);
+		const ADAPTERS = [/openai/i, /anthropic/i, /mistral/i, /google-generative/i, /google-vertex/i, /azure-openai/i];
+		// Asking an api value what it is. A method call, an index, a comparison against a literal, a
+		// coercion into one, or a hand-off to a helper that reads it. Pi's own handle is not a model's
+		// api, so it is cut out before these run; the cut is keyed on the two calls only an ExtensionAPI
+		// can make, so a local named the same way cannot borrow the exemption and a rename cannot lose
+		// it.
+		const HANDLE = /\b[\w$]+\s*\??\.api\s*\??\.\s*(?:getActiveTools|setActiveTools)\s*(?:\?\.)?\s*\(/g;
+		const METHOD = /\bapi\b\s*\??\.\s*(?:[\w$]+\s*\(|\[)/;
+		const BRACKET = /\bapi\b\s*\??\.?\s*\[/;
+		const TO_LITERAL = /\bapi\b\s*(?:===|!==|==|!=)\s*["'`]|["'`][^"'`]*["'`]\s*(?:===|!==|==|!=)\s*[\w$.]*\bapi\b/;
+		// `typeof x.api === "string"` is a type guard on a value that may be absent, not a branch on
+		// which api answered.
+		const TYPE_GUARD = /typeof\s+[\w$?.]*\bapi\b\s*(?:===|!==)\s*["'`](?:string|number|boolean|object|undefined|function|symbol|bigint)["'`]/;
+		// A fallback is a coercion too. The placeholders below cannot be an api id, so they only make
+		// a value safe to log; a name spelled with letters is the branch, written as a default.
+		const DEFAULT_LIT = /\bapi\b\s*(?:\?\?|\|\|)\s*["'`]([^"'`]*)["'`]/;
+		const PLACEHOLDER = /^\s*(?:[-?\u2014_]|unknown|none|null|undefined|n\/a)?\s*$/i;
+		// An api wrapped in a call and then asked a question is coerced before it is read.
+		const COERCED = /\bapi\b[^;]*?\)\s*\.\s*(?:startsWith|endsWith|includes|indexOf|lastIndexOf|match|test|split|toLowerCase|toUpperCase|search|trim)\s*\(/;
+		const HELPER = /\b(?:Object\.is|includes|indexOf|lastIndexOf|test|match|some|every|find|findIndex|has|get|equals)\s*\([^;]*\bapi\b/;
+		// A value coerced into a string and then compared is a comparison against a literal, wherever
+		// the coercion is written: a call, a template, or a concatenation.
+		const COERCE_EQ = /(?:String\s*\([^)]*\bapi\b[^)]*\)|`[^`]*\$\{[^}]*\bapi\b[^}]*\}[^`]*`|[\w$.]*\bapi\b\s*\+\s*["'`]["'`])\s*(?:===|!==|==|!=)/;
+		// A comparison against an identifier is fine only when the identifier is pi's sentinel, an
+		// absence, or another message's own stamp. Any other name is an indirection to a value.
+		const COMPARE_IDENT = /\bapi\b\s*(?:===|!==|==|!=)\s*(?!["'`])([\w$]+(?:\??\.[\w$]+)*)/;
+		const ALLOWED_IDENT = new Set(["VIRTUAL_MODEL_API", "undefined", "null"]);
+		// A dispatch on the value is a branch even without a comparison, and a numeric comparison is a
+		// comparison against something that is not a stamp.
+		const SWITCH = /\bswitch\s*\(\s*[^)]*\bapi\b/;
+		const NUMERIC = /\bapi\b\s*(?:===|!==|==|!=|<|>|<=|>=)\s*\d/;
+		// A property read off an api value is how its shape is inspected, and a branch on a length is
+		// still a branch on which api answered. Holding the value and writing it down is neither.
+		const PROPERTY = /\bapi\b\s*\??\.\s*[\w$]+\s*(?:[=!]==?|!==?|[<>]=?|&&|\|\||\?|:|,|;|\)|\})/;
+		const files = readdirSync(PACKAGE_DIR, { recursive: true })
+			.map((name) => String(name).replace(/\\/g, "/"))
+			.filter((name) => /\.[cm]?[jt]sx?$/.test(name) && name !== "check.mjs" && !name.startsWith("node_modules/"));
+		// The guard is only as good as its reach, so the files it must cover are named here.
+		for (const file of ["index.ts", "config.js", "channel.js", "gate.js", "turns.js", "forge.js", "commands.ts"]) {
+			assert.ok(files.includes(file), `the adapter guard must cover ${file}`);
 		}
-		// A file without the key produces the same spec objects it produced before the key existed.
-		assert.deepEqual(parseTurns("- user: a\n- assistant: b\n").specs[1], { role: "assistant", cot: "", text: "b", call: null });
-		badYaml("- user: a\n- assistant: {cot: c, native: '1bad'}\n", /native must be a reasoning field name/);
-		badYaml("- user: a\n- assistant: {native: reasoning_content}\n", /native needs a cot/);
+		assert.ok(files.length >= 7, "the guard must reach the package's source files");
+		let forgeReads = 0;
+		for (const file of files) {
+			const source = readFileSync(new URL(`./${file}`, import.meta.url), "utf8");
+			for (const api of ADAPTERS) {
+				assert.equal(api.test(source), false, `${file} must not name a ${api.source} adapter`);
+			}
+			source.split("\n").forEach((line, index) => {
+				if (!/\bapi\b/.test(line)) return;
+				if (/^\s*(?:\*|\/\/)/.test(line)) return;
+				// Counted on the property read rather than on the bare word, so renaming a local out of the
+				// picture cannot make the scan look emptier than it is.
+				if (file === "forge.js" && /\.api\b/.test(line)) forgeReads++;
+				const at = `${file}:${index + 1}`;
+				// Pi's own handle is cut out of the line rather than used to excuse it: a line that holds both
+				// the handle and a model's api would otherwise carry the exemption over to the model's api.
+				const body = line.replace(HANDLE, "HANDLE(");
+				assert.equal(METHOD.test(body), false, `${at} calls a method on an api value: ${line.trim()}`);
+				assert.equal(BRACKET.test(body), false, `${at} indexes an api value: ${line.trim()}`);
+				assert.equal(PROPERTY.test(body), false, `${at} reads a property off an api value: ${line.trim()}`);
+				assert.ok(!TO_LITERAL.test(body) || TYPE_GUARD.test(body), `${at} compares api against a literal: ${line.trim()}`);
+				const fallback = DEFAULT_LIT.exec(body);
+				assert.ok(!fallback || PLACEHOLDER.test(fallback[1]), `${at} defaults api to a value: ${line.trim()}`);
+				assert.equal(COERCED.test(body), false, `${at} coerces api before reading it: ${line.trim()}`);
+				assert.equal(COERCE_EQ.test(body), false, `${at} compares a coerced api against a literal: ${line.trim()}`);
+				assert.equal(HELPER.test(body), false, `${at} hands api to a reader: ${line.trim()}`);
+				const compared = COMPARE_IDENT.exec(body);
+				assert.ok(
+					!compared || ALLOWED_IDENT.has(compared[1]) || /\.api$/.test(compared[1]),
+					`${at} compares api to ${compared?.[1]}: ${line.trim()}`,
+				);
+				assert.equal(SWITCH.test(body), false, `${at} switches on an api value: ${line.trim()}`);
+				assert.equal(NUMERIC.test(body), false, `${at} compares api to a number: ${line.trim()}`);
+			});
+		}
+		// The scan is not vacuous: the predicate that copies pi's test reads a stamp, and that line has to
+		// be visible to the scan for the scan to mean anything. A count of how many api reads the tree
+		// happens to carry is not pinned, because a legitimate rename moves it and the count says nothing
+		// about whether the guard works.
+		assert.ok(forgeReads >= 1, "the api scan must see the predicate that reads a stamp");
+		// A turn file that still names a reasoning field is rejected whole, so the turn is not written
+		// as something other than what it says.
+		const stale = parseTurns("- user: a\n- assistant: {cot: c, native: reasoning_content}\n");
+		assert.match(stale.error, /assistant carries native, which it does not take/);
 	}
-	console.log("ok forge native cot");
+	console.log("ok no adapter branch");
 }
 
 
@@ -1030,14 +1185,31 @@ console.log("ok guard places the text");
 		assert.match(guardRun(history)?.messages?.[2]?.content?.[1]?.text ?? "", /^<think>/, "and turning it back on refills again");
 	}
 
-	// (e) `always` refills a turn pi would carry, which `auto` leaves alone.
+	// (e) A mode is a two-state switch, and a removed one is a command that refuses rather than a value
+	// that quietly reads as something else. "Refuses" is measured on the published answer, byte for
+	// byte: a refusal that still wrote a setting would leave a different payload behind.
 	{
-		await command.handler("forge always", forgeCtx);
+		let said = null;
+		const refusing = { model: LEVIATHAN, ui: { notify: (text, type) => { said = { text, type }; } } };
+		await command.handler("forgeMaxChars 4321", forgeCtx);
+		const published = process.env[ENV_NAME];
+		assert.match(published ?? "", /forgeMaxChars":4321/, "the answer under test carries a bound to lose");
+		for (const [command_, pattern] of [
+			["forge always", /forge must be auto, off/],
+			["forgeMaxChars 0", /forgeMaxChars must be a positive whole number/],
+			["forgeMaxChars -4000", /forgeMaxChars must be a positive whole number/],
+		]) {
+			await command.handler(command_, refusing);
+			assert.match(said?.text ?? "", pattern, `the command is refused: ${command_}`);
+			assert.equal(said?.type, "error");
+			assert.equal(process.env[ENV_NAME], published, `a refused command leaves the answer byte-identical: ${command_}`);
+		}
+		await command.handler("forgeMaxChars default", forgeCtx);
+		// A turn pi carries still stays untouched, because nothing set the removed mode.
 		await run(LEVIATHAN);
 		const ownTurn = { ...foreignTurn, provider: LEVIATHAN.provider, api: LEVIATHAN.api, model: LEVIATHAN.id };
-		const forced = guardRun([head(promptText), { ...turn }, ownTurn]);
-		assert.match(forced.messages[2].content[1].text, /^<think>/, "always refills even a turn pi would carry");
-		await command.handler("forge default", forgeCtx);
+		assert.equal(guardRun([head(promptText), { ...turn }, ownTurn]), undefined, "a refused mode changes no request");
+		assert.match(guardRun(history)?.messages?.[2]?.content?.[1]?.text ?? "", /^<think>/, "and the mode in force still refills");
 	}
 	// (f) A head that cannot hold the text must not cost the refill. With `turns` off and the text
 	// undeliverable, `project(forged, false)` used to return undefined by construction and throw the
@@ -1810,6 +1982,52 @@ console.log("ok remember keeps the cot tag in force");
 }
 console.log("ok remember keeps the turns in force");
 
+// The cot bound is three-state, and `null` is the state that says "whole": a session that asks for
+// no bound gets one even when the config sets a bound, the panel names it, `remember` writes it, and
+// the receipt does not call it `off`, which is what `turns` means by the same value.
+{
+	const command = commands.get("leviathan");
+	const u = ui();
+	const ctx = { model: LEVIATHAN, ui: u };
+	const panel = async () => {
+		await command.handler("", ctx);
+		return u.notes.at(-1)[1];
+	};
+	const readRules = () => JSON.parse(readFileSync(configFile, "utf8")).rules;
+
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", forgeMaxChars: 800 }], { forgeMaxChars: null });
+	await start({ type: "session_start", reason: "startup" }, {});
+	await command.handler("reset", ctx);
+	assert.match(await panel(), /forge\s+auto \(800 chars\)/, "the rule's bound is the one in force");
+
+	// The session lifts the rule's bound: `??` would read this `null` as an unset key and hand 800 back.
+	await command.handler("forgeMaxChars none", ctx);
+	assert.equal(u.notes.at(-1)[1], "forgeMaxChars none", "the receipt does not call a bound `off`");
+	assert.match(await panel(), /forge\s+auto \(no bound\)/, "a session's null reaches the decision");
+
+	// `remember` carries it to the rule it writes, and writes it even though it is null.
+	await command.handler("remember on", ctx);
+	assert.equal(readRules()[0].forgeMaxChars, null, "the rule carries the session's no-bound answer");
+	await command.handler("reset", ctx);
+	assert.match(await panel(), /forge\s+auto \(no bound\)/, "and the written rule is the one in force");
+
+	// A number travels the same way.
+	await command.handler("forgeMaxChars 1200", ctx);
+	assert.equal(u.notes.at(-1)[1], "forgeMaxChars 1200");
+	assert.match(await panel(), /forge\s+auto \(1200 chars\)/, "a session's number reaches the decision");
+	await command.handler("remember on", ctx);
+	assert.equal(readRules()[0].forgeMaxChars, 1200);
+
+	// `default` drops the key, so the file decides again.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", forgeMaxChars: 800 }], { forgeMaxChars: null });
+	await command.handler("forgeMaxChars default", ctx);
+	assert.equal(u.notes.at(-1)[1], "forgeMaxChars default (config)");
+	assert.match(await panel(), /forge\s+auto \(800 chars\)/, "dropping the session value returns the rule's bound");
+	await command.handler("reset", ctx);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+}
+console.log("ok forge max chars is three-state in a session");
+
 // A file that does not parse is left alone, and the command says so.
 {
 	const command = commands.get("leviathan");
@@ -2056,7 +2274,7 @@ console.log("ok reset reports the config mode");
 	// Every key the list names is a setting that can be set: a key with no branch of its own would be a
 	// dead entry that rejects every value it is given.
 	{
-		const sample = { prompt: "p.md", turns: null, cotTag: "think", forge: "always", forgeMaxChars: 1200, inherit: "keyed" };
+		const sample = { prompt: "p.md", turns: null, cotTag: "think", forge: "auto", forgeMaxChars: 1200, inherit: "keyed" };
 		assert.deepEqual(Object.keys(sample).sort(), [...SETTINGS_KEYS].sort(), "the sample covers the list and nothing else");
 		for (const key of SETTINGS_KEYS) {
 			assert.equal(sessionSettings({ [key]: sample[key] }).error, undefined, `${key} is settable`);
