@@ -1,39 +1,36 @@
 /**
- * Injects the leviathan text into the system prompt of the sessions a rule selects, and a fabricated
- * conversation ahead of the first real user message in the sessions a turn file selects. It also
- * refills, per message, the reasoning pi drops when a request targets a different model than the one
- * that wrote a turn; `forge.js` owns that and states its invariants.
+ * Five slots, five jobs, no bundle.
  *
- * The text goes in as the head of the leading system message's `content`, ahead of every section,
- * on every request. A section would name the block, which marks it as injected. The
- * `context_with_system` guard places the raw text, with no wrapper, ahead of every section. The
- * transcript records nothing for it, so nothing is persisted, nothing leaks to another model, and
- * an unchanged run sends byte-identical prompts turn after turn.
+ * A model is whatever its record resolves to: `persona` puts text at the head of the system prompt
+ * and withholds pi's stock identity sentence, `gate` declares `ask_authorize_gate`, `turns` splices a
+ * fabricated conversation ahead of the first real user message, `forge` refills the reasoning pi
+ * drops for a turn another model wrote, and `cotTag` names the fence both writers use. Nothing here
+ * asks whether a model "is a leviathan" — that word is gone, because it never named one of the five
+ * and could not say which of them it meant.
  *
- * The fabricated conversation is spliced before the first message that is not a system message, so
- * it lands after the prompt and after a compaction summary alike. It is rebuilt from the turn file
- * on every request, so a model switch, a fork, a reload or a new session leaves nothing to clean
- * up, and a file that fails to load injects nothing while the text above stays in force.
+ * Every slot resolves on its own, down session -> first matching rule -> the file's `default` ->
+ * a built-in record with all four switches off. A model with nothing configured therefore gets an
+ * untouched request: this extension with no config changes nothing at all.
  *
- * The leading system message is the first system message in the transcript, not the entry at index
- * 0: an entry written before the first run, such as the `bashExecution` record of a `!command`, sits
- * ahead of the prompt patch pi appends for that run. Pi reads the prompt from index 0 alone, so a
- * leading system message found later moves to index 0 while the text is in force, which is also
- * where the provider renders it as the prompt instead of as a mid-conversation section update.
+ * The persona text goes in as the head of the leading system message's `content`, ahead of every
+ * section, on every request. A section would name the block, which marks it as injected. The
+ * transcript records nothing for it, so nothing is persisted and an unchanged run sends
+ * byte-identical prompts turn after turn. The leading system message is the first system message in
+ * the transcript, not the entry at index 0: an entry written before the first run, such as the
+ * `bashExecution` record of a `!command`, sits ahead of the prompt patch pi appends for that run.
+ * Pi reads the prompt from index 0 alone, so a leading system message found later moves to index 0
+ * while the text is in force, which is also where the provider renders it as the prompt instead of
+ * as a mid-conversation section update.
  *
  * The text contradicts the stock identity sentence that opens pi's default preamble, so the guard
  * withholds that sentence while the text is in force and lets it back the moment the text is not.
- * It withholds it on every system message, not only the leading one, and only when the value is
- * that stock sentence: a custom system prompt also lands in `preamble` and must survive.
  *
- * One decision per run, rebuilt when the model key or the session override changes. The guard
- * reads that object, so a steady conversation never parses the config or reads the text again.
+ * One decision per run, rebuilt when the model key or the session settings change. The guard reads
+ * that object, so a steady conversation never parses the config or reads a file again.
  *
- * The extension also registers `ask_authorize_gate`, a direct tool that returns a ruling, a re-call
- * request, or a failed call for a request the persona is unsure about. It registers dormant
- * (`defaultActive: false`) and activates exactly while the text is in force, because the text is
- * what tells the model to call it. `before_agent_start` and `model_select` toggle it there: pi
- * applies a `setActiveTools()` call made in either to the run being prepared.
+ * `ask_authorize_gate` is registered dormant (`defaultActive: false`) and activated exactly while the
+ * `gate` slot is on. `before_agent_start` and `model_select` toggle it there: pi applies a
+ * `setActiveTools()` call made in either to the run being prepared.
  */
 
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -41,7 +38,19 @@ import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { authorizeGate, GATE_FIELDS, GATE_TOOL, normalizeFields } from "./gate.js";
-import { configPath, loadConfig, parseConfig, promptPath, resolve, sessionSettings, settingFromCommand, turnsPath } from "./config.js";
+import {
+	configPath,
+	configTags,
+	loadConfig,
+	parseConfig,
+	promptPath,
+	resolve,
+	sessionSettings,
+	settingFromCommand,
+	SLOTS,
+	SWITCHES,
+	turnsPath,
+} from "./config.js";
 import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { forgeHistory } from "./forge.js";
 import { cachedFile, loadTurns, toMessages } from "./turns.js";
@@ -70,6 +79,9 @@ const STOCK_PREAMBLES = new Set([
 	// 1.5.0.
 	"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.",
 ]);
+
+/** The footer glyph for each switch, in the order the footer renders them. */
+const GLYPHS = Object.freeze({ persona: "\u{1F3AD}", gate: "\u{1F6E1}\u{FE0F}", turns: "\u{1F4AC}", forge: "\u2692\u{FE0F}" });
 
 /**
  * A plain JSON Schema, not a typebox builder: a typebox schema is JSON Schema, so pi sends and
@@ -106,40 +118,48 @@ type TurnSpec =
 	| { role: "assistant"; cot: string; text: string; call: { name: string; arguments: Record<string, any> } | null }
 	| { role: "toolResult"; name: string; text: string };
 
+/** A switch and the argument it carries, as a record holds it. */
+type Forge = { maxChars: number | null };
+
 /**
- * The decision a run works from. `text` is null when the session runs normal or the file is unusable,
- * and `turns` is null when no turn file is configured or the one configured does not load.
+ * One model's record, every slot resolved, plus what the run needs to act on it: the persona text
+ * already read, the turn file already parsed, and the set of tags a fence may be written in.
  */
 type Decision = {
 	key: string;
-	mode: "leviathan" | "normal";
+	persona: string | false;
+	turnsSpec: string | false;
+	forge: Forge | false;
+	gate: boolean;
+	cotTag: string;
+	/** Every tag the config names, so a turn fenced under one of them counts as fenced for all. */
+	tags: string[];
+	/** The persona text, null when the slot is off or the file does not read. */
 	text: string | null;
+	/** The parsed fabricated conversation, null when the slot is off or the file does not load. */
 	turns: TurnSpec[] | null;
 	turnsError: string | null;
 	turnsPath: string | null;
-	cotTag: string;
-	forge: string;
-	// `null` is no bound, so it is a value the decision carries rather than an absence.
-	forgeMaxChars: number | null;
-	prompt: string;
-	source: string;
+	promptPath: string | null;
+	sources: Record<string, string>;
+	ruleIndex: number;
 	inherit: string;
 	configPath: string | null;
 	error?: string;
 };
 
-/** What a session answer may carry on top of its mode. `turns` is three-state, as in the config. */
+/** A session's own answers, one per slot. An absent slot leaves the file in charge. */
 type Settings = {
-	prompt?: string;
-	turns?: string | null;
+	persona?: string | false;
+	gate?: boolean;
+	turns?: string | false;
+	forge?: Forge | false;
 	cotTag?: string;
-	forge?: string;
-	forgeMaxChars?: number | null;
 	inherit?: string;
 };
 
-/** A session's answer: the mode, the scope it governs, and the settings it carries. */
-type Answer = { mode: "on" | "off"; key: string; settings: Settings };
+/** A session's answer: the scope it governs and the slots it sets. */
+type Answer = { key: string; settings: Settings };
 
 /**
  * The answer this process set, so a new runtime in the same process keeps it. Pi loads the
@@ -152,12 +172,11 @@ const PROCESS_ANSWER = Symbol.for("pi-leviathan.process-answer");
 function readProcessAnswer(): Answer | null {
 	const value = (globalThis as any)[PROCESS_ANSWER];
 	if (!value || typeof value !== "object") return null;
-	if (value.mode !== "on" && value.mode !== "off") return null;
 	// The second trust boundary for the same object: another install sharing the symbol writes here
 	// too, and a setting of the wrong shape would reach `buildDecision`.
 	const read = sessionSettings(value.settings ?? {});
 	if (read.error) return null;
-	return { mode: value.mode, key: String(value.key ?? ""), settings: read.settings as Settings };
+	return { key: String(value.key ?? ""), settings: read.settings as Settings };
 }
 
 function writeProcessAnswer(next: Answer | null) {
@@ -174,7 +193,7 @@ type State = {
 	/** This session's own answer, mirrored into the environment for the processes it starts. */
 	override: Answer | null;
 	/** What the last request sent actually carried, keyed like a decision. */
-	delivery: { key: string; prompt: string; turns: string | null; delivered: boolean; injected: boolean } | null;
+	delivery: { key: string; persona: string | false; turns: string | false; delivered: boolean; injected: boolean } | null;
 	decision: Decision | null;
 	reported: Set<string>;
 	gateBlocked: boolean;
@@ -199,7 +218,7 @@ function report(s: State, ctx: any, message: string, type = "error") {
 	}
 }
 
-/** Read the text once per file revision. An unreadable or empty file leaves the run normal. */
+/** Read the text once per file revision. An unreadable or empty file leaves the slot with no text. */
 function readPrompt(s: State, path: string, ctx: any) {
 	const hit = cachedFile(path, "prompt", (text: string) => {
 		const trimmed = text.trim();
@@ -224,23 +243,21 @@ function buildDecision(s: State, ctx: any): Decision {
 	const loaded = loadConfig(configPath(), PACKAGE_DIR);
 	if (loaded.error) report(s, ctx, loaded.error);
 	const config = loaded.config;
-	const hit = resolve(config, ctx?.model);
-	// A tree answer covers every model in this process, which is what it publishes. The answer's own
-	// `inherit` decides that when it has one; the config decides otherwise.
+	// A tree answer covers every model in this process. The answer's own `inherit` decides that when
+	// it has one; the config decides otherwise.
 	const tree = (s.override?.settings.inherit ?? config.inherit) === "tree";
 	const session = s.override && (tree || applies(s.override, key)) ? s.override : null;
 	// Session settings win over the rule, and an absent one leaves the config in charge.
 	const settings = session?.settings ?? {};
-	const mode = session ? (session.mode === "on" ? "leviathan" : "normal") : hit.mode;
-	const prompt = settings.prompt ?? promptPath(config, hit.prompt);
-	const text = mode === "leviathan" ? readPrompt(s, prompt, ctx) ?? null : null;
-	// The fabricated conversation is read only in a leviathan session: a normal one never opens it.
-	const turnsFile =
-		mode !== "leviathan" ? null : settings.turns !== undefined ? settings.turns : hit.turns ? turnsPath(config, hit.turns) : null;
+	const record = resolve(config, ctx?.model, settings);
+	const persona = record.persona;
+	const personaSpec = typeof persona === "string" ? promptPath(config, persona) : null;
+	const turnsSpec = typeof record.turns === "string" ? turnsPath(config, record.turns) : null;
+	const text = personaSpec ? readPrompt(s, personaSpec, ctx) ?? null : null;
 	let turns: TurnSpec[] | null = null;
 	let turnsError: string | null = null;
-	if (turnsFile) {
-		const file = loadTurns(turnsFile);
+	if (turnsSpec) {
+		const file = loadTurns(turnsSpec);
 		if (file.error) {
 			turnsError = file.error;
 			report(s, ctx, file.error, "warning");
@@ -248,19 +265,22 @@ function buildDecision(s: State, ctx: any): Decision {
 	}
 	s.decision = {
 		key,
-		mode,
+		persona: personaSpec ?? false,
+		turnsSpec: turnsSpec ?? false,
+		forge: record.forge === false ? false : { maxChars: record.forge.maxChars },
+		gate: record.gate === true,
+		cotTag: record.cotTag,
+		// Every tag the file names, plus the one this model resolved: a session-set tag is not in the
+		// file, and a fence it writes would otherwise be invisible to the next request.
+		tags: [...new Set([...configTags(config), record.cotTag])],
 		text,
 		turns,
 		turnsError,
-		turnsPath: turnsFile,
-		cotTag: settings.cotTag ?? hit.cotTag,
-		forge: settings.forge ?? hit.forge,
-		// `null` is a session asking for no bound, so it is a value: `??` would read it as an unset
-		// key and hand the config's bound back, which is the one thing the session said not to do.
-		forgeMaxChars: settings.forgeMaxChars !== undefined ? settings.forgeMaxChars : hit.forgeMaxChars,
-		prompt,
-		source: session ? "session" : hit.ruleIndex < 0 ? "default" : `rule ${hit.ruleIndex + 1}`,
-		inherit: settings.inherit ?? config.inherit,
+		turnsPath: turnsSpec,
+		promptPath: personaSpec,
+		sources: record.sources,
+		ruleIndex: record.ruleIndex,
+		inherit: record.inherit,
 		configPath: config.path,
 		error: loaded.error,
 	};
@@ -322,9 +342,9 @@ function project(messages: any[], stripIdentity: boolean) {
 }
 
 /**
- * Declare the gate exactly while the text is in force. Merging into the live set keeps every other
- * active tool; an unchanged set returns early, so a steady run records no tool-set change and the
- * prompt prefix stays cacheable.
+ * Declare the gate exactly while its slot is on. Merging into the live set keeps every other active
+ * tool; an unchanged set returns early, so a steady run records no tool-set change and the prompt
+ * prefix stays cacheable.
  */
 function syncGate(s: State, want: boolean, ctx: any) {
 	// A name the allowlist or the exposure rules filter out never becomes active; one attempt is
@@ -395,7 +415,7 @@ function injectTurns(s: State, ctx: any, current: Decision, messages: any[], nex
 	// Two points, so a pasted message that happens to match one fabricated one does not pass for a
 	// block that is already there.
 	const same = (a: any, b: any) => a !== undefined && JSON.stringify(a) === JSON.stringify(b);
-	if (same(base[insertAt], block[0]) && same(base[insertAt + specs.length - 1], block[block.length - 1])) {
+	if (same(base[insertAt], block[0]) && same(base[insertAt + block.length - 1], block[block.length - 1])) {
 		report(s, ctx, `${file} is already in the transcript (the fabricated block is not added twice)`, "warning");
 		return { injected: true };
 	}
@@ -411,36 +431,54 @@ function injectTurns(s: State, ctx: any, current: Decision, messages: any[], nex
 	return { messages: out, injected: true };
 }
 
-function updateStatus(s: State, ctx: any, current: Decision) {
-	// A request that carried neither half, or a configured turn file that did not load, is a loss the
-	// footer shows at once.
+/**
+ * A slot's value as the run holds it. `turns` is the one name that means two things here: the specs a
+ * request will carry, and whether the slot is on at all. Everything that asks "is this slot on"
+ * asks through here, so the array never passes for a switch.
+ */
+function slotValue(current: Decision, slot: string) {
+	return slot === "turns" ? current.turnsSpec : current[slot as keyof Decision];
+}
+
+/**
+ * The footer: one glyph per switch that is on, in a fixed order, and `!` when one that is on did not
+ * reach the request. A switch that is off prints nothing, so presence is the whole message and the
+ * glyphs never have to be counted against a fixed width.
+ */
+function footerState(current: Decision, delivery: State["delivery"]) {
+	const on = SWITCHES.filter((slot) => slotValue(current, slot) !== false);
+	// Two losses, both known before any request is built: a persona slot whose file does not read, and
+	// a fabricated conversation that does not load. The rest is what the last request actually carried.
 	const lost =
-		s.delivery &&
-		s.delivery.key === current.key &&
-		s.delivery.prompt === current.prompt &&
-		(!s.delivery.delivered || (s.delivery.turns !== null && !s.delivery.injected));
-	const state = !current.text
-		? current.mode === "leviathan"
-			? "Leviathan !"
-			: "Leviathan off"
-		: lost || current.turnsError
-			? "Leviathan !"
-			: "Leviathan on";
+		Boolean(current.turnsError) ||
+		(current.persona !== false && !current.text) ||
+		Boolean(
+			delivery &&
+				delivery.key === current.key &&
+				delivery.persona === current.persona &&
+				delivery.turns === current.turnsSpec &&
+				((current.persona !== false && !delivery.delivered) || (current.turnsSpec !== false && !delivery.injected)),
+		);
+	if (on.length === 0) return lost ? "Leviathan !" : "Leviathan";
+	return `Leviathan ${on.map((slot) => GLYPHS[slot]).join("")}${lost ? "!" : ""}`;
+}
+
+function updateStatus(s: State, ctx: any, current: Decision) {
 	try {
-		ctx?.ui?.setStatus?.("leviathan", state);
+		ctx?.ui?.setStatus?.("leviathan", footerState(current, s.delivery));
 	} catch {
-		// Status is decoration; a mode without a terminal must not fail a run.
+		// Status is decoration; a session without a terminal must not fail a run.
 	}
 }
 
 /** Record what a request carried, and show the loss the moment it happens. */
 function noteDelivery(s: State, ctx: any, current: Decision, delivered: boolean, injected: boolean) {
 	const before = s.delivery;
-	s.delivery = { key: current.key, prompt: current.prompt, turns: current.turnsPath, delivered, injected };
+	s.delivery = { key: current.key, persona: current.persona, turns: current.turnsSpec, delivered, injected };
 	if (
 		before &&
 		before.key === s.delivery.key &&
-		before.prompt === s.delivery.prompt &&
+		before.persona === s.delivery.persona &&
 		before.turns === s.delivery.turns &&
 		before.delivered === s.delivery.delivered &&
 		before.injected === s.delivery.injected
@@ -449,7 +487,7 @@ function noteDelivery(s: State, ctx: any, current: Decision, delivered: boolean,
 	updateStatus(s, ctx, current);
 }
 
-/** Forget the delivery of a request that a mode or session change no longer describes. */
+/** Forget the delivery of a request that a session change no longer describes. */
 function forgetDelivery(s: State) {
 	s.delivery = null;
 }
@@ -483,35 +521,19 @@ function syncChannel(s: State, ctx: any, inherit: string) {
 	publish(process.env, inherit === "none" || !s.override ? null : { ...s.override, key: publishKey(inherit, s.override.key) }, process.pid);
 }
 
-/** Replace this session's answer, mirror it for child processes, and apply it now. */
-function setOverride(s: State, ctx: any, mode: "on" | "off" | "toggle"): { mode: "on" | "off"; applied: boolean } {
-	if (!hasModel(ctx)) {
-		report(s, ctx, "no model selected", "warning");
-		s.decision = null;
-		const now = buildDecision(s, ctx);
-		return { mode: now.mode === "leviathan" ? "on" : "off", applied: false };
-	}
-	const key = modelKey(ctx?.model);
-	const before = buildDecision(s, ctx);
-	const current = s.override && applies(s.override, key) ? s.override.mode : before.mode === "leviathan" ? "on" : "off";
-	const next = mode === "toggle" ? (current === "on" ? "off" : "on") : mode;
-	// Under a tree the stored key is the scope the answer governs, so the panel and the payload agree.
-	setAnswer(s, { mode: next, key: before.inherit === "tree" ? "*" : key, settings: s.override?.settings ?? {} });
-	// A mode change describes a request that has not been sent yet.
-	forgetDelivery(s);
-	// Rebuild first: the config may have changed since the decision was made, and its `inherit`
-	// decides what the child processes see.
+/** Re-read the config, apply the answer, and show the result. */
+function reapply(s: State, ctx: any): Decision {
 	s.decision = null;
-	const after = buildDecision(s, ctx);
-	syncChannel(s, ctx, after.inherit);
-	syncGate(s, after.text !== null, ctx);
-	updateStatus(s, ctx, after);
-	return { mode: next, applied: true };
+	const current = buildDecision(s, ctx);
+	syncChannel(s, ctx, current.inherit);
+	syncGate(s, current.gate, ctx);
+	updateStatus(s, ctx, current);
+	return current;
 }
 
 /**
- * Set one session setting and apply it now. A value that does not validate changes nothing at all:
- * no decision reset, no publish, no status write.
+ * Set one session slot and apply it now. A value that does not validate changes nothing at all: no
+ * decision reset, no publish, no status write.
  *
  * The answer is re-keyed to the live model, or to `*` under an effective tree, so the settings apply
  * to the model in front of the user and a later `tree` to `keyed` flip narrows through the channel.
@@ -524,44 +546,37 @@ function configure(s: State, ctx: any, name: string, value: string): { ok: boole
 	const settings: Settings = { ...(s.override?.settings ?? {}) };
 	if (assignment.value === undefined) delete (settings as any)[assignment.key];
 	else (settings as any)[assignment.key] = assignment.value;
-	// Read the config as it is now: a decision older than this command must not decide the mode.
+	// Read the config as it is now: a decision older than this command must not decide the scope.
 	s.decision = null;
 	const before = buildDecision(s, ctx);
-	const inheritAfter = settings.inherit ?? loadConfig(configPath(), PACKAGE_DIR).config.inherit;
+	const inheritAfter = settings.inherit ?? before.inherit;
 	const answerKey = inheritAfter === "tree" ? "*" : s.override && applies(s.override, key) ? s.override.key : key;
-	// The answer keeps its own mode: a setting is not a mode change, and re-keying must not flip it.
-	const mode = s.override ? s.override.mode : before.mode === "leviathan" ? "on" : "off";
-	setAnswer(s, { mode, key: answerKey, settings });
+	setAnswer(s, { key: answerKey, settings });
 	forgetDelivery(s);
-	s.decision = null;
-	const after = buildDecision(s, ctx);
-	syncChannel(s, ctx, after.inherit);
-	syncGate(s, after.text !== null, ctx);
-	updateStatus(s, ctx, after);
+	reapply(s, ctx);
 	if (assignment.value === undefined) return { ok: true, message: `${assignment.key} default (config)` };
-	// `null` is two things: injection off for `turns`, and no bound for `forgeMaxChars`.
-	if (assignment.value === null) return { ok: true, message: `${assignment.key} ${assignment.key === "forgeMaxChars" ? "none" : "off"}` };
+	if (assignment.value === false) return { ok: true, message: `${assignment.key} off` };
+	if (assignment.value === true) return { ok: true, message: `${assignment.key} on` };
+	if (assignment.key === "forge") return { ok: true, message: `forge ${(assignment.value as Forge).maxChars === null ? "on, no bound" : `on, maxChars ${(assignment.value as Forge).maxChars}`}` };
 	return { ok: true, message: `${assignment.key} ${assignment.value}` };
 }
 
-/** Drop this session's answer, so the config decides again. Returns the mode that now applies. */
-function clearOverride(s: State, ctx: any): "on" | "off" {
-	setAnswer(s, null);
-	s.decision = null;
-	forgetDelivery(s);
-	publish(process.env, null, process.pid);
-	const current = buildDecision(s, ctx);
-	syncGate(s, current.text !== null, ctx);
-	updateStatus(s, ctx, current);
-	return current.mode === "leviathan" ? "on" : "off";
-}
-
 /**
- * Write the answer into the config file this session reads, as a rule for the current model.
- * The file's other keys and the other rules are kept as they are. A file that does not parse is
- * left untouched: replacing it would throw away the rules it still holds.
+ * Write the live model's whole record into the config file as one rule.
+ *
+ * The rule is complete rather than a patch: all five slots, `false` included, so nothing about this
+ * model is left to the file's `default` afterwards. That is what makes the file readable on its own
+ * — a record that inherits half its slots cannot be read without running the resolver in your head.
+ *
+ * The spelling of a value is preserved rather than its resolved form, so a slot that said `true`
+ * keeps saying `true` and a relative path keeps being relative: writing today's absolute path would
+ * lock the record to one machine. Only a value the session set is written as the session holds it,
+ * because a session path is already the absolute one the user typed.
+ *
+ * The rule goes to the front: the first matching rule wins, so an exact rule behind a wildcard has
+ * to move up rather than be edited where it sits. Running it twice leaves the file byte-identical.
  */
-function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; message: string } {
+function remember(s: State, ctx: any): { ok: boolean; message: string } {
 	const provider = String(ctx?.model?.provider ?? "");
 	const id = String(ctx?.model?.id ?? "");
 	if (!hasModel(ctx)) return { ok: false, message: "nothing written: no model selected" };
@@ -577,28 +592,38 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	const parsed = parseConfig(text, dirname(path));
 	if (parsed.error) return { ok: false, message: `${path}: ${parsed.error}` };
 	const data = JSON.parse(text);
-	// The rule that governs this model now. The rule this command writes takes over its text, or
-	// remembering a mode would silently switch the model to the default prompt file.
-	const applied = resolve(parsed.config, ctx?.model);
 	// What this session set, and only while the answer governs this model: a model the answer does not
 	// cover reads the config, so its rule must not take settings the user never saw here.
 	const tree = (s.override?.settings.inherit ?? parsed.config.inherit) === "tree";
 	const s0: Settings = s.override && (tree || applies(s.override, modelKey(ctx.model))) ? s.override.settings : {};
-	// The rule this command writes takes over the text, or remembering a mode would silently switch
-	// the model to the default prompt file.
-	const carried = s0.prompt ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].prompt : undefined);
-	// The tag is carried the same way: a rule that pinned its own keeps it, and a rule that left the
-	// key absent still inherits the config level.
-	const carriedCotTag = s0.cotTag ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].cotTag : undefined);
-	// The turns value the model resolves, written even when it is null: an absent key would inherit a
-	// config-level default and turn injection back on.
-	const carriedTurns = s0.turns !== undefined ? s0.turns : applied.turns;
-	// The forge settings travel the same way as the tag, with one difference: `auto` is the default, so
-	// writing it is harmless and a rule that never carried the key stays clean.
-	const carriedForge = s0.forge ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].forge : undefined);
-	const carriedForgeMaxChars =
-		s0.forgeMaxChars !== undefined ? s0.forgeMaxChars : applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].forgeMaxChars : undefined;
-	const rules = Array.isArray(data.rules) ? data.rules : [];
+	// The session rides along so `sources` can name it: a slot the session set is written as the session
+	// holds it, and the receipt has to say so.
+	const applied = resolve(parsed.config, ctx?.model, s0);
+	const matched = applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex] : null;
+	// The spelling comes from the file's own bytes: the parsed record has already turned `true` into the
+	// name of the shipped file and a tag into a bare name, and writing that back would pin a value that
+	// was meant to stay portable.
+	const spelled = applied.ruleIndex >= 0 ? (data.rules ?? [])[applied.ruleIndex] ?? {} : {};
+	const fallback = parsed.config.default ?? {};
+	const spelledFallback = data.default ?? {};
+	// The written form of one slot: the layer that answered, spelled the way that layer spells it.
+	const spelling = (slot: string) => {
+		if (s0[slot as keyof Settings] !== undefined) return s0[slot as keyof Settings];
+		if (matched && matched[slot] !== undefined && spelled[slot] !== undefined) return spelled[slot];
+		if (fallback[slot] !== undefined && spelledFallback[slot] !== undefined) return spelledFallback[slot];
+		return applied[slot as keyof typeof applied];
+	};
+	const record: Record<string, any> = { provider, model: id };
+	const was: string[] = [];
+	for (const slot of SLOTS) {
+		const value = spelling(slot);
+		// `true` and `{ maxChars: null }` say the same thing for forge; the short one is the one to write.
+		record[slot] = slot === "forge" && value && typeof value === "object" && value.maxChars === null ? true : value;
+		const source = applied.sources[slot] ?? "builtin";
+		const before = source === "session" ? "session" : source === "rule" ? `rule ${applied.ruleIndex + 1}` : source;
+		was.push(`  ${slot.padEnd(8)} ${JSON.stringify(record[slot])} (was ${before})`);
+	}
+	const rules = Array.isArray(data.rules) ? data.rules.slice() : [];
 	const at = rules.findIndex(
 		(rule: any) =>
 			typeof rule?.provider === "string" &&
@@ -606,94 +631,112 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 			rule.provider.toLowerCase() === provider.toLowerCase() &&
 			rule.model.toLowerCase() === id.toLowerCase(),
 	);
-	const next = mode === "on" ? "leviathan" : "normal";
-	// The first matching rule wins, so an exact rule behind a wildcard has to move up, not be
-	// edited where it sits.
-	if (at >= 0) {
-		const [updated] = rules.splice(at, 1);
-		// A key the session set is written as it is; one it did not set keeps what the rule carries.
-		rules.unshift({
-			...updated,
-			mode: next,
-			...(s0.prompt !== undefined ? { prompt: s0.prompt } : updated.prompt === undefined && carried ? { prompt: carried } : {}),
-			...(s0.cotTag !== undefined ? { cotTag: s0.cotTag } : updated.cotTag === undefined && carriedCotTag ? { cotTag: carriedCotTag } : {}),
-			...(s0.forge !== undefined ? { forge: s0.forge } : updated.forge === undefined && carriedForge ? { forge: carriedForge } : {}),
-			...(s0.forgeMaxChars !== undefined
-				? { forgeMaxChars: s0.forgeMaxChars }
-				: updated.forgeMaxChars === undefined && carriedForgeMaxChars !== undefined
-					? { forgeMaxChars: carriedForgeMaxChars }
-					: {}),
-			...(s0.turns !== undefined ? { turns: s0.turns } : updated.turns === undefined ? { turns: carriedTurns } : {}),
-		});
-	} else {
-		rules.unshift({
-			provider,
-			model: id,
-			mode: next,
-			...(carried ? { prompt: carried } : {}),
-			...(carriedCotTag ? { cotTag: carriedCotTag } : {}),
-			...(carriedForge ? { forge: carriedForge } : {}),
-			// Written even when it is `null`: an absent key would inherit the config's bound.
-			...(carriedForgeMaxChars !== undefined ? { forgeMaxChars: carriedForgeMaxChars } : {}),
-			turns: carriedTurns,
-		});
-	}
-	const out = {
-		...data,
-		default: data.default ?? "normal",
-		inherit: s0.inherit ?? data.inherit ?? "keyed",
-		prompt: data.prompt ?? "prompt.md",
-		rules,
-	};
-	const tmp = `${path}.${process.pid}.tmp`;
-	try {
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(tmp, `${JSON.stringify(out, null, "\t")}\n`);
-		renameSync(tmp, path);
-	} catch (error: any) {
+	if (at >= 0) rules.splice(at, 1);
+	rules.unshift(record);
+	const out = { default: data.default ?? {}, inherit: s0.inherit ?? data.inherit ?? "keyed", rules };
+	const before_ = `${JSON.stringify(out, null, "\t")}\n`;
+	const previous = at === 0 ? text.endsWith(before_) : false;
+	if (!previous) {
+		const tmp = `${path}.${process.pid}.tmp`;
 		try {
-			rmSync(tmp, { force: true });
-		} catch {
-			// The report below says what failed; a stray temp file is not worth a second error.
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(tmp, before_);
+			renameSync(tmp, path);
+		} catch (error: any) {
+			try {
+				rmSync(tmp, { force: true });
+			} catch {
+				// The report below says what failed; a stray temp file is not worth a second error.
+			}
+			return { ok: false, message: `${path}: ${error?.message ?? "write failed"}` };
 		}
-		return { ok: false, message: `${path}: ${error?.message ?? "write failed"}` };
 	}
-	// The file carries what the session set, so the session stops repeating it. A setting the write did
-	// not carry stays stored, and the re-key below applies it to the model in front of the user.
-	if (Object.keys(s0).length && s.override) s.override = { ...s.override, settings: {} };
-	// The file just changed: a decision taken before the write must not decide the key label below.
-	s.decision = null;
-	setOverride(s, ctx, mode);
-	return { ok: true, message: path };
+	// The file carries these slots now, so the session stops repeating them. `inherit` is a scope
+	// rather than a slot and stays where the session put it.
+	if (Object.keys(s0).length && s.override) {
+		const kept: Settings = { ...s0 };
+		for (const slot of SLOTS) delete (kept as any)[slot];
+		s.override = { ...s.override, settings: kept };
+		writeProcessAnswer(s.override);
+	}
+	forgetDelivery(s);
+	reapply(s, ctx);
+	const position = previous ? "unchanged" : at < 0 ? "written as rule 1" : at === 0 ? "updated rule 1" : `moved to rule 1 (was rule ${at + 1})`;
+	return { ok: true, message: `remembered ${provider}/${id}\n${was.join("\n")}\n  ${position}\n  ${path}` };
 }
 
-/** The panel: what the session resolved, and where each part came from. */
+/** Drop this session's answer, so the config decides again. Returns the record that now applies. */
+function clearOverride(s: State, ctx: any): Decision {
+	setAnswer(s, null);
+	forgetDelivery(s);
+	publish(process.env, null, process.pid);
+	return reapply(s, ctx);
+}
+
+/** Whether an earlier rule matches every model this one can match. Conservative on purpose: it
+ * reports the cases it can prove, and a rule it does not name may still be unreachable. */
+function covers(earlier: any, later: any) {
+	for (const field of ["provider", "model"]) {
+		const a = earlier[field];
+		const b = later[field];
+		if (a === undefined) continue;
+		if (b === undefined) return false;
+		if (a === b) continue;
+		if (typeof a === "string" && a.endsWith("*") && typeof b === "string" && b.startsWith(a.slice(0, -1))) continue;
+		return false;
+	}
+	return true;
+}
+
+/** The panel: what the live model resolved, where each slot came from, and every rule in the file. */
 function panel(s: State, ctx: any) {
 	// Read the config as it is now, not as the last run left it.
 	s.decision = null;
 	const current = buildDecision(s, ctx);
 	const inherited = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
-	// The session row lists what the answer carries, and says so when a model switch left it unapplied.
 	const settings = s.override?.settings ?? {};
-	const shown = Object.entries(settings)
-		.map(([name, value]) => `${name}=${value === null ? (name === "forgeMaxChars" ? "none" : "off") : value}`)
-		.join(" ");
-	const rows: string[][] = [
-		["model", hasModel(ctx) ? current.key : "(none)"],
-		["mode", current.mode],
-		["source", current.source],
-		...(shown ? [["session", `${s.override?.mode === "on" ? "on" : "off"}@${s.override?.key ?? ""} ${shown}${current.source === "session" ? "" : " (not applied)"}`]] : []),
-		["prompt", current.prompt],
-		["turns", current.turnsPath ?? "off"],
-		["forge", `${current.forge} (${current.forgeMaxChars === null ? "no bound" : `${current.forgeMaxChars} chars`})`],
-	];
-	if (current.mode === "leviathan" && !current.text) rows.push(["text", "missing"]);
+	// A session answer governs the model it names, or the whole tree under a tree scope. One that
+	// governs nothing in front of the user is still worth naming: it is why a slot looks unset.
+	const governed = Boolean(s.override) && (s.override.key === "*" || applies(s.override, current.key));
+	const rows: string[][] = [["model", hasModel(ctx) ? current.key : "(none)"]];
+	const describe = (slot: string) => {
+		const value = slotValue(current, slot);
+		if (slot === "forge") {
+			if (value === false) return "off";
+			const bound = (value as Forge).maxChars;
+			return bound === null ? "on, no bound" : `on, maxChars ${bound}`;
+		}
+		if (value === true) return "on";
+		if (value === false) return "off";
+		return String(value);
+	};
+	for (const slot of SLOTS) {
+		const source = current.sources[slot] ?? "builtin";
+		rows.push([
+			slot,
+			`${describe(slot)}${governed && settings[slot as keyof Settings] !== undefined ? " (session)" : ""}`,
+			source === "rule" ? `rule ${current.ruleIndex + 1}` : source,
+		]);
+	}
+	if (s.override && !governed) rows.push(["session", `${s.override.key} (not applied)`, ""]);
+	if (current.persona !== false && !current.text) rows.push(["persona", "the file does not read", ""]);
 	rows.push(["inherit", current.inherit], ["config", current.configPath ?? "none"]);
-	if (inherited) rows.push(["env", `${inherited.mode}@${inherited.key} ${applies(inherited, current.key) ? "applied" : "ignored"}`]);
+	if (inherited) rows.push(["env", `${inherited.key} ${applies(inherited, current.key) ? "applied" : "ignored"}`]);
 	if (current.error) rows.push(["error", current.error]);
 	if (current.turnsError) rows.push(["turns error", current.turnsError]);
 	const width = Math.max(...rows.map(([name]) => name.length)) + 2;
-	return rows.map(([name, value]) => `${name.padEnd(width)}${value}`).join("\n");
+	const head = rows.map(([name, value, note]) => `${name.padEnd(width)}${value}${note ? `  ${note}` : ""}`).join("\n");
+	// Every rule, including the ones an earlier rule makes unreachable: a table that hid them would
+	// answer "which model does this rule govern" with silence.
+	const { config } = loadConfig(configPath(), PACKAGE_DIR);
+	const lines = config.rules.map((rule, index) => {
+		const who = `${rule.provider ?? "*"}/${rule.model ?? "*"}`;
+		const on = SWITCHES.filter((slot) => rule[slot] !== undefined && rule[slot] !== false);
+		const shadow = config.rules.findIndex((earlier, earlierIndex) => earlierIndex < index && covers(earlier, rule));
+		const detail = on.length ? on.join(" ") : "nothing";
+		return `  ${String(index + 1).padStart(2)}  ${who.padEnd(34)}${detail}${shadow >= 0 ? `   (shadowed by ${shadow + 1})` : ""}`;
+	});
+	return lines.length ? `${head}\n\nrules\n${lines.join("\n")}` : `${head}\n\nrules\n  none`;
 }
 
 export default function leviathan(pi: ExtensionAPI) {
@@ -715,7 +758,7 @@ export default function leviathan(pi: ExtensionAPI) {
 			if (input.fictional !== undefined) out.fictional = input.fictional;
 			return out;
 		},
-		// Dormant until a run in force activates it, so another model never sees a declaration.
+		// Dormant until a run whose record turns the gate on activates it.
 		defaultActive: false,
 		annotations: { readOnlyHint: true, idempotentHint: true },
 		async execute(toolCallId: string, params: any) {
@@ -735,9 +778,8 @@ export default function leviathan(pi: ExtensionAPI) {
 	});
 
 	registerCommands(pi, {
-		set: (ctx, mode) => setOverride(s, ctx, mode),
 		reset: (ctx) => clearOverride(s, ctx),
-		remember: (ctx, mode) => remember(s, ctx, mode),
+		remember: (ctx) => remember(s, ctx),
 		configure: (ctx, name, value) => configure(s, ctx, name, value),
 		panel: (ctx) => panel(s, ctx),
 	});
@@ -756,20 +798,17 @@ export default function leviathan(pi: ExtensionAPI) {
 		// process already holds stands.
 		const inherited = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
 		if (inherited && (config.inherit !== "none" || inherited.self)) {
-			s.override = { mode: inherited.mode, key: inherited.key, settings: inherited.settings };
+			s.override = { key: inherited.key, settings: inherited.settings };
 		} else if (config.inherit === "none" && inherited && !inherited.self) {
 			// A parent's answer is dropped when this tree does not inherit.
 			s.override = null;
 		} else {
 			// A runtime that replaces this one carries no channel under `none`, and `/reload`
-			// re-evaluates this module, so the answer this process set is what keeps the mode
+			// re-evaluates this module, so the answer this process set is what keeps the slots
 			// across `/new`, a fork, a session switch and `/reload`.
 			s.override = readProcessAnswer();
 		}
-		s.decision = null;
-		const current = buildDecision(s, ctx);
-		syncChannel(s, ctx, current.inherit);
-		updateStatus(s, ctx, current);
+		reapply(s, ctx);
 	});
 
 	// A ruling has to be its own result: pi keeps a nested call out of the transcript, so a gate
@@ -790,7 +829,7 @@ export default function leviathan(pi: ExtensionAPI) {
 		s.options = options;
 		// A run start is where an edited `inherit` reaches the channel.
 		syncChannel(s, ctx, current.inherit);
-		syncGate(s, current.text !== null, ctx);
+		syncGate(s, current.gate, ctx);
 		updateStatus(s, ctx, current);
 	});
 
@@ -803,7 +842,7 @@ export default function leviathan(pi: ExtensionAPI) {
 		forgetDelivery(s);
 		const current = buildDecision(s, ctx);
 		syncChannel(s, ctx, current.inherit);
-		syncGate(s, current.text !== null, ctx);
+		syncGate(s, current.gate, ctx);
 		updateStatus(s, ctx, current);
 	});
 
@@ -816,7 +855,7 @@ export default function leviathan(pi: ExtensionAPI) {
 		// be loaded after this one and writes onto the options object this run handed out.
 		const forced = s.options?.forceSystemPrompt !== undefined;
 		if (current.text && forced) {
-			report(s, ctx, `${basename(current.prompt)} is not delivered (another extension replaced the system prompt)`, "warning");
+			report(s, ctx, `${basename(current.persona as string)} is not delivered (another extension replaced the system prompt)`, "warning");
 		}
 		// 1) Refill the CoT pi drops for a message written by another model. This runs first, on the
 		// transcript as it arrived, so the fabricated block's anchor below is computed on the list it
@@ -825,9 +864,15 @@ export default function leviathan(pi: ExtensionAPI) {
 		// A routed selection has no reachable physical model here, so it refills nothing.
 		const routed = ctx?.model?.api === VIRTUAL_MODEL_API;
 		const forged =
-			current.forge === "off" || !hasModel(ctx) || routed
+			current.forge === false || !hasModel(ctx) || routed
 				? messages
-				: forgeHistory(messages, { provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id }, current.cotTag, current.forgeMaxChars);
+				: forgeHistory(
+						messages,
+						{ provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id },
+						current.cotTag,
+						current.forge.maxChars,
+						current.tags,
+					);
 		// 2) The prompt head, then the fabricated block. `project` only ever removes a section key
 		// from a system message, which forge never touched.
 		let next = project(forged, current.text !== null);
@@ -854,8 +899,8 @@ export default function leviathan(pi: ExtensionAPI) {
 					s,
 					ctx,
 					at < 0
-						? `${basename(current.prompt)} is not delivered (the transcript carries no system message)`
-						: `${basename(current.prompt)} is not delivered (the leading system message takes no text blocks)`,
+						? `${basename(current.persona as string)} is not delivered (the transcript carries no system message)`
+						: `${basename(current.persona as string)} is not delivered (the leading system message takes no text blocks)`,
 					"warning",
 				);
 			} else {
@@ -883,8 +928,8 @@ export default function leviathan(pi: ExtensionAPI) {
 		// system prompt was replaced by another extension skips it and says so.
 		const spliced = injectTurns(s, ctx, current, forged, next, at, forced);
 		if (spliced.messages) next = spliced.messages;
-		// The footer reports what the request carried, not only what the mode asked for.
-		if (current.text || current.turns) noteDelivery(s, ctx, current, delivered && !forced, spliced.injected);
+		// The footer reports what the request carried, not only what the record asked for.
+		if (current.persona !== false || current.turnsSpec !== false) noteDelivery(s, ctx, current, delivered && !forced, spliced.injected);
 		else forgetDelivery(s);
 		// Aligned: return undefined so the request stays byte-identical and allocation-free.
 		return next === undefined ? undefined : { messages: next };

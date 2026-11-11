@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import def from "./index.ts";
 import { authorizeGate, CSAM_FIELD, GATE_FIELDS, GATE_TOOL } from "./gate.js";
-import { configPath, DEFAULT_TURNS, emptyConfig, globMatch, loadConfig, parseConfig, promptPath, resolve as resolveMode, sessionSettings, settingFromCommand, SETTINGS_KEYS, turnsPath } from "./config.js";
+import { configPath, configTags, DEFAULT_PROMPT, DEFAULT_TURNS, emptyConfig, emptyRecord, globMatch, loadConfig, parseConfig, promptPath, resolve as resolveMode, sessionSettings, settingFromCommand, SETTINGS_KEYS, SLOTS, SWITCHES, turnsPath } from "./config.js";
 import { applies, decode, encode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { loadTurns, parseTurns, toMessages } from "./turns.js";
 import { forgeHistory, forgeOne, isSameModel, ownCot, prefixStable } from "./forge.js";
@@ -196,7 +196,7 @@ assert.equal(payloadSegments(prose), 22, "the number of Chinese payload segments
 console.log("ok prompt.md");
 
 // ---------------------------------------------------------------------------
-// The rule table
+// The record: five slots, five resolutions
 // ---------------------------------------------------------------------------
 assert.equal(globMatch("deepseek-*", "deepseek-flash"), true);
 assert.equal(globMatch("*deepseek*", "@cf/deepseek-ai/deepseek-v4.1-flash"), true);
@@ -206,177 +206,186 @@ assert.equal(globMatch("glm-5.3", "glm-5.3-turbo"), false, "a pattern without * 
 assert.equal(globMatch("*gpt-5.1*", "gpt-5x1"), false, "a dot matches only a dot");
 assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 
+// The record with nothing configured changes no request: all four switches off, and the shipped tag.
 {
-	const parsed = parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", model: "glm-*" }] }), "/cfg");
-	assert.equal(parsed.error, undefined);
-	assert.equal(parsed.config.default, "normal");
-	assert.equal(parsed.config.inherit, "keyed");
-	assert.equal(parsed.config.prompt, "prompt.md");
-	assert.equal(parsed.config.dir, "/cfg");
-	for (const bad of [
-		"{",
-		"[]",
-		JSON.stringify({ default: "on" }),
-		JSON.stringify({ inherit: "yes" }),
-		JSON.stringify({ rules: {} }),
-		JSON.stringify({ rules: [{ provider: "x" }] }),
-		JSON.stringify({ rules: [{ mode: "leviathan", model: "" }] }),
-		JSON.stringify({ rules: [{ mode: "leviathan", prompt: 1 }] }),
-	]) {
-		assert.ok(parseConfig(bad, "/cfg").error, `must reject: ${bad}`);
-	}
+	const bare = parseConfig("{}", "/cfg");
+	assert.equal(bare.error, undefined);
+	assert.deepEqual(bare.config.default, {}, "the file's default names nothing");
+	assert.equal(bare.config.inherit, "keyed");
+	assert.equal(bare.config.dir, "/cfg");
+	assert.deepEqual(emptyConfig("/cfg").default, {}, "and neither does the empty config");
+	assert.deepEqual(emptyRecord(), { persona: false, gate: false, turns: false, forge: false, cotTag: "think" });
+	const resolved = resolveMode(bare.config, { provider: "any", id: "model" });
+	assert.deepEqual(
+		{ persona: resolved.persona, gate: resolved.gate, turns: resolved.turns, forge: resolved.forge, cotTag: resolved.cotTag },
+		emptyRecord(),
+		"every slot falls through to the built-in record",
+	);
+	assert.deepEqual(resolved.sources, { persona: "builtin", gate: "builtin", turns: "builtin", forge: "builtin", cotTag: "builtin" });
+	assert.equal(resolved.ruleIndex, -1);
 }
 
+// A file, a rule and a session each set slots on their own, and every slot reports which layer
+// answered. This table is the whole design in one place: four switches that never drag each other.
 {
 	const config = parseConfig(
 		JSON.stringify({
-			default: "normal",
+			default: { persona: true, cotTag: "think" },
 			rules: [
-				{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "normal" },
-				{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" },
-				{ model: "*glm*", mode: "leviathan", prompt: "prompts/glm.md" },
-				{ provider: "deepseek", mode: "leviathan" },
+				{ provider: "a", model: "one", gate: true },
+				{ provider: "a", model: "two", turns: true, forge: { maxChars: 800 } },
+				{ provider: "a", model: "three", persona: false, cotTag: "<analysis>" },
+				{ model: "*three*", forge: false },
 			],
 		}),
 		"/cfg",
 	).config;
-	assert.deepEqual(resolveMode(config, { provider: "CLIProxy-Chat", id: "deepseek-flash" }), {
-		mode: "normal",
-		prompt: "prompt.md",
-		turns: DEFAULT_TURNS,
-		cotTag: "think",
-		forge: "auto",
-		forgeMaxChars: null,
-		ruleIndex: 0,
-	}, "the first match wins");
-	assert.deepEqual(resolveMode(config, { provider: "CLIProxy-Chat", id: "deepseek-pro" }), {
-		mode: "leviathan",
-		prompt: "prompt.md",
-		turns: DEFAULT_TURNS,
-		cotTag: "think",
-		forge: "auto",
-		forgeMaxChars: null,
-		ruleIndex: 1,
-	});
-	assert.deepEqual(resolveMode(config, { provider: "zhipu", id: "glm-5.3" }), {
-		mode: "leviathan",
-		prompt: "prompts/glm.md",
-		turns: DEFAULT_TURNS,
-		cotTag: "think",
-		forge: "auto",
-		forgeMaxChars: null,
-		ruleIndex: 2,
-	}, "a missing provider matches any provider");
-	assert.deepEqual(resolveMode(config, { provider: "deepseek", id: "anything" }), {
-		mode: "leviathan",
-		prompt: "prompt.md",
-		turns: DEFAULT_TURNS,
-		cotTag: "think",
-		forge: "auto",
-		forgeMaxChars: null,
-		ruleIndex: 3,
-	}, "a missing model matches any model");
-	assert.deepEqual(resolveMode(config, { provider: "openai", id: "gpt-5" }), {
-		mode: "normal",
-		prompt: "prompt.md",
-		turns: DEFAULT_TURNS,
-		cotTag: "think",
-		forge: "auto",
-		forgeMaxChars: null,
-		ruleIndex: -1,
-	}, "no match falls back to the default");
-	assert.equal(promptPath(config, "prompts/glm.md"), join("/cfg", "prompts", "glm.md"));
-	assert.equal(promptPath(config, "/abs/prompt.md"), "/abs/prompt.md");
-	assert.equal(
-		promptPath(config, "prompt.md"),
-		join(dirname(fileURLToPath(import.meta.url)), "prompt.md"),
-		"the default name always means the text that ships with the extension",
+	assert.equal(config.error, undefined);
+	const one = resolveMode(config, { provider: "a", id: "one" });
+	assert.deepEqual(
+		{ persona: one.persona, gate: one.gate, turns: one.turns, forge: one.forge, cotTag: one.cotTag },
+		{ persona: DEFAULT_PROMPT, gate: true, turns: false, forge: false, cotTag: "think" },
+		"a rule that names gate leaves the other four to the layers below it",
 	);
-}
+	assert.deepEqual(one.sources, { persona: "default", gate: "rule", turns: "builtin", forge: "builtin", cotTag: "default" });
 
-// The tag is configurable, and both spellings of one tag resolve to the same name.
+	const two = resolveMode(config, { provider: "a", id: "two" });
+	assert.deepEqual(
+		{ persona: two.persona, gate: two.gate, turns: two.turns, forge: two.forge },
+		{ persona: DEFAULT_PROMPT, gate: false, turns: DEFAULT_TURNS, forge: { maxChars: 800 } },
+		"a rule that names turns and forge leaves persona and gate alone",
+	);
+	assert.deepEqual(two.sources, { persona: "default", gate: "builtin", turns: "rule", forge: "rule", cotTag: "default" });
+
+	const three = resolveMode(config, { provider: "a", id: "three" });
+	assert.equal(three.persona, false, "a rule turns a slot off that the file turned on");
+	assert.equal(three.cotTag, "analysis", "angle brackets are not part of the tag name");
+	assert.equal(three.forge, false, "a wildcard rule behind it is shadowed by the exact one");
+
+	// The session wins over every file layer, and only for the slots it names.
+	const session = resolveMode(config, { provider: "a", id: "two" }, { gate: true, forge: { maxChars: null } });
+	assert.equal(session.gate, true, "a session slot wins over the built-in record");
+	assert.deepEqual(session.forge, { maxChars: null }, "and over the rule");
+	assert.equal(session.turns, DEFAULT_TURNS, "a slot the session does not name stays where the file put it");
+	assert.equal(session.sources.gate, "session");
+	assert.equal(session.sources.forge, "session");
+	assert.equal(session.sources.turns, "rule");
+
+	// Changing one slot in the file's default changes nothing about the slots a rule names.
+	const moved = parseConfig(
+		JSON.stringify({ default: { persona: true, gate: true, turns: true, forge: true }, rules: [{ provider: "a", model: "x", gate: false }] }),
+		"/cfg",
+	).config;
+	const x = resolveMode(moved, { provider: "a", id: "x" });
+	assert.deepEqual({ ...x.sources }, { persona: "default", gate: "rule", turns: "default", forge: "default", cotTag: "builtin" });
+	assert.equal(x.gate, false);
+}
+console.log("ok record resolution");
+
+// The shapes each slot takes, and the value it refuses.
 {
-	const bare = parseConfig(JSON.stringify({ rules: [] }), "/cfg");
-	assert.equal(bare.config.cotTag, "think", "the fence tag defaults to think");
-	const wrapped = parseConfig(JSON.stringify({ cotTag: "<think>" }), "/cfg");
-	assert.equal(wrapped.config.cotTag, "think", "angle brackets are not part of the name");
-	const named = parseConfig(JSON.stringify({ cotTag: " analysis ", rules: [{ mode: "leviathan", provider: "a", model: "b", cotTag: "<reasoning>" }] }), "/cfg");
-	assert.equal(named.config.cotTag, "analysis", "a config-level tag is trimmed");
-	assert.equal(named.config.rules[0].cotTag, "reasoning", "a rule tag keeps the same normalization");
-	assert.equal(resolveMode(named.config, { provider: "x", id: "y" }).cotTag, "analysis", "the config value reaches a model no rule names");
-	assert.equal(resolveMode(named.config, { provider: "a", id: "b" }).cotTag, "reasoning", "a rule tag wins over the config value");
-	for (const bad of ["", "<>", "a b", "1tag", "<a><b>", "tag>"] ) {
-		assert.ok(parseConfig(JSON.stringify({ cotTag: bad }), "/cfg").error, `cotTag rejects ${JSON.stringify(bad)}`);
-		assert.ok(parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", cotTag: bad }] }), "/cfg").error, `a rule rejects ${JSON.stringify(bad)}`);
+	const one = (slot, value) => parseConfig(JSON.stringify({ default: { [slot]: value } }), "/cfg");
+	assert.equal(one("persona", true).config.default.persona, DEFAULT_PROMPT, "true names the shipped text");
+	assert.equal(one("persona", "mine.md").config.default.persona, "mine.md", "a path is kept as written");
+	assert.equal(one("persona", false).config.default.persona, false);
+	assert.equal(one("turns", true).config.default.turns, DEFAULT_TURNS);
+	assert.deepEqual(one("forge", true).config.default.forge, { maxChars: null }, "true is no bound");
+	assert.deepEqual(one("forge", { maxChars: 1200 }).config.default.forge, { maxChars: 1200 });
+	assert.deepEqual(one("forge", { maxChars: null }).config.default.forge, { maxChars: null });
+	assert.equal(one("forge", false).config.default.forge, false);
+	assert.equal(one("gate", true).config.default.gate, true);
+	assert.equal(one("cotTag", "<analysis>").config.default.cotTag, "analysis");
+
+	for (const [slot, bad] of [
+		["persona", 1],
+		["persona", ""],
+		["persona", null],
+		["turns", null],
+		["turns", 1],
+		["turns", ""],
+		["gate", "on"],
+		["gate", 1],
+		["forge", "auto"],
+		["forge", "off"],
+		["forge", 1],
+		["forge", {}],
+		["forge", { maxChars: 0 }],
+		["forge", { maxChars: -1 }],
+		["forge", { maxChars: 1.5 }],
+		["forge", { maxChars: "1200" }],
+		["forge", { bound: 1200 }],
+		["cotTag", ""],
+		["cotTag", "<>"],
+		["cotTag", "a b"],
+		["cotTag", "1tag"],
+		["cotTag", "<a><b>"],
+	]) {
+		assert.ok(one(slot, bad).error, `the file rejects ${slot}: ${JSON.stringify(bad)}`);
+		assert.ok(parseConfig(JSON.stringify({ rules: [{ [slot]: bad }] }), "/cfg").error, `a rule rejects ${slot}: ${JSON.stringify(bad)}`);
 	}
+	// A rule names slots and a match, and nothing else.
+	assert.equal(parseConfig(JSON.stringify({ rules: [{ provider: "x" }] }), "/cfg").error, undefined, "a rule whose slots all fall through is a match and nothing else");
+	assert.match(parseConfig(JSON.stringify({ rules: [{ provider: 1 }] }), "/cfg").error ?? "", /provider must be a non-empty string/);
 }
-console.log("ok cot tag");
+console.log("ok slot shapes");
 
-// The file takes the keys it names and nothing else: one that still carries the removed channel is
-// rejected whole rather than silently ignored.
+// A path has to name something: whitespace is not a name, so the file that carries one is rejected
+// where it is read instead of failing later as an unreadable file.
 {
+	for (const slot of ["persona", "turns"]) {
+		for (const bad of ["   ", "\t", "\n "]) {
+			assert.match(
+				parseConfig(JSON.stringify({ default: { [slot]: bad } }), "/cfg").error ?? "",
+				/non-empty path/,
+				`a whitespace-only ${slot} is rejected: ${JSON.stringify(bad)}`,
+			);
+		}
+	}
+	// A path that merely contains or surrounds spaces is a path.
+	assert.equal(parseConfig(JSON.stringify({ default: { persona: "  p.md  " } }), "/cfg").config.default.persona, "  p.md  ", "a padded path keeps its bytes");
+	assert.equal(parseConfig(JSON.stringify({ default: { persona: "dir with space/f.md" } }), "/cfg").error, undefined, "a path with a space inside is fine");
+	// And the command line agrees with the file.
+	assert.match(settingFromCommand("persona", "   ").error ?? "", /needs a value/);
+	assert.match(settingFromCommand("turns", "   ").error ?? "", /needs a value/);
+}
+
+// A config takes three keys. The bundle this replaced is gone, and a file that still carries it is
+// rejected whole rather than read as some other combination of slots.
+{
+	assert.match(parseConfig(JSON.stringify({ mode: "leviathan" }), "/cfg").error, /mode is not a config key \(default, inherit, rules\)/);
+	assert.match(parseConfig(JSON.stringify({ prompt: "p.md" }), "/cfg").error, /prompt is not a config key/);
+	assert.match(parseConfig(JSON.stringify({ forgeMaxChars: 4000 }), "/cfg").error, /forgeMaxChars is not a config key/);
+	assert.match(parseConfig(JSON.stringify({ default: { mode: "leviathan" } }), "/cfg").error, /default: mode is not one of persona, gate, turns, forge, cotTag/);
+	assert.match(parseConfig(JSON.stringify({ default: { prompt: "p.md" } }), "/cfg").error, /default: prompt is not one of/);
 	assert.match(
-		parseConfig(JSON.stringify({ cot: "content" }), "/cfg").error,
-		/cot is not a config key \(default, inherit, prompt, turns, cotTag, forge, forgeMaxChars, rules\)/,
+		parseConfig(JSON.stringify({ rules: [{ provider: "x", forgeMaxChars: 1200 }] }), "/cfg").error,
+		/rule 1: forgeMaxChars is not one of provider, model, persona, gate, turns, forge, cotTag/,
 	);
-	assert.match(
-		parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", cot: "content" }] }), "/cfg").error,
-		/cot is not a rule key \(mode, provider, model, prompt, turns, cotTag, forge, forgeMaxChars\)/,
-	);
-	assert.equal(parseConfig(JSON.stringify({ cotTag: "think", rules: [{ mode: "leviathan", cotTag: "analysis" }] }), "/cfg").error, undefined);
-	// A mode outside the set rejects the file whole. The removed mode is the one that matters: reading
-	// it as `auto` would change what a request carries without a word.
-	assert.equal(parseConfig(JSON.stringify({ forge: "always" }), "/cfg").error, "forge must be auto, off");
-	assert.equal(parseConfig(JSON.stringify({ forge: "ALWAYS" }), "/cfg").error, "forge must be auto, off", "the check is on the lowered value, not the spelling");
-	assert.equal(
-		parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", forge: "always" }] }), "/cfg").error,
-		"rule 1: forge must be auto, off",
-		"a rule reports the rule it is in",
-	);
-	assert.equal(parseConfig(JSON.stringify({ forge: "off" }), "/cfg").config.forge, "off", "a mode in the set loads as itself");
+	assert.match(parseConfig(JSON.stringify({ inherit: "yes" }), "/cfg").error, /inherit must be/);
+	assert.match(parseConfig(JSON.stringify({ default: "on" }), "/cfg").error, /default is not an object/);
+	assert.match(parseConfig(JSON.stringify({ rules: {} }), "/cfg").error, /rules must be an array/);
+	assert.match(parseConfig("{", "/cfg").error, /invalid JSON/);
+	assert.match(parseConfig("[]", "/cfg").error, /not an object/);
 }
 console.log("ok config keys");
 
-// The cot budget is off unless it is asked for, and asking for it is the only way it is on. A cut
-// trace is not the reasoning the turn wrote, and a model handed a truncated version of its own
-// thinking has a reason to distrust the turn, which is worth more than any request-size saving.
+// Every tag the file names travels with the resolved record, because a turn fenced under one model's
+// tag has to count as fenced for the model configured with another.
 {
-	const bound = (value) => parseConfig(JSON.stringify(value === undefined ? {} : { forgeMaxChars: value }), "/cfg");
-	assert.equal(bound(undefined).config.forgeMaxChars, null, "the default is no bound");
-	assert.equal(bound(null).config.forgeMaxChars, null, "null is no bound, spelled out");
-	assert.equal(bound(1200).config.forgeMaxChars, 1200, "a positive integer bounds the trace");
-	for (const bad of [0, -1, -4000, 1.5, "1200", true]) {
-		assert.match(bound(bad).error ?? "", /forgeMaxChars must be a positive whole number, or null for no bound/, `rejected: ${JSON.stringify(bad)}`);
-	}
-	// A rule carries the same three states, and `null` is a value there: it turns the bound off even
-	// when the config names one.
-	const rooted = parseConfig(
-		JSON.stringify({ forgeMaxChars: 800, rules: [{ mode: "leviathan", model: "a", forgeMaxChars: null }, { mode: "leviathan", model: "b", forgeMaxChars: 100 }] }),
+	const config = parseConfig(
+		JSON.stringify({ default: { cotTag: "think" }, rules: [{ model: "a", cotTag: "analysis" }, { model: "b", cotTag: "<reasoning>" }] }),
 		"/cfg",
 	).config;
-	assert.equal(resolveMode(rooted, { provider: "x", id: "a" }).forgeMaxChars, null, "a rule turns the bound off");
-	assert.equal(resolveMode(rooted, { provider: "x", id: "b" }).forgeMaxChars, 100, "a rule sets its own bound");
-	assert.equal(resolveMode(rooted, { provider: "x", id: "c" }).forgeMaxChars, 800, "and the config value reaches a rule that does not name one");
-	assert.match(
-		parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", forgeMaxChars: 0 }] }), "/cfg").error ?? "",
-		/rule 1: forgeMaxChars must be a positive whole number/,
-	);
-	// The command spells no bound as `none` or `null`, and a bare number as itself.
-	assert.deepEqual(settingFromCommand("forgeMaxChars", "none"), { key: "forgeMaxChars", value: null });
-	assert.deepEqual(settingFromCommand("forgeMaxChars", "null"), { key: "forgeMaxChars", value: null });
-	assert.deepEqual(settingFromCommand("forgeMaxChars", "1200"), { key: "forgeMaxChars", value: 1200 });
-	for (const bad of ["0", "-4000", "1.5", "lots"]) {
-		assert.ok(settingFromCommand("forgeMaxChars", bad).error, `the command rejects ${bad}`);
-	}
-	// And a session answer carries the three states as they are.
-	assert.deepEqual(sessionSettings({ forgeMaxChars: null }).settings, { forgeMaxChars: null }, "no bound travels as a value, not an absence");
+	assert.deepEqual([...configTags(config)].sort(), ["analysis", "reasoning", "think"]);
+	assert.deepEqual([...configTags(emptyConfig("/cfg"))], ["think"], "the built-in tag is always in the set");
+	assert.equal(resolveMode(config, { provider: "x", id: "a" }).cotTag, "analysis", "a model's own tag still decides what it writes");
 }
-console.log("ok forge budget config");
+console.log("ok config tags");
 
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-leviathan-config-"));
 	const file = join(dir, "leviathan.json");
-	writeFileSync(file, JSON.stringify({ rules: [{ model: "*", mode: "leviathan" }] }));
+	writeFileSync(file, JSON.stringify({ rules: [{ model: "*", persona: true }] }));
 	const first = loadConfig(file, dir);
 	assert.equal(first.error, undefined);
 	assert.equal(first.config.path, file);
@@ -385,44 +394,50 @@ console.log("ok forge budget config");
 	assert.ok(second.error, "a rejected file is reported");
 	assert.deepEqual(second.config.rules, [], "and the empty config takes over");
 	assert.deepEqual(loadConfig(join(dir, "missing.json"), dir).config.rules, [], "a missing file is the empty config");
-	assert.equal(emptyConfig(dir).default, "normal");
 	rmSync(dir, { recursive: true, force: true });
 }
-
 console.log("ok config");
 
-// `turns` is three-state: absent inherits, `null` turns injection off, a string names the file. A
-// rule's own value wins, and an explicit `null` is not folded into the config-level one.
+// The cache keys on the bytes, not on the stat: two writes in one timestamp tick share an `mtimeMs`,
+// and two spellings of one record share a `size`, so a stat-keyed cache answers with a record the
+// file no longer carries.
 {
-	const states = (data) => parseConfig(JSON.stringify(data), "/cfg");
-	assert.equal(states({ turns: "turn0.yml" }).config.turns, "turn0.yml");
-	assert.equal(states({ turns: null }).config.turns, null);
-	assert.equal(states({}).config.turns, DEFAULT_TURNS, "an absent key takes the file that ships with the package");
-	assert.equal(states({ rules: [{ mode: "leviathan", turns: "ds/turn0.yml" }] }).config.rules[0].turns, "ds/turn0.yml");
-	assert.equal(states({ rules: [{ mode: "leviathan", turns: null }] }).config.rules[0].turns, null);
-	assert.equal(states({ rules: [{ mode: "leviathan" }] }).config.rules[0].turns, undefined, "an absent rule value inherits");
-	for (const bad of [{ turns: 1 }, { turns: "" }, { turns: true }, { rules: [{ mode: "leviathan", turns: 1 }] }]) {
-		assert.ok(states(bad).error, `must reject: ${JSON.stringify(bad)}`);
+	const dir = mkdtempSync(join(tmpdir(), "pi-leviathan-revision-"));
+	const file = join(dir, "leviathan.json");
+	// Same length, different record: this pair is what a stat-keyed cache cannot tell apart.
+	const a = JSON.stringify({ default: { gate: true, forge: false } });
+	const b = JSON.stringify({ default: { turns: true, forge: true } });
+	assert.equal(a.length, b.length, "the two records are the same width, so a size cannot separate them");
+	for (let i = 0; i < 40; i++) {
+		writeFileSync(file, a);
+		const first = loadConfig(file, dir).config.default;
+		writeFileSync(file, b);
+		const second = loadConfig(file, dir).config.default;
+		assert.equal(first.forge, false, `revision ${i} reads the first file`);
+		assert.deepEqual(second.forge, { maxChars: null }, `revision ${i} reads the second file, not the one it replaced`);
 	}
-	assert.equal(emptyConfig("/cfg").turns, DEFAULT_TURNS);
-
-	const config = states({
-		turns: "turn0.yml",
-		rules: [
-			{ provider: "a", mode: "leviathan" },
-			{ provider: "b", mode: "leviathan", turns: "b.yml" },
-			{ provider: "c", mode: "leviathan", turns: null },
-		],
-	}).config;
-	assert.equal(resolveMode(config, { provider: "a", id: "x" }).turns, "turn0.yml", "a rule with no value inherits the config one");
-	assert.equal(resolveMode(config, { provider: "b", id: "x" }).turns, "b.yml");
-	assert.equal(resolveMode(config, { provider: "c", id: "x" }).turns, null, "an explicit null turns injection off");
-	assert.equal(resolveMode(config, { provider: "d", id: "x" }).turns, "turn0.yml", "no rule falls back to the config");
-	assert.equal(turnsPath(config, "ds/turn0.yml"), join("/cfg", "ds", "turn0.yml"), "a relative path sits next to the config file");
-	assert.equal(turnsPath(config, "/abs/turn0.yml"), "/abs/turn0.yml");
-	assert.equal(turnsPath(config, DEFAULT_TURNS), join(PACKAGE_DIR, DEFAULT_TURNS), "the shipped file resolves to the package copy");
+	// And a rejected revision is reported, not served from the record that parsed before it.
+	writeFileSync(file, a);
+	assert.equal(loadConfig(file, dir).error, undefined);
+	writeFileSync(file, "{ not json");
+	assert.match(loadConfig(file, dir).error ?? "", /invalid JSON/, "a broken revision is reported");
+	writeFileSync(file, a);
+	assert.equal(loadConfig(file, dir).error, undefined, "and the fix is seen too");
+	rmSync(dir, { recursive: true, force: true });
 }
-console.log("ok turns config");
+console.log("ok config cache reads the bytes");
+
+// The two path slots resolve the shipped name to the package copy and a relative path to the file's
+// own directory, so a config written anywhere means the same thing.
+{
+	const config = parseConfig(JSON.stringify({ default: { persona: "text/mine.md", turns: "team/turn0.yml" } }), "/cfg").config;
+	assert.equal(promptPath(config, "text/mine.md"), join("/cfg", "text", "mine.md"));
+	assert.equal(promptPath(config, "/abs/prompt.md"), "/abs/prompt.md");
+	assert.equal(promptPath(config, DEFAULT_PROMPT), join(PACKAGE_DIR, DEFAULT_PROMPT), "the shipped name means the package copy");
+	assert.equal(turnsPath(config, "team/turn0.yml"), join("/cfg", "team", "turn0.yml"));
+	assert.equal(turnsPath(config, DEFAULT_TURNS), join(PACKAGE_DIR, DEFAULT_TURNS));
+}
+console.log("ok slot paths");
 
 // The file that ships with the package parses, and a config that names nothing takes it.
 {
@@ -450,22 +465,27 @@ console.log("ok config path");
 {
 	const pid = process.pid;
 	const ppid = process.ppid;
-	assert.deepEqual(decode(encode({ mode: "on", key: "A/B" }, ppid), { ppid, pid }), { mode: "on", key: "A/B", self: false, settings: {} });
-	assert.deepEqual(decode(encode({ mode: "off", key: "*" }, pid), { ppid, pid }), { mode: "off", key: "*", self: true, settings: {} });
-	assert.equal(decode(encode({ mode: "on", key: "A/B" }, pid + 1), { ppid, pid }), null, "a foreign publisher is rejected");
+	assert.deepEqual(decode(encode({ key: "A/B" }, ppid), { ppid, pid }), { key: "A/B", self: false, settings: {} });
+	assert.deepEqual(decode(encode({ key: "*" }, pid), { ppid, pid }), { key: "*", self: true, settings: {} });
+	assert.equal(decode(encode({ key: "A/B" }, pid + 1), { ppid, pid }), null, "a foreign publisher is rejected");
 	assert.equal(decode("on@A/B", { ppid, pid }), null, "a bare token is not the payload");
-	assert.equal(decode(`{"m":"maybe","k":"*","p":${pid}}`, { ppid, pid }), null);
-	assert.equal(decode(`{"m":"on","k":"","p":${pid}}`, { ppid, pid }), null);
-	assert.equal(decode(`{"m":"on","k":"*"}`, { ppid, pid }), null, "a payload without a publisher is rejected");
+	assert.equal(decode(`{"m":"maybe"}`, { ppid, pid }), null, "a payload with no key is rejected");
+	assert.equal(decode(`{"k":"","p":${pid}}`, { ppid, pid }), null);
+	assert.equal(decode(`{"k":"*"}`, { ppid, pid }), null, "a payload without a publisher is rejected");
 	assert.equal(decode(undefined, { ppid, pid }), null);
+	// A slot travels as its own value, and one that does not validate rejects the whole payload.
+	const carried = decode(encode({ key: "*", settings: { persona: "/abs/p.md", turns: false, forge: { maxChars: 1200 }, gate: true, cotTag: "analysis" } }, pid), { ppid, pid });
+	assert.deepEqual(carried.settings, { persona: "/abs/p.md", turns: false, forge: { maxChars: 1200 }, gate: true, cotTag: "analysis" });
+	assert.equal(decode(`{"k":"*","p":${pid},"s":{"forge":{"maxChars":0}}}`, { ppid, pid }), null, "a bad slot rejects the payload");
+	assert.equal(decode(`{"k":"*","p":${pid},"s":{"mode":"on"}}`, { ppid, pid }), null, "and so does a key the record does not have");
 	const env = { [ENV_NAME]: "junk" };
-	publish(env, { mode: "on", key: "*" }, pid);
-	assert.deepEqual(JSON.parse(env[ENV_NAME]), { m: "on", k: "*", p: pid });
+	publish(env, { key: "*" }, pid);
+	assert.deepEqual(JSON.parse(env[ENV_NAME]), { k: "*", p: pid });
 	publish(env, null, pid);
 	assert.equal(ENV_NAME in env, false, "no decision removes the variable");
-	assert.equal(applies({ mode: "on", key: "*" }, "A/B"), true);
-	assert.equal(applies({ mode: "on", key: "a/b" }, "A/B"), true, "keys compare case-insensitively");
-	assert.equal(applies({ mode: "on", key: "A/C" }, "A/B"), false);
+	assert.equal(applies({ key: "*" }, "A/B"), true);
+	assert.equal(applies({ key: "a/b" }, "A/B"), true, "keys compare case-insensitively");
+	assert.equal(applies({ key: "A/C" }, "A/B"), false);
 	assert.equal(modelKey({ provider: "P", id: "M" }), "P/M");
 }
 
@@ -564,6 +584,23 @@ console.log("ok turns parse");
 	rmSync(dir, { recursive: true, force: true });
 }
 console.log("ok turns cache");
+
+// The turn file's cache is keyed the same way, so a same-width revision is not served stale.
+{
+	const dir = mkdtempSync(join(tmpdir(), "pi-leviathan-turn-revision-"));
+	const file = join(dir, "turn0.yml");
+	const a = "- user: aa\n";
+	const b = "- user: bb\n";
+	assert.equal(a.length, b.length, "the two files are the same width");
+	for (let i = 0; i < 20; i++) {
+		writeFileSync(file, a);
+		assert.equal(loadTurns(file).specs[0].text.trim(), "aa");
+		writeFileSync(file, b);
+		assert.equal(loadTurns(file).specs[0].text.trim(), "bb", `revision ${i} reads the new bytes`);
+	}
+	rmSync(dir, { recursive: true, force: true });
+}
+console.log("ok turns cache reads the bytes");
 
 /** The fenced cot a fabricated reply leads with: the tag, the cot, the closing tag, then the text. */
 const fenced = (tag, cot, text) => "<" + tag + ">\n" + cot + "\n</" + tag + ">\n\n" + text;
@@ -935,14 +972,14 @@ const tempDir = mkdtempSync(join(tmpdir(), "pi-leviathan-"));
 process.on("exit", () => rmSync(tempDir, { recursive: true, force: true }));
 const configFile = join(tempDir, "leviathan.json");
 process.env.PI_LEVIATHAN_CONFIG = configFile;
-const writeConfig = (rules, extra = {}) =>
-	writeFileSync(
-		configFile,
-		// `turns` is off unless a case names a file: the shipped default would otherwise splice its
-		// block into every leviathan fixture below.
-		JSON.stringify({ default: "normal", inherit: "keyed", prompt: join(PACKAGE_DIR, "prompt.md"), turns: null, rules, ...extra }, null, "\t"),
-	);
-writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+// The fixture config: the text and the gate on for the rules below, turns and forge off unless a
+// case names them, because the shipped turn file would otherwise splice itself into every run.
+const writeConfig = (rules, extra = {}) => {
+	const { inherit = "keyed", default: fallback = {}, ...slots } = extra;
+	const base = { persona: false, gate: false, turns: false, forge: false, ...slots };
+	writeFileSync(configFile, JSON.stringify({ default: { ...base, ...fallback }, inherit, rules }, null, "\t"));
+};
+writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 
 const LEVIATHAN = { provider: "CLIProxy-Chat", id: "deepseek-flash" };
 const NORMAL = { provider: "openai", id: "gpt-5" };
@@ -966,6 +1003,12 @@ def({
 	},
 });
 const handler = (name) => handlers.find(([registered]) => registered === name)?.[1];
+/** The footer split into the switches it names and whether it reports a loss. */
+const statusOf = (text) => {
+	const body = String(text ?? "").replace(/^Leviathan ?/, "");
+	const lost = body.endsWith("!");
+	return { body: lost ? body.slice(0, -1) : body, lost, empty: body.replace("!", "").length === 0 };
+};
 const ui = () => {
 	const notes = [];
 	const statuses = [];
@@ -993,14 +1036,14 @@ const guardRun = (messages, model = LEVIATHAN) => guard({ type: "context_with_sy
 // (a) A session start takes a decision a parent wrote, re-stamps it, and removes anything else.
 {
 	const ctx = { model: LEVIATHAN, ui: ui() };
-	process.env[ENV_NAME] = encode({ mode: "off", key: "*" }, process.ppid);
+	process.env[ENV_NAME] = encode({ key: "*", settings: { gate: false, persona: false } }, process.ppid);
 	await start({ type: "session_start", reason: "startup" }, ctx);
 	const mirror = decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid });
-	assert.equal(mirror?.mode, "off", "an inherited decision survives");
+	assert.deepEqual(mirror?.settings, { gate: false, persona: false }, "an inherited answer survives");
 	assert.equal(mirror?.self, true, "and is re-stamped with this process");
 	activeTools = ["read", "bash"];
 	await run(LEVIATHAN);
-	assert.equal(activeTools.includes(GATE_TOOL), false, "an inherited off keeps a leviathan model normal");
+	assert.equal(activeTools.includes(GATE_TOOL), false, "an inherited gate:false keeps the tool dormant");
 
 	process.env[ENV_NAME] = "on@A/B";
 	await start({ type: "session_start", reason: "startup" }, ctx);
@@ -1009,12 +1052,12 @@ const guardRun = (messages, model = LEVIATHAN) => guard({ type: "context_with_sy
 	assert.equal(JSON.parse(process.env[ENV_NAME]).p, process.pid, "with this process as its publisher");
 
 	writeConfig([], { inherit: "none" });
-	process.env[ENV_NAME] = encode({ mode: "on", key: "*" }, process.ppid);
+	process.env[ENV_NAME] = encode({ key: "*", settings: { persona: true } }, process.ppid);
 	await start({ type: "session_start", reason: "startup" }, ctx);
 	assert.equal(process.env[ENV_NAME], undefined, "a tree that does not inherit publishes nothing");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 	// Leave a model-keyed answer behind, so the blocks below see one leviathan model and one normal.
-	process.env[ENV_NAME] = encode({ mode: "on", key: "CLIProxy-Chat/deepseek-flash" }, process.ppid);
+	process.env[ENV_NAME] = encode({ key: "CLIProxy-Chat/deepseek-flash", settings: { persona: true, gate: true } }, process.ppid);
 	await start({ type: "session_start", reason: "startup" }, ctx);
 }
 console.log("ok session_start");
@@ -1044,10 +1087,11 @@ console.log("ok forced prompt reported once");
 // (d) The gate is declared exactly while the text is in force, and a steady run writes nothing.
 {
 	activeTools = ["read", "bash"];
-	assert.deepEqual(await run(NORMAL), {});
-	assert.deepEqual(activeTools, ["read", "bash"], "a normal model never receives the gate");
+	await run(NORMAL);
+	assert.deepEqual(activeTools, ["read", "bash"], "a model whose record turns the gate off never receives it");
+	activeTools = ["read", "bash"];
 	assert.deepEqual(await run(LEVIATHAN), {});
-	assert.deepEqual(activeTools, ["read", "bash", GATE_TOOL], "a leviathan model declares the gate");
+	assert.deepEqual(activeTools, ["read", "bash", GATE_TOOL], "and for the rule's model");
 	const writes = toolSetWrites;
 	for (let i = 0; i < 5; i++) await run(LEVIATHAN);
 	assert.equal(toolSetWrites, writes, "a steady run writes the tool set zero times");
@@ -1066,7 +1110,7 @@ console.log("ok gate activation");
 	assert.equal(switched, undefined, "the text follows the live model, not the run's first model");
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
-	assert.equal(lastStatus(u), "Leviathan off", "a normal model shows off");
+	assert.equal(statusOf(lastStatus(u)).empty, true, "a model with every slot off shows the bare word");
 	assert.equal(guard({ type: "context_with_system", messages }, { model: LEVIATHAN, ui: ui() })?.messages?.[0].content, promptText);
 }
 console.log("ok decision follows the model");
@@ -1123,7 +1167,7 @@ console.log("ok guard places the text");
 
 	// (a) Leviathan on, a request that needs no other change: the refill is the only difference, so it
 	// must be returned rather than swallowed by the `undefined` that means "send it as it arrived".
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: null });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { turns: false });
 	await run(LEVIATHAN);
 	{
 		const result = guardRun(history);
@@ -1151,7 +1195,7 @@ console.log("ok guard places the text");
 
 	// (c) The refill alongside the fabricated block: the block anchors on the list it splices into.
 	{
-		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: DEFAULT_TURNS });
+		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { turns: true });
 		await run(LEVIATHAN);
 		const result = guardRun(history);
 		const loaded = loadTurns(turnsPath(emptyConfig(PACKAGE_DIR), DEFAULT_TURNS));
@@ -1166,16 +1210,25 @@ console.log("ok guard places the text");
 		assert.match(result.messages[1 + block.length + 1].content[1].text, /^<think>/, "and the refilled turn follows it");
 	}
 
-	// (d) The refill is a request property, not a persona property: a normal session refills too, and
-	// `forge: "off"` is the only thing that stops it.
+	// (d) The refill is its own slot: a record that turns forge on refills even when persona, gate and
+	// turns are all off, and the model's own `forge: false` is the only thing that stops it.
 	{
 		// Back to no fabricated block, so the refill is the only thing this request could change.
-		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: null });
+		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { turns: false, forge: true });
+		// A session slot wins over the file, so the answer this session holds has to go first: this
+		// block is about what the record says.
+		await command.handler("reset", forgeCtx);
 		await run(NORMAL);
 		const normalHistory = [head(""), ...history.slice(1)];
 		const normal = guardRun(normalHistory, NORMAL);
-		assert.match(normal?.messages?.[2]?.content?.[1]?.text ?? "", /^<think>/, "a normal session refills as well");
-		assert.equal(normal?.messages?.[0]?.content, "", "and still carries no persona text");
+		// The foreign turn is the one carrying the request's own reply, wherever the splice put it.
+		const refilled =
+			(normal?.messages ?? [])
+				.flatMap((message) => message?.content ?? [])
+				.find((block) => block?.type === "text" && String(block.text).includes("COT FROM ELSEWHERE"))?.text ?? "";
+		assert.equal(refilled.startsWith("<think>"), true, `a record with forge on refills for any model: ${JSON.stringify(refilled.slice(0, 80))}`);
+		assert.equal(refilled.includes("COT FROM ELSEWHERE"), true, `the refill carries the foreign cot: ${JSON.stringify(refilled.slice(0, 80))}`);
+		assert.equal(normal?.messages?.[0]?.content, "", "and carries no persona text, because that slot is off for it");
 		await run(LEVIATHAN);
 		await command.handler("forge off", forgeCtx);
 		const off = guardRun(history);
@@ -1185,37 +1238,37 @@ console.log("ok guard places the text");
 		assert.match(guardRun(history)?.messages?.[2]?.content?.[1]?.text ?? "", /^<think>/, "and turning it back on refills again");
 	}
 
-	// (e) A mode is a two-state switch, and a removed one is a command that refuses rather than a value
-	// that quietly reads as something else. "Refuses" is measured on the published answer, byte for
-	// byte: a refusal that still wrote a setting would leave a different payload behind.
+	// (e) A value a slot does not take is a command that refuses, and a refusal is measured on the
+	// published answer byte for byte: one that still wrote a setting would leave a different payload.
 	{
 		let said = null;
 		const refusing = { model: LEVIATHAN, ui: { notify: (text, type) => { said = { text, type }; } } };
-		await command.handler("forgeMaxChars 4321", forgeCtx);
+		await command.handler("forge maxChars 4321", forgeCtx);
 		const published = process.env[ENV_NAME];
-		assert.match(published ?? "", /forgeMaxChars":4321/, "the answer under test carries a bound to lose");
+		assert.match(published ?? "", /maxChars":4321/, "the answer under test carries a bound to lose");
 		for (const [command_, pattern] of [
-			["forge always", /forge must be auto, off/],
-			["forgeMaxChars 0", /forgeMaxChars must be a positive whole number/],
-			["forgeMaxChars -4000", /forgeMaxChars must be a positive whole number/],
+			["forge maxChars 0", /maxChars must be a positive whole number/],
+			["forge maxChars -4000", /maxChars must be a positive whole number/],
+			["gate maybe", /gate must be/],
+			["cotTag 1bad", /cotTag must be a tag name/],
 		]) {
 			await command.handler(command_, refusing);
 			assert.match(said?.text ?? "", pattern, `the command is refused: ${command_}`);
 			assert.equal(said?.type, "error");
 			assert.equal(process.env[ENV_NAME], published, `a refused command leaves the answer byte-identical: ${command_}`);
 		}
-		await command.handler("forgeMaxChars default", forgeCtx);
-		// A turn pi carries still stays untouched, because nothing set the removed mode.
+		await command.handler("forge default", forgeCtx);
+		// A turn pi carries still stays untouched, because nothing set the removed bundle.
 		await run(LEVIATHAN);
 		const ownTurn = { ...foreignTurn, provider: LEVIATHAN.provider, api: LEVIATHAN.api, model: LEVIATHAN.id };
-		assert.equal(guardRun([head(promptText), { ...turn }, ownTurn]), undefined, "a refused mode changes no request");
-		assert.match(guardRun(history)?.messages?.[2]?.content?.[1]?.text ?? "", /^<think>/, "and the mode in force still refills");
+		assert.equal(guardRun([head(promptText), { ...turn }, ownTurn]), undefined, "a refused value changes no request");
+		assert.match(guardRun(history)?.messages?.[2]?.content?.[1]?.text ?? "", /^<think>/, "and the record in force still refills");
 	}
 	// (f) A head that cannot hold the text must not cost the refill. With `turns` off and the text
 	// undeliverable, `project(forged, false)` used to return undefined by construction and throw the
 	// forged list away, so the refill never reached the request.
 	{
-		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: null });
+		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { turns: false });
 		await run(LEVIATHAN);
 		// A leading system message holding a block pi never puts there.
 		const unusable = [{ role: "system", content: [{ type: "image", mimeType: "image/png", data: "AA==" }], sections: { [PREAMBLE]: STOCK_PREAMBLE }, timestamp: 0 }, ...history.slice(1)];
@@ -1328,7 +1381,7 @@ console.log("ok steady request is byte-identical");
 	assert.equal(u.notes.at(-1)[0], "warning");
 	assert.match(u.notes.at(-1)[1], /prompt\.md is not delivered/, "the warning names the file and the loss");
 	assert.equal(later.sections[PREAMBLE], STOCK_PREAMBLE, "the identity sentence stays when the text does not arrive");
-	assert.equal(lastStatus(u), "Leviathan !", "a request that carried nothing shows as such");
+	assert.equal(statusOf(lastStatus(u)).lost, true, "a request that carried nothing shows as such");
 	const u2 = ui();
 	assert.equal(guard({ type: "context_with_system", messages: [turn] }, { model: LEVIATHAN, ui: u2 }), undefined, "a transcript without a system message is left alone");
 	assert.equal(u2.notes.length, 1, "that loss is reported too");
@@ -1348,8 +1401,8 @@ console.log("ok guard reports an unusable head");
 	const result = guard({ type: "context_with_system", messages }, { model: LEVIATHAN, ui: u });
 	assert.ok(result?.messages, "the text is delivered when the prompt does not lead the transcript");
 	assert.deepEqual(u.notes, [], "and nothing is reported as lost");
-	assert.equal(lastStatus(u), "Leviathan on", "a delivered request shows as on");
-	assert.deepEqual(u.statuses.at(-1), ["leviathan", "Leviathan on"], "and it is written under the status key the UI shows");
+	assert.equal(statusOf(lastStatus(u)).lost, false, "a delivered request shows as on");
+	assert.equal(u.statuses.at(-1)[0], "leviathan", "and it is written under the status key the UI shows");
 	assert.equal(result.messages[0].role, "system", "the leading system message moves to index 0");
 	assert.equal(result.messages[0].content, promptText, "and carries the text");
 	assert.equal(result.messages[1], bash, "the entry that led the transcript follows it");
@@ -1365,21 +1418,30 @@ console.log("ok guard hoists a late prompt");
 {
 	const short = join(tempDir, "t.md");
 	writeFileSync(short, "T");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", prompt: short }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: short, gate: true, forge: true }]);
+	// A session slot wins over the rule, so the session's own answer is dropped first: this block is
+	// about what the file says.
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
 	await run(LEVIATHAN);
 	const result = guardRun([head("X\nrest"), turn]);
+	// A head that merely ends like the text is not the text: the slot is prepended, not patched in.
 	assert.ok(result.messages[0].content.startsWith("T\n\n"), "only a real prefix counts as injected");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok a false prefix is not aligned");
 
 // A prompt that cannot be read is not the same as off.
 {
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", prompt: join(tempDir, "gone.md") }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: join(tempDir, "gone.md"), gate: true, forge: true }]);
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan !", "a missing prompt shows as neither on nor off");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	// A persona slot that names a file which does not read carries nothing, so the record is already a
+	// loss before a request is built: the slot is on and what it names is not there.
+	assert.equal(statusOf(lastStatus(u)).lost, true, "a persona slot with no text is a loss");
+	guard({ type: "context_with_system", messages: [head(""), turn] }, { model: LEVIATHAN, ui: u });
+	assert.equal(statusOf(lastStatus(u)).lost, true, "and the request that follows says so too");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok a missing prompt is reported in the status");
 
@@ -1389,15 +1451,17 @@ console.log("ok a missing prompt is reported in the status");
 	const u = ui();
 	await run(LEVIATHAN);
 	guard({ type: "context_with_system", messages: [turn] }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan !", "a request with nowhere to put the text says so");
-	await command.handler("off", { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan off", "a mode change reports the mode");
-	await command.handler("on", { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan on", "and the loss of an earlier request is not carried over");
+	assert.equal(statusOf(lastStatus(u)).lost, true, "a request with nowhere to put the text says so");
+	// Every switch off prints the bare word; the fixture's other slots are on, so one turn of the
+	// persona slot is what empties the footer.
+	await command.handler("persona off", { model: LEVIATHAN, ui: u });
+	assert.equal(statusOf(lastStatus(u)).lost, false, "a slot change is not a loss");
+	await command.handler("persona default", { model: LEVIATHAN, ui: u });
+	assert.equal(statusOf(lastStatus(u)).lost, false, "and the loss of an earlier request is not carried over");
 	guard({ type: "context_with_system", messages: [turn] }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan !");
+	assert.equal(statusOf(lastStatus(u)).lost, true);
 	await start({ type: "session_start", reason: "new" }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan on", "a new session starts from its own state");
+	assert.equal(statusOf(lastStatus(u)).lost, false, "a new session starts from its own state");
 }
 console.log("ok status follows the request");
 
@@ -1406,10 +1470,10 @@ console.log("ok status follows the request");
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {}, forceSystemPrompt: "FORCED" } }, { model: LEVIATHAN, ui: u });
 	guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan !", "a forced prompt shows as undelivered");
+	assert.equal(statusOf(lastStatus(u)).lost, true, "a forced prompt shows as undelivered");
 	await run(LEVIATHAN);
 	guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan on", "and the next run without one recovers");
+	assert.equal(statusOf(lastStatus(u)).lost, false, "and the next run without one recovers");
 }
 console.log("ok a forced prompt shows as undelivered");
 
@@ -1443,10 +1507,10 @@ console.log("ok a forced prompt shows as undelivered");
 	assert.equal(a.active.includes(GATE_TOOL), true, "the leviathan session declares the gate");
 	assert.equal(b.active.includes(GATE_TOOL), false, "the normal session in the same process does not");
 	a.guard({ type: "context_with_system", messages: [turn] }, { model: LEVIATHAN, ui: ua });
-	assert.equal(lastStatus(ua), "Leviathan !", "one session's loss is its own");
-	assert.equal(lastStatus(ub), "Leviathan off", "and does not reach the other");
+	assert.equal(statusOf(lastStatus(ua)).lost, true, "one session's loss is its own");
+	assert.equal(statusOf(lastStatus(ub)).empty, true, "and does not reach the other");
 	b.guard({ type: "context_with_system", messages: [head(""), turn] }, { model: NORMAL, ui: ub });
-	assert.equal(lastStatus(ua), "Leviathan !", "a normal session's request does not clear it either");
+	assert.equal(statusOf(lastStatus(ua)).lost, true, "a normal session's request does not clear it either");
 }
 console.log("ok two sessions keep their own state");
 
@@ -1454,11 +1518,12 @@ console.log("ok two sessions keep their own state");
 {
 	const short = join(tempDir, "short.md");
 	writeFileSync(short, "SHORTTEXT");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", prompt: short }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: short, gate: true, forge: true }]);
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
 	await run(LEVIATHAN);
 	const result = guardRun([head("this head mentions SHORTTEXT inside a sentence"), turn]);
 	assert.ok(result.messages[0].content.startsWith("SHORTTEXT\n\n"), "the text is placed, not assumed");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok short text is not mistaken for an injected one");
 
@@ -1467,12 +1532,16 @@ console.log("ok short text is not mistaken for an injected one");
 // ---------------------------------------------------------------------------
 const turnFile = join(tempDir, "turn0.yml");
 const turnsConfig = (extra = {}) =>
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: turnFile, ...extra });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { turns: turnFile, ...extra });
 
-// An absent `turns` key takes the file that ships with the package, so a leviathan session carries
-// the block without naming a file.
+// `turns: true` names the file that ships with the package, so a record carries the block without
+// writing a path. The two `false` slots in this fixture are what "nothing else, by default" means.
 {
-	writeFileSync(configFile, JSON.stringify({ default: "normal", prompt: join(PACKAGE_DIR, "prompt.md") }, null, "\t"));
+	writeFileSync(
+		configFile,
+		JSON.stringify({ default: {}, rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", turns: true }] }, null, "\t"),
+	);
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
 	await run(LEVIATHAN);
 	const result = guardRun([head(""), turn]);
 	assert.ok(result?.messages, "the shipped turn file is injected by default");
@@ -1534,7 +1603,8 @@ console.log("ok turns after compaction");
 // result and the cached revision serves both.
 {
 	writeFileSync(turnFile, "- user: |\n    first\n- assistant: |\n    ok\n");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", prompt: turnFile }], { turns: turnFile });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: turnFile, gate: true, forge: true }], { turns: turnFile });
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
 	await run(LEVIATHAN);
 	const result = guardRun([head(""), turn]);
 	assert.equal(result.messages[0].content, "- user: |\n    first\n- assistant: |\n    ok", "the prompt half reads the bytes as text");
@@ -1542,14 +1612,16 @@ console.log("ok turns after compaction");
 	const again = guardRun([head(""), turn]);
 	assert.equal(again.messages[0].content, "- user: |\n    first\n- assistant: |\n    ok", "the cached revision serves the prompt half");
 	assert.equal(again.messages[1].content[0].text, "first\n", "and the turn half");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok one path serves both kinds");
 
 // The leading-system move runs whenever the splice runs, so a turn file alone still hoists the
 // prompt to index 0 even with no prompt text in force.
 {
-	turnsConfig({ rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", prompt: join(tempDir, "gone.md") }] });
+	// `turns` is off in this fixture's default, so the rule names the file itself.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: join(tempDir, "gone.md"), gate: true, turns: turnFile, forge: true }]);
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
 	await run(LEVIATHAN);
 	const bash = { role: "bashExecution", command: "ls", output: "x", exitCode: 0, cancelled: false, truncated: false, timestamp: 1, excludeFromContext: false };
 	const result = guardRun([bash, head(""), turn]);
@@ -1587,7 +1659,7 @@ console.log("ok turns trailing shape");
 	const result = guard({ type: "context_with_system", messages: [head("")] }, { model: LEVIATHAN, ui: u });
 	assert.equal(result.messages.length, 1, "an all-system list takes no injection");
 	assert.ok(u.notes.some(([type, text]) => type === "warning" && /carries no non-system message/.test(text)), "and the skip is reported");
-	assert.equal(lastStatus(u), "Leviathan !", "the footer shows the loss");
+	assert.equal(statusOf(lastStatus(u)).lost, true, "the footer shows the loss");
 }
 console.log("ok turns nowhere to splice");
 
@@ -1599,8 +1671,8 @@ console.log("ok turns nowhere to splice");
 	writeFileSync(turnFile, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
 	writeConfig(
 		[
-			{ provider: "deepseek", model: "deepseek-*", mode: "leviathan" },
-			{ provider: "anthropic", model: "claude*", mode: "leviathan", cotTag: "analysis" },
+			{ provider: "deepseek", model: "deepseek-*", persona: true, gate: true, forge: true },
+			{ provider: "anthropic", model: "claude*", persona: true, gate: true, forge: true, cotTag: "analysis" },
 		],
 		{ turns: turnFile },
 	);
@@ -1618,7 +1690,7 @@ console.log("ok turns nowhere to splice");
 	assert.equal(tagged.at(-2).content[0].text, fenced("analysis", "think", "ok"), "the rule's tag fences it");
 
 	// One tag, two models: the spliced content is the same, and only the message stamps differ.
-	writeConfig([{ model: "*", mode: "leviathan" }], { turns: turnFile, cotTag: "think" });
+	writeConfig([{ model: "*", persona: true, gate: true, forge: true }], { turns: turnFile, cotTag: "think" });
 	const u3 = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: reasoning, ui: u3 });
 	const deep = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u3 }).messages;
@@ -1628,6 +1700,29 @@ console.log("ok turns nowhere to splice");
 	assert.deepEqual(deep.map((message) => message.content), other.map((message) => message.content), "one tag, the same content on every model");
 }
 console.log("ok turns fence");
+
+// A tag set in the session is not in the file, so the record must carry it for the fence test: a
+// second request over the same transcript has to see the fence the first one wrote.
+{
+	const fenceFile = join(tempDir, "fence-turn0.yml");
+	writeFileSync(fenceFile, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
+	const command = commands.get("leviathan");
+	const ctx = { model: LEVIATHAN, ui: ui() };
+	await command.handler("reset", ctx);
+	await command.handler(`turns ${fenceFile}`, ctx);
+	await command.handler("cotTag analysis", ctx);
+	await run(LEVIATHAN);
+	const once = guardRun([head(""), turn]);
+	const first = once.messages[2].content[0].text;
+	assert.equal(first, fenced("analysis", "think", "ok"), "the session tag fences the block");
+	// Feed the result back: a second build sees the fence it wrote and changes nothing.
+	const twice = guard({ type: "context_with_system", messages: once.messages }, { model: LEVIATHAN, ui: ui() });
+	assert.equal(twice, undefined, "a fenced block is not fenced again under the session tag");
+	await command.handler("reset", ctx);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
+}
+console.log("ok a session tag is not fenced twice");
 
 // A forced prompt replaces the system messages after the guard, so that run carries no block.
 {
@@ -1639,7 +1734,7 @@ console.log("ok turns fence");
 	const result = guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: LEVIATHAN, ui: u });
 	assert.equal(result.messages.length, 2, "a forced prompt carries no fabricated block");
 	assert.ok(u.notes.some(([type, text]) => type === "warning" && /is not injected/.test(text)), "and the skip is reported");
-	assert.equal(lastStatus(u), "Leviathan !", "a forced prompt shows as undelivered");
+	assert.equal(statusOf(lastStatus(u)).lost, true, "a forced prompt shows as undelivered");
 }
 console.log("ok turns forced prompt");
 
@@ -1659,26 +1754,26 @@ console.log("ok turns forced prompt");
 	const result = guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: LEVIATHAN, ui: u });
 	assert.equal(result.messages.length, 2, "a late force carries no fabricated block");
 	assert.ok(u.notes.some(([type, text]) => type === "warning" && /replaced the system prompt/.test(text)), "the text is reported undelivered");
-	assert.equal(lastStatus(u), "Leviathan !", "and the run shows as undelivered");
+	assert.equal(statusOf(lastStatus(u)).lost, true, "and the run shows as undelivered");
 	// The next run without a force recovers, so the record is not sticky.
 	await run(LEVIATHAN);
 	guard({ type: "context_with_system", messages: [head("", { [PREAMBLE]: STOCK_PREAMBLE }), turn] }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan on", "the next run without a force recovers");
+	assert.equal(statusOf(lastStatus(u)).lost, false, "the next run without a force recovers");
 }
 console.log("ok a late forced prompt");
 
 // A forced prompt on a model with no text in force has no loss to report: the guard speaks only for
 // a text it was meant to place.
 {
-	writeConfig([{ provider: "openai", model: "gpt-*", mode: "normal" }]);
+	writeConfig([{ provider: "openai", model: "gpt-*", persona: false, gate: false, turns: false, forge: false }]);
 	const u = ui();
 	await start({ type: "session_start", reason: "new" }, { model: NORMAL, ui: u });
 	await before({ systemPromptOptions: { sections: {}, forceSystemPrompt: "FORCED" } }, { model: NORMAL, ui: u });
 	guard({ type: "context_with_system", messages: [head(""), turn] }, { model: NORMAL, ui: u });
 	assert.equal(u.notes.length, 0, "no text in force, no loss to report");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
-console.log("ok a forced prompt on a normal model reports nothing");
+console.log("ok a forced prompt on a model with every slot off reports nothing");
 
 // A new session carries no options from the last one, so a request before this session's own run
 // starts is not treated as forced.
@@ -1699,7 +1794,7 @@ console.log("ok a new session drops the last options");
 	turnsConfig();
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan !", "a turn file that does not load shows in the footer");
+	assert.equal(statusOf(lastStatus(u)).lost, true, "a turn file that does not load shows in the footer");
 	assert.ok(u.notes.some(([type, text]) => type === "warning" && /^pi-leviathan: turn0\.yml: item 2: note is not one of/.test(text)), "the report names the file and the item");
 	const result = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: LEVIATHAN, ui: u });
 	assert.equal(result.messages[0].content, promptText, "the prompt text is delivered either way");
@@ -1707,16 +1802,16 @@ console.log("ok a new session drops the last options");
 }
 console.log("ok turns failure leaves the text");
 
-// A normal-mode session never opens the file.
+// A session with every slot off never opens the file.
 {
-	writeConfig([{ provider: "openai", model: "gpt-*", mode: "normal" }], { turns: join(tempDir, "nope.yml") });
+	writeConfig([{ provider: "openai", model: "gpt-*", persona: false, gate: false, turns: false, forge: false }], { turns: join(tempDir, "nope.yml") });
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
 	assert.equal(u.notes.some(([, text]) => /nope\.yml/.test(text)), false, "a normal session never opens the turn file");
 	assert.equal(guard({ type: "context_with_system", messages: [head(""), turn] }, { model: NORMAL, ui: u }), undefined, "and injects nothing");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
-console.log("ok turns off in normal mode");
+console.log("ok turns off with every slot off");
 
 // Two consecutive builds of the same request are identical byte for byte.
 {
@@ -1737,49 +1832,62 @@ console.log("ok turns are byte-identical");
 {
 	const command = commands.get("leviathan");
 	assert.ok(command, "the leviathan command is registered");
-	assert.deepEqual(command.getArgumentCompletions("rem"), [
-		{ value: "remember on", label: "remember on" },
-		{ value: "remember off", label: "remember off" },
-	]);
+	assert.deepEqual(command.getArgumentCompletions("rem"), [{ value: "remember", label: "remember" }]);
+	assert.deepEqual(
+		command.getArgumentCompletions("persona o"),
+		[
+			{ value: "persona on", label: "persona on" },
+			{ value: "persona off", label: "persona off" },
+		],
+		"the completion table lists every slot verb",
+	);
 	assert.equal(command.getArgumentCompletions("zzz"), null);
 
 	const u = ui();
 	const ctx = { model: LEVIATHAN, ui: u };
 	await start({ type: "session_start", reason: "startup" }, {});
 	await command.handler("reset", ctx);
-	assert.equal(u.notes.at(-1)[1], "leviathan on (config)");
+	assert.ok(u.notes.at(-1)[1].startsWith("leviathan reset (config: persona "), "reset reports the record the file gives back");
 	assert.equal(ENV_NAME in process.env, false, "reset removes the value a child would read");
 	await command.handler("", ctx);
 	assert.match(u.notes.at(-1)[1], /deepseek-flash/, "the panel names the model");
 	assert.match(u.notes.at(-1)[1], /rule 1/, "and the rule that selected it");
 
-	await command.handler("off", ctx);
-	assert.equal(activeTools.includes(GATE_TOOL), false, "off withdraws the gate");
-	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid })?.mode, "off", "off reaches child processes");
+	await command.handler("gate off", ctx);
+	assert.equal(activeTools.includes(GATE_TOOL), false, "gate off withdraws the tool");
+	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid })?.settings?.gate, false, "the slot answer reaches child processes");
 
-	await command.handler("toggle", ctx);
-	assert.equal(activeTools.includes(GATE_TOOL), true, "toggle turns it back on");
-	assert.equal(u.notes.at(-1)[1], "leviathan on");
+	await command.handler("gate on", ctx);
+	assert.equal(activeTools.includes(GATE_TOOL), true, "gate on declares it again");
+	assert.equal(u.notes.at(-1)[1], "gate on");
 
-	await command.handler("of", ctx);
-	assert.match(u.notes.at(-1)[1], /on \| off \| toggle/, "a mistyped argument names the accepted ones");
+	// A path keeps its case and its spelling, so `of` is a file called `of` and only `off` is the
+	// keyword: the two are different values, and only one of them turns the slot off.
+	await command.handler("persona of", ctx);
+	assert.ok(u.notes.at(-1)[1].endsWith("/of") || u.notes.at(-1)[1].endsWith("\of"), "a bare value is a path, even when it is a near miss");
+	await command.handler("persona off", ctx);
+	assert.equal(u.notes.at(-1)[1], "persona off");
+	await command.handler("zzz", ctx);
+	assert.match(u.notes.at(-1)[1], /persona on\|off/, "an unknown verb names the accepted ones");
+
+	// `remember` writes the live model's record as an exact rule, so the wildcard that used to cover it
+	// stays where it is and the exact rule mounts in front of it.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: false, turns: false, forge: true }]);
+	await command.handler("reset", ctx);
 	await command.handler("remember", ctx);
-	assert.match(u.notes.at(-1)[1], /remember on \| remember off/);
-
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
-	await command.handler("remember off", ctx);
-	assert.match(u.notes.at(-1)[1], /remembered: leviathan off in .*leviathan\.json/);
+	assert.match(u.notes.at(-1)[1], /remembered CLIProxy-Chat\/deepseek-flash/, "the receipt names the model");
 	const written = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(written.rules[0].mode, "normal", "remember writes the current model first");
-	assert.equal(written.rules[0].provider, "CLIProxy-Chat");
+	assert.equal(written.rules[0].provider, "CLIProxy-Chat", "remember writes the current model first");
 	assert.equal(written.rules[0].model, "deepseek-flash");
-	assert.equal(written.rules[1].mode, "leviathan", "the broader rule is kept");
+	assert.equal(written.rules.length, 2, "the exact rule mounts in front of the wildcard that shadowed it");
+	assert.equal(written.rules[1].model, "deepseek-*", "and the wildcard is kept as it was");
+	assert.equal(written.rules[0].gate, false, "and every slot is written out, false included");
+	assert.equal(written.rules[0].persona, true, "a slot that named the shipped file keeps saying true");
 
-	await command.handler("remember on", ctx);
+	await command.handler("remember", ctx);
 	const again = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(again.rules.length, 2, "an exact rule is updated, not duplicated");
-	assert.equal(again.rules[0].mode, "leviathan");
-	assert.match(u.notes.at(-1)[1], /remembered: leviathan on in .*leviathan\.json/, "the receipt names the file");
+	assert.deepEqual(again, written, "running it twice leaves the file byte-identical");
+	assert.match(u.notes.at(-1)[1], /unchanged/, "and says so");
 }
 console.log("ok commands");
 
@@ -1790,13 +1898,13 @@ console.log("ok commands");
 	const ctx = { model: LEVIATHAN, ui: u };
 	await start({ type: "session_start", reason: "startup" }, ctx);
 	await command.handler("reset", ctx);
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 	await command.handler("", ctx);
-	assert.match(u.notes.at(-1)[1], /mode\s+leviathan/);
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "normal" }]);
+	assert.match(u.notes.at(-1)[1], /persona\s+.*prompt\.md/, "the panel names the file the persona slot resolved");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: false, forge: false }]);
 	await command.handler("", ctx);
-	assert.match(u.notes.at(-1)[1], /mode\s+normal/, "a config edited between two panels is visible");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	assert.match(u.notes.at(-1)[1], /persona\s+off/, "a config edited between two panels is visible");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok panel reads the current config");
 
@@ -1814,7 +1922,7 @@ console.log("ok panel names no model");
 	const command = commands.get("leviathan");
 	const before_ = readFileSync(configFile, "utf8");
 	const u = ui();
-	await command.handler("remember on", { model: undefined, ui: u });
+	await command.handler("remember", { model: undefined, ui: u });
 	assert.equal(u.notes.at(-1)[0], "error");
 	assert.match(u.notes.at(-1)[1], /no model/);
 	assert.equal(readFileSync(configFile, "utf8"), before_, "the file is untouched");
@@ -1826,244 +1934,161 @@ console.log("ok remember refuses without a model");
 	const command = commands.get("leviathan");
 	const text = JSON.stringify({
 		note: "mine",
-		default: "normal",
-		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }],
+		default: { persona: true },
+		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }],
 	});
 	writeFileSync(configFile, text);
 	const u = ui();
-	await command.handler("remember on", { model: LEVIATHAN, ui: u });
+	await command.handler("remember", { model: LEVIATHAN, ui: u });
 	assert.equal(u.notes.at(-1)[0], "error", "a key the extension does not take is refused");
 	assert.match(u.notes.at(-1)[1], /note is not a config key/);
 	assert.equal(readFileSync(configFile, "utf8"), text, "and the file is left as it was");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok remember refuses a file it cannot read whole");
 
-// A rule the wildcard above it shadows is moved to the front, so the next process resolves it.
+// `remember` writes the live model's whole record: all five slots, `false` included, spelled the way
+// the layer that answered spelled them, mounted in front of whatever shadowed it, and stable on a
+// second run.
 {
 	const command = commands.get("leviathan");
-	writeFileSync(
-		configFile,
-		JSON.stringify({
-			default: "normal",
-			rules: [
-				{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "normal" },
-				{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "leviathan" },
-			],
-		}),
-	);
-	const before_ = resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, LEVIATHAN);
-	assert.equal(before_.mode, "normal", "the wildcard shadows the exact rule");
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	const data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules.length, 2, "the rule is moved, not duplicated");
-	assert.equal(data.rules[0].model, "deepseek-flash", "the remembered rule goes first");
-	const after_ = resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, LEVIATHAN);
-	assert.equal(after_.mode, "leviathan", "the next process resolves the remembered answer");
-	assert.equal(after_.ruleIndex, 0);
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
-}
-console.log("ok remember moves a shadowed rule");
+	const ctx = { model: LEVIATHAN, ui: ui() };
+	const write = (data) => writeFileSync(configFile, JSON.stringify(data, null, "\t"));
+	const read = () => JSON.parse(readFileSync(configFile, "utf8"));
+	const resolved = () => resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, LEVIATHAN);
+	const slots = (rule) => ({ persona: rule.persona, gate: rule.gate, turns: rule.turns, forge: rule.forge, cotTag: rule.cotTag });
 
-// Remembering a mode keeps the prompt file the model already resolves to: a rule written for the
-// current model takes over its text, whether the rule is updated where it sits or moved forward.
-{
-	const command = commands.get("leviathan");
+	// A wildcard in force: the exact rule takes its values and moves in front of it.
 	const custom = join(tempDir, "custom.md");
 	writeFileSync(custom, "CUSTOM");
-	const resolved = () => resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, LEVIATHAN);
+	write({
+		default: { persona: false },
+		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cotTag: "reasoning" }],
+	});
+	assert.equal(resolved().persona, custom);
+	await command.handler("reset", ctx);
+	await command.handler("remember", ctx);
+	let data = read();
+	assert.equal(data.rules.length, 2, "the exact rule mounts in front of the wildcard, which is kept");
+	assert.equal(data.rules[0].provider, "CLIProxy-Chat", "the rule is written for the live model, literally");
+	assert.equal(data.rules[0].model, "deepseek-flash", "and never with a pattern");
+	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cotTag: "reasoning" });
+	assert.equal(data.default.persona, false, "the file's default is left alone");
+	assert.equal(resolved().ruleIndex, 0, "and the model now resolves through the new rule");
 
-	// The wildcard is the rule in force, so the new exact rule inherits its prompt.
-	writeFileSync(
-		configFile,
-		JSON.stringify({
-			default: "normal",
-			rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", prompt: custom }],
-		}),
-	);
-	assert.equal(resolved().prompt, custom);
-	await command.handler("remember off", { model: LEVIATHAN, ui: ui() });
-	let data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].mode, "normal");
-	assert.equal(data.rules[0].prompt, custom, "the rule that takes over keeps the text in force");
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules.length, 2, "the exact rule is updated, not duplicated");
-	assert.equal(data.rules[0].mode, "leviathan");
-	assert.equal(resolved().prompt, custom, "and the model still reads the same file");
+	// The second run changes nothing at all, byte for byte.
+	const once = readFileSync(configFile, "utf8");
+	await command.handler("remember", ctx);
+	assert.equal(readFileSync(configFile, "utf8"), once, "a second remember is byte-identical");
+	assert.match(ctx.ui.notes.at(-1)[1], /unchanged/);
 
-	// The exact rule sits behind the wildcard and has no prompt of its own.
-	writeFileSync(
-		configFile,
-		JSON.stringify({
-			default: "normal",
-			rules: [
-				{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "normal", prompt: custom },
-				{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "leviathan" },
-			],
-		}),
-	);
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules.length, 2, "the shadowed rule is moved, not duplicated");
-	assert.equal(data.rules[0].prompt, custom, "the moved rule keeps the text the wildcard gave it");
-	assert.equal(resolved().prompt, custom);
-	assert.equal(resolved().ruleIndex, 0);
+	// The receipt names the layer that answered, and a slot the session set says so.
+	const receiptTurn = join(tempDir, "receipt-turn0.yml");
+	writeFileSync(receiptTurn, "- user: q\n");
+	await command.handler(`turns ${receiptTurn}`, ctx);
+	await command.handler("cotTag analysis", ctx);
+	await command.handler("remember", ctx);
+	assert.match(ctx.ui.notes.at(-1)[1], /turns\s+"[^"]*receipt-turn0[^"]*" \(was session\)/, "a session slot is reported as the session's");
+	assert.match(ctx.ui.notes.at(-1)[1], /cotTag\s+"analysis" \(was session\)/, "and so is a session tag");
+	await command.handler("reset", ctx);
 
-	// A model with no rule of its own keeps the config default, unwritten.
-	writeConfig([{ provider: "openai", model: "gpt-*", mode: "leviathan", prompt: custom }]);
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].prompt, undefined, "no rule in force leaves the default prompt alone");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	// A slot the session set is written as the session holds it, and the session stops repeating it.
+	write({
+		default: { persona: false },
+		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cotTag: "reasoning" }],
+	});
+	await command.handler("reset", ctx);
+	await command.handler("forge maxChars none", ctx);
+	await command.handler("remember", ctx);
+	data = read();
+	assert.equal(data.rules[0].forge, true, "no bound is written as the short spelling");
+	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: true, cotTag: "reasoning" });
+	await command.handler("forge maxChars 1200", ctx);
+	await command.handler("remember", ctx);
+	assert.deepEqual(read().rules[0].forge, { maxChars: 1200 }, "a bound is written as a bound");
+
+	// A slot that named the shipped file keeps saying `true` rather than the path it resolved to.
+	write({ default: {}, rules: [{ provider: "CLIProxy-Chat", model: "deepseek-flash", persona: true, gate: false, turns: false, forge: false }] });
+	await command.handler("reset", ctx);
+	await command.handler("remember", ctx);
+	data = read();
+	assert.equal(data.rules[0].persona, true, "the shipped name stays portable");
+	assert.equal(data.rules.length, 1, "the rule that was already there is updated in place");
+
+	// A model no rule names takes the file's default and writes it out as the rule it now has.
+	write({ default: { persona: false, gate: false, turns: false, forge: false }, rules: [{ provider: "openai", model: "gpt-*", persona: true }] });
+	await command.handler("reset", ctx);
+	await command.handler("remember", ctx);
+	data = read();
+	assert.equal(data.rules.length, 2, "a rule is added in front of the one that did not match");
+	assert.deepEqual(slots(data.rules[0]), { persona: false, gate: false, turns: false, forge: false, cotTag: "think" });
+	assert.equal(data.rules[1].persona, true, "and the rule that did not match is untouched");
+
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
-console.log("ok remember keeps the prompt in force");
+console.log("ok remember writes the whole record");
 
-// Remembering carries the tag, or the exact rule it writes would silently drop what the wildcard
-// rule gave the model.
-{
-	const command = commands.get("leviathan");
-	const resolved = () => resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, LEVIATHAN);
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", cotTag: "reasoning" }]);
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	let data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].cotTag, "reasoning", "the tag is carried to the rule that takes over");
-	assert.equal(resolved().cotTag, "reasoning");
-
-	// A wildcard that leaves the key absent still lets the new rule inherit the config level.
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { cotTag: "analysis" });
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].cotTag, undefined, "an absent key stays absent, so the config level still applies");
-	assert.equal(resolved().cotTag, "analysis");
-
-	// The update branch: an exact rule behind the wildcard moves up and takes the tag with it.
-	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", cotTag: "reasoning" },
-		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "normal" },
-	]);
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules.length, 2, "the exact rule is moved, not duplicated");
-	assert.equal(data.rules[0].cotTag, "reasoning", "the moved rule carries the tag the wildcard gave it");
-	assert.equal(resolved().cotTag, "reasoning");
-
-	// An exact rule that pins its own tag keeps it.
-	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", cotTag: "reasoning" },
-		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "normal", cotTag: "analysis" },
-	]);
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].cotTag, "analysis", "a rule's own tag is not overwritten");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
-}
-console.log("ok remember keeps the cot tag in force");
-
-// Remembering carries the turns value the model resolves, including an explicit null: an absent key
-// would inherit a config-level default and turn injection back on.
-{
-	const command = commands.get("leviathan");
-	const inForce = join(tempDir, "ds-turn0.yml");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", turns: null }], { turns: inForce, cotTag: "analysis" });
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	let data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].turns, null, "an explicit null is written, so the new rule does not inherit the default");
-	assert.equal(data.rules[1].turns, null, "and the rule it shadows keeps its own value");
-	assert.equal(data.turns, inForce, "the config-level turns value survives the write");
-	assert.equal(data.cotTag, "analysis", "and so does the config-level tag");
-	assert.equal(data.rules[0].cotTag, undefined, "a tag the session did not set is not pinned on the rule");
-
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", turns: "ds/turn0.yml" }]);
-	await command.handler("remember on", { model: LEVIATHAN, ui: ui() });
-	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].turns, "ds/turn0.yml", "the file in force is carried to the rule that takes over");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
-}
-console.log("ok remember keeps the turns in force");
-
-// The cot bound is three-state, and `null` is the state that says "whole": a session that asks for
-// no bound gets one even when the config sets a bound, the panel names it, `remember` writes it, and
-// the receipt does not call it `off`, which is what `turns` means by the same value.
+// The panel fills in a width, so the last row has no padding of its own to trim.
 {
 	const command = commands.get("leviathan");
 	const u = ui();
 	const ctx = { model: LEVIATHAN, ui: u };
-	const panel = async () => {
-		await command.handler("", ctx);
-		return u.notes.at(-1)[1];
-	};
-	const readRules = () => JSON.parse(readFileSync(configFile, "utf8")).rules;
-
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", forgeMaxChars: 800 }], { forgeMaxChars: null });
-	await start({ type: "session_start", reason: "startup" }, {});
+	await start({ type: "session_start", reason: "startup" }, ctx);
 	await command.handler("reset", ctx);
-	assert.match(await panel(), /forge\s+auto \(800 chars\)/, "the rule's bound is the one in force");
-
-	// The session lifts the rule's bound: `??` would read this `null` as an unset key and hand 800 back.
-	await command.handler("forgeMaxChars none", ctx);
-	assert.equal(u.notes.at(-1)[1], "forgeMaxChars none", "the receipt does not call a bound `off`");
-	assert.match(await panel(), /forge\s+auto \(no bound\)/, "a session's null reaches the decision");
-
-	// `remember` carries it to the rule it writes, and writes it even though it is null.
-	await command.handler("remember on", ctx);
-	assert.equal(readRules()[0].forgeMaxChars, null, "the rule carries the session's no-bound answer");
-	await command.handler("reset", ctx);
-	assert.match(await panel(), /forge\s+auto \(no bound\)/, "and the written rule is the one in force");
-
-	// A number travels the same way.
-	await command.handler("forgeMaxChars 1200", ctx);
-	assert.equal(u.notes.at(-1)[1], "forgeMaxChars 1200");
-	assert.match(await panel(), /forge\s+auto \(1200 chars\)/, "a session's number reaches the decision");
-	await command.handler("remember on", ctx);
-	assert.equal(readRules()[0].forgeMaxChars, 1200);
-
-	// `default` drops the key, so the file decides again.
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", forgeMaxChars: 800 }], { forgeMaxChars: null });
-	await command.handler("forgeMaxChars default", ctx);
-	assert.equal(u.notes.at(-1)[1], "forgeMaxChars default (config)");
-	assert.match(await panel(), /forge\s+auto \(800 chars\)/, "dropping the session value returns the rule's bound");
-	await command.handler("reset", ctx);
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: false, forge: false }]);
+	await command.handler("", ctx);
+	const text = u.notes.at(-1)[1];
+	for (const slot of ["persona", "gate", "turns", "forge", "cotTag"]) {
+		assert.match(text, new RegExp(`${slot}\\s+\\S`), `the panel has a row for ${slot}`);
+	}
+	assert.match(text, /rules\s*\n\s*1\s+CLIProxy-Chat\/deepseek-\*/, "and a table of the file's rules");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
-console.log("ok forge max chars is three-state in a session");
+console.log("ok panel row per slot");
 
-// A file that does not parse is left alone, and the command says so.
+// A rule an earlier rule covers is named as such, and one that is not covered is not.
 {
 	const command = commands.get("leviathan");
-	writeFileSync(configFile, "{ not json");
-	const before_ = readFileSync(configFile, "utf8");
 	const u = ui();
-	await command.handler("remember on", { model: LEVIATHAN, ui: u });
-	assert.equal(u.notes.at(-1)[0], "error");
-	assert.match(u.notes.at(-1)[1], /leviathan\.json/);
-	assert.match(u.notes.at(-1)[1], /invalid JSON/, "the message comes from the parser the loader uses");
-	assert.equal(readFileSync(configFile, "utf8"), before_, "the broken file is untouched");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true },
+		{ provider: "CLIProxy-Chat", model: "deepseek-flash", gate: true },
+		{ provider: "openai", model: "gpt-*", persona: true },
+	]);
+	await command.handler("", { model: LEVIATHAN, ui: u });
+	const text = u.notes.at(-1)[1];
+	assert.match(text, /deepseek-flash.*shadowed by 1/, "a rule the first one covers says so");
+	assert.doesNotMatch(text, /gpt-\*.*shadowed/, "a rule nothing covers does not");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
+console.log("ok panel names a shadowed rule");
+
 console.log("ok remember refuses a broken file");
 
-// reset reports the mode the config gives back, in both directions.
+// `reset` reports the record the file gives back, slot by slot, in both directions.
 {
 	const command = commands.get("leviathan");
 	const u = ui();
-	writeConfig([{ provider: "openai", model: "gpt-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "openai", model: "gpt-*", persona: true, gate: true, forge: true }]);
 	await command.handler("reset", { model: LEVIATHAN, ui: u });
-	assert.equal(u.notes.at(-1)[1], "leviathan off (config)");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	assert.equal(
+		u.notes.at(-1)[1],
+		"leviathan reset (config: persona off, gate off, turns off, forge off, cotTag think)",
+		"a model no rule names gets the built-in record",
+	);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 	await command.handler("reset", { model: LEVIATHAN, ui: u });
-	assert.equal(u.notes.at(-1)[1], "leviathan on (config)");
+	assert.match(u.notes.at(-1)[1], /persona \S+prompt\.md, gate on, turns off, forge on, cotTag think/, "and a matched one gets its own");
 }
-console.log("ok reset reports the config mode");
+console.log("ok reset reports the record");
 
 // ---------------------------------------------------------------------------
-// Session settings: prompt, turns, cotTag, inherit
-// ---------------------------------------------------------------------------
+// Session slots: each verb sets its own slot, wins over the file, and is written out by `remember`.
 {
 	const command = commands.get("leviathan");
 	const u = ui();
 	const ctx = { model: LEVIATHAN, ui: u };
-	const jail = [{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }];
+	const jail = [{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }];
 	const panel = async (model = LEVIATHAN) => {
 		await command.handler("", { model, ui: u });
 		return u.notes.at(-1)[1];
@@ -2082,32 +2107,43 @@ console.log("ok reset reports the config mode");
 	await start({ type: "session_start", reason: "startup" }, {});
 	await command.handler("reset", ctx);
 
-	// The prompt file: an absolute path, the config again, a relative path, and one that is missing.
-	await command.handler(`prompt ${altPrompt}`, ctx);
-	assert.equal(u.notes.at(-1)[1], `prompt ${altPrompt}`, "the receipt names the file");
+	// persona: an absolute path, the config again, a relative path, and one that is missing.
+	await command.handler(`persona ${altPrompt}`, ctx);
+	assert.equal(u.notes.at(-1)[1], `persona ${altPrompt}`, "the receipt names the file");
 	await run(LEVIATHAN);
 	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "the guard head is the session file");
-	await command.handler("prompt default", ctx);
-	assert.equal(u.notes.at(-1)[1], "prompt default (config)");
+	await command.handler("persona default", ctx);
+	assert.equal(u.notes.at(-1)[1], "persona default (config)");
 	await run(LEVIATHAN);
 	assert.equal(guardRun([head(""), turn]).messages[0].content, promptText, "default restores the package copy");
-	await command.handler(`prompt ${relative(cwd, altPrompt)}`, ctx);
-	assert.equal(u.notes.at(-1)[1], `prompt ${altPrompt}`, "a relative path is stored absolute");
+	await command.handler(`persona ${relative(cwd, altPrompt)}`, ctx);
+	assert.equal(u.notes.at(-1)[1], `persona ${altPrompt}`, "a relative path is stored absolute");
 	await run(LEVIATHAN);
 	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"));
-	await command.handler(`prompt ${join(tempDir, "nope.md")}`, ctx);
+	await command.handler(`persona ${join(tempDir, "nope.md")}`, ctx);
 	assert.ok(u.notes.some(([type, text]) => type === "error" && /nope\.md unreadable/.test(text)), "a missing file is reported");
 	const missing = ui();
 	await select({ type: "model_select" }, { model: LEVIATHAN, ui: missing });
-	assert.equal(lastStatus(missing), "Leviathan !", "and shows in the footer");
+	assert.equal(statusOf(lastStatus(missing)).lost, true, "and shows in the footer");
 
 	// A path keeps its spaces and its case.
-	await command.handler(`prompt ${spacedPrompt}`, ctx);
-	assert.equal(u.notes.at(-1)[1], `prompt ${spacedPrompt}`, "the receipt is the value verbatim");
+	await command.handler(`persona ${spacedPrompt}`, ctx);
+	assert.equal(u.notes.at(-1)[1], `persona ${spacedPrompt}`, "the receipt is the value verbatim");
 	await run(LEVIATHAN);
 	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("SPACED TEXT"));
 
-	// The turn file: a session file, off, the config value, and a file literally named `off`.
+	// gate: the switch the footer's second glyph reports.
+	await command.handler(`persona ${altPrompt}`, ctx);
+	await command.handler("gate off", ctx);
+	assert.equal(u.notes.at(-1)[1], "gate off");
+	assert.equal(activeTools.includes(GATE_TOOL), false, "gate off withdraws the tool");
+	assert.equal(statusOf(lastStatus(u)).body.includes("\u{1F6E1}"), false, "and the footer stops naming it");
+	await command.handler("gate on", ctx);
+	assert.equal(activeTools.includes(GATE_TOOL), true, "gate on declares it again");
+	await command.handler("gate default", ctx);
+	assert.equal(u.notes.at(-1)[1], "gate default (config)");
+
+	// turns: a session file, off, the config value, and a file literally named `off`.
 	await command.handler(`turns ${sessionTurns}`, ctx);
 	await run(LEVIATHAN);
 	assert.equal(guardRun([head(""), turn]).messages[1].content[0].text, "session first\n", "the session turn file is injected");
@@ -2116,8 +2152,8 @@ console.log("ok reset reports the config mode");
 	const off = ui();
 	await before({ systemPromptOptions: {} }, { model: LEVIATHAN, ui: off });
 	assert.equal(guardRun([head(""), turn]).messages.length, 2, "turns off injects nothing");
-	assert.notEqual(lastStatus(off), "Leviathan !", "and is not a loss");
-	assert.match(await panel(), /turns=off/, "the panel says the block is off");
+	assert.equal(statusOf(lastStatus(off)).lost, false, "and is not a loss");
+	assert.match(await panel(), /turns\s+off/, "the panel says the block is off");
 	writeConfig(jail, { turns: sessionTurns });
 	await command.handler("turns default", ctx);
 	assert.equal(u.notes.at(-1)[1], "turns default (config)");
@@ -2133,52 +2169,25 @@ console.log("ok reset reports the config mode");
 	await command.handler("turns off", ctx);
 	writeConfig(jail);
 
-	// inherit: tree covers every model in this process, the mode verbs keep it, keyed narrows, none
-	// publishes nothing.
-	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
-	await command.handler("inherit tree", ctx);
-	assert.equal(u.notes.at(-1)[1], "inherit tree");
-	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid }).key, "*", "tree publishes the whole tree");
-	assert.match(await panel(), /on@\*/, "the row names the scope");
-	await command.handler("on", ctx);
-	assert.match(await panel(), /on@\*/, "a mode verb keeps the tree scope");
-	await select({ type: "model_select" }, { model: NORMAL, ui: u });
-	assert.equal(lastStatus(u), "Leviathan on", "a tree answer covers the other model");
-	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("ALT TEXT"), "and its settings reach it");
-	await command.handler("inherit keyed", { model: NORMAL, ui: u });
-	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid }).key, modelKey(NORMAL), "keyed narrows to the live model");
-	await command.handler("inherit none", { model: NORMAL, ui: u });
-	assert.equal(ENV_NAME in process.env, false, "none publishes nothing");
+	// forge: the slot that decides whether a foreign turn's reasoning comes back, and with what bound.
+	await command.handler("forge on", ctx);
+	assert.equal(u.notes.at(-1)[1], "forge on, no bound", "on is no bound, and the receipt says so");
+	assert.match(await panel(), /forge\s+on, no bound/, "on is no bound");
+	await command.handler("forge maxChars 1200", ctx);
+	assert.equal(u.notes.at(-1)[1], "forge on, maxChars 1200", "a bound names itself");
+	assert.match(await panel(), /forge\s+on, maxChars 1200/);
+	await command.handler("forge maxChars none", ctx);
+	assert.equal(u.notes.at(-1)[1], "forge on, no bound", "none is the short spelling of no bound");
+	await command.handler("forge off", ctx);
+	assert.equal(u.notes.at(-1)[1], "forge off");
+	await command.handler("forge default", ctx);
+	assert.equal(u.notes.at(-1)[1], "forge default (config)");
 
-	// A settings verb keeps the mode the answer already carries, even when it widens the answer.
-	writeConfig(jail);
-	await command.handler("reset", ctx);
-	await command.handler("on", ctx);
-	await select({ type: "model_select" }, { model: NORMAL, ui: u });
-	await command.handler("inherit tree", { model: NORMAL, ui: u });
-	assert.equal(JSON.parse(process.env[ENV_NAME]).m, "on", "the answer keeps its own mode");
-	await run(LEVIATHAN);
-	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("This is YG's context."), "and the model that was on stays on");
-
-	// A keyed answer that does not govern this model never suppresses its payload.
-	writeConfig(jail);
-	process.env[ENV_NAME] = encode({ mode: "on", key: "other/model", settings: { inherit: "none" } }, process.ppid);
-	await start({ type: "session_start", reason: "startup" }, { model: LEVIATHAN, ui: u });
-	assert.equal(ENV_NAME in process.env, true, "another model's none setting does not delete this one's payload");
-
-	// A config-level tree covers every model even when the answer carries a model key.
-	const treePrompt = join(tempDir, "tree.md");
-	writeFileSync(treePrompt, "TREE TEXT");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "tree", prompt: treePrompt });
-	process.env[ENV_NAME] = encode({ mode: "on", key: "other/model" }, process.ppid);
-	await start({ type: "session_start", reason: "startup" }, { model: LEVIATHAN, ui: u });
-	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("TREE TEXT"), "a config tree governs the other model");
-	await command.handler("reset", ctx);
-
-	// The tag that fences the cot.
-	writeFileSync(sessionTurns, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
-	writeConfig(jail, { turns: sessionTurns });
+	// cotTag: the fence both writers use, per model.
+	// The session names a file whose cot is fenced in the tag this session sets.
+	const tagFile = join(tempDir, "tag-turn0.yml");
+	writeFileSync(tagFile, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
+	await command.handler(`turns ${tagFile}`, ctx);
 	await command.handler("cotTag analysis", ctx);
 	assert.equal(u.notes.at(-1)[1], "cotTag analysis");
 	await run(LEVIATHAN);
@@ -2186,246 +2195,176 @@ console.log("ok reset reports the config mode");
 	await command.handler("cotTag default", ctx);
 	assert.equal(u.notes.at(-1)[1], "cotTag default (config)");
 
+	// inherit: tree covers every model in this process, a slot verb keeps it, keyed narrows, none
+	// publishes nothing.
+	await command.handler("reset", ctx);
+	await command.handler(`persona ${altPrompt}`, ctx);
+	await command.handler("inherit tree", ctx);
+	assert.equal(u.notes.at(-1)[1], "inherit tree");
+	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid }).key, "*", "tree publishes the whole tree");
+	assert.match(await panel(), /env\s+\*/, "the panel names the scope the answer published");
+	await command.handler("gate on", ctx);
+	assert.match(await panel(), /env\s+\*/, "a slot verb keeps the tree scope");
+	await select({ type: "model_select" }, { model: NORMAL, ui: u });
+	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("ALT TEXT"), "and its settings reach the other model");
+	await command.handler("inherit keyed", { model: NORMAL, ui: u });
+	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid }).key, modelKey(NORMAL), "keyed narrows to the live model");
+	await command.handler("inherit none", { model: NORMAL, ui: u });
+	assert.equal(ENV_NAME in process.env, false, "none publishes nothing");
+
 	// remember writes what the session set, then the session stops repeating it.
 	writeConfig(jail);
 	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler(`persona ${altPrompt}`, ctx);
 	await command.handler("cotTag analysis", ctx);
-	assert.equal(u.notes.at(-1)[1], "cotTag analysis");
 	await command.handler("turns off", ctx);
+	await command.handler("gate off", ctx);
 	await command.handler("inherit keyed", ctx);
-	await command.handler("remember on", ctx);
+	await command.handler("remember", ctx);
 	let data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].prompt, altPrompt, "the written rule carries the session prompt");
+	assert.equal(data.rules[0].persona, altPrompt, "the written rule carries the session persona");
 	assert.equal(data.rules[0].cotTag, "analysis");
-	assert.equal(data.rules[0].turns, null, "an explicit null is written");
+	assert.equal(data.rules[0].turns, false, "the slot is written out, false included");
+	assert.equal(data.rules[0].gate, false);
 	assert.equal(data.inherit, "keyed");
 	assert.doesNotMatch(await panel(), /^session\s/m, "the session row is gone once the file carries it");
 
-	// A config tree makes the answer govern this model, so remember writes its settings there.
+	// A config tree makes the answer govern this model, so remember writes its slots there.
 	writeConfig(jail);
 	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler(`persona ${altPrompt}`, ctx);
 	writeConfig(jail, { inherit: "tree" });
 	await select({ type: "model_select" }, { model: NORMAL, ui: u });
-	await command.handler("remember on", { model: NORMAL, ui: u });
+	await command.handler("remember", { model: NORMAL, ui: u });
 	data = JSON.parse(readFileSync(configFile, "utf8"));
 	assert.equal(data.rules[0].model, "gpt-5");
-	assert.equal(data.rules[0].prompt, altPrompt, "a config tree makes the answer govern this model");
+	assert.equal(data.rules[0].persona, altPrompt, "a config tree makes the answer govern this model");
 
-	// A key the session set wins over a value the rule already pins.
+	// A slot the session set wins over a value the rule already pins.
 	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan", cotTag: "reasoning", turns: "x.yml" },
-		{ provider: "CLIProxy-Chat", model: "deepseek-flash", mode: "leviathan", cotTag: "reasoning", turns: "x.yml" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true, cotTag: "reasoning", turns: "x.yml" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-flash", persona: true, gate: true, forge: true, cotTag: "reasoning", turns: "x.yml" },
 	]);
 	await command.handler("reset", ctx);
 	await command.handler("cotTag analysis", ctx);
-	assert.equal(u.notes.at(-1)[1], "cotTag analysis");
 	await command.handler("turns off", ctx);
-	await command.handler("remember on", ctx);
+	await command.handler("remember", ctx);
 	data = JSON.parse(readFileSync(configFile, "utf8"));
 	assert.equal(data.rules.length, 2, "the exact rule is updated, not duplicated");
-	assert.equal(data.rules[0].cotTag, "analysis", "a session key is written over the rule's own value");
-	assert.equal(data.rules[0].turns, null);
+	assert.equal(data.rules[0].cotTag, "analysis", "a session slot is written over the rule's own value");
+	assert.equal(data.rules[0].turns, false);
 
 	// A refused write changes nothing.
 	writeConfig(jail);
 	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler(`persona ${altPrompt}`, ctx);
 	writeFileSync(configFile, "{ not json");
-	await command.handler("remember on", ctx);
+	await command.handler("remember", ctx);
 	assert.equal(u.notes.at(-1)[0], "error");
-	assert.ok((await panel()).includes(`prompt=${altPrompt}`), "a refused write leaves the session answer alone");
+	assert.ok((await panel()).includes(altPrompt), "a refused write leaves the session answer alone");
 	writeConfig(jail);
 
-	// A setting the answer did not carry is not written, and the re-key applies it here.
+	// A session that governs one model says nothing about another: the rule this command writes for the
+	// model in front of the user carries only what this session resolved for it.
 	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler(`persona ${altPrompt}`, ctx);
 	await select({ type: "model_select" }, { model: NORMAL, ui: u });
-	await command.handler("remember on", { model: NORMAL, ui: u });
+	await command.handler("remember", { model: NORMAL, ui: u });
 	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].model, "gpt-5");
-	assert.equal(data.rules[0].prompt, undefined, "a setting the answer did not carry is not written");
-	await run(NORMAL);
-	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("ALT TEXT"), "the re-key applies the stored setting");
-	assert.doesNotMatch(await panel(NORMAL), /not applied/);
-	await command.handler("remember on", { model: NORMAL, ui: u });
-	data = JSON.parse(readFileSync(configFile, "utf8"));
-	assert.equal(data.rules[0].prompt, altPrompt, "a second remember persists it");
-
-	// The channel carries the settings, and rejects a malformed set whole.
-	{
-		const pid = process.pid;
-		const ppid = process.ppid;
-		const full = { prompt: "/abs/Alt.md", turns: null, cotTag: "analysis", inherit: "keyed" };
-		assert.deepEqual(decode(encode({ mode: "on", key: "A/B", settings: full }, pid), { ppid, pid }).settings, full);
-		assert.equal(
-			decode(encode({ mode: "on", key: "A/B", settings: { prompt: "rel/Alt.md" } }, pid), { ppid, pid }).settings.prompt,
-			resolve(process.cwd(), "rel/Alt.md"),
-			"a relative path is normalized on both entry points",
-		);
-		for (const bad of [{ s: null }, { s: [] }, { s: { nope: "x" } }, { s: { cot: "keyed" } }, { s: { cotTag: "1bad" } }, { s: { turns: "" } }, { s: { prompt: "" } }]) {
-			assert.equal(decode(JSON.stringify({ m: "on", k: "*", p: pid, ...bad }), { ppid, pid }), null, `a malformed s is rejected whole: ${JSON.stringify(bad)}`);
-		}
-		assert.deepEqual(decode(JSON.stringify({ m: "on", k: "*", p: pid }), { ppid, pid }).settings, {});
-		assert.equal(encode({ mode: "on", key: "*", settings: {} }, pid), JSON.stringify({ m: "on", k: "*", p: pid }), "an empty set writes no s");
-	}
-
-	// Every key the list names is a setting that can be set: a key with no branch of its own would be a
-	// dead entry that rejects every value it is given.
-	{
-		const sample = { prompt: "p.md", turns: null, cotTag: "think", forge: "auto", forgeMaxChars: 1200, inherit: "keyed" };
-		assert.deepEqual(Object.keys(sample).sort(), [...SETTINGS_KEYS].sort(), "the sample covers the list and nothing else");
-		for (const key of SETTINGS_KEYS) {
-			assert.equal(sessionSettings({ [key]: sample[key] }).error, undefined, `${key} is settable`);
-		}
-	}
-
-	// A reload keeps the settings on the process; a malformed process answer is not trusted.
+	assert.equal(data.rules[0].model, "gpt-5", "the rule is written for the live model");
+	assert.equal(data.rules[0].persona, false, "and carries that model's own record, not the other one's session slot");
 	writeConfig(jail);
-	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
-	delete process.env[ENV_NAME];
-	await start({ type: "session_start", reason: "reload" }, {});
-	await run(LEVIATHAN);
-	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "a reload keeps the settings on the process");
-	globalThis[Symbol.for("pi-leviathan.process-answer")] = { mode: "on", key: "A/B", settings: { cotTag: "1bad" } };
-	delete process.env[ENV_NAME];
-	await start({ type: "session_start", reason: "startup" }, {});
-	await run(LEVIATHAN);
-	assert.equal(guardRun([head(""), turn]).messages[0].content, promptText, "a malformed process answer resolves from the config");
-	await command.handler("reset", ctx);
-	globalThis[Symbol.for("pi-leviathan.process-answer")] = { mode: "on", key: "*", settings: { prompt: relative(process.cwd(), altPrompt) } };
-	delete process.env[ENV_NAME];
-	await start({ type: "session_start", reason: "startup" }, {});
-	await run(LEVIATHAN);
-	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "a relative process-answer path is normalized");
-	await command.handler("reset", ctx);
-
-	// A child adopts a tree payload with its settings and narrows to its own model.
-	process.env[ENV_NAME] = encode({ mode: "on", key: "*", settings: { prompt: altPrompt } }, process.ppid);
-	await start({ type: "session_start", reason: "startup" }, { model: LEVIATHAN, ui: u });
-	assert.equal(decode(process.env[ENV_NAME], { ppid: process.ppid, pid: process.pid }).key, modelKey(LEVIATHAN), "the child narrows the tree key");
-	await run(LEVIATHAN);
-	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "and keeps the settings");
 
 	// A rejected verb changes nothing at all.
-	writeConfig(jail);
 	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler(`persona ${altPrompt}`, ctx);
 	for (const [args, pattern] of [
 		["cotTag 1bad", /cotTag must be/],
 		["inherit nope", /inherit must be/],
-		["prompt", /prompt needs a value/],
+		["persona", /persona needs a value/],
 		["turns", /turns needs a value/],
+		["forge maxChars 0", /maxChars must be a positive whole number/],
 	]) {
 		await command.handler(args, ctx);
 		assert.equal(u.notes.at(-1)[0], "error", `${args} is an error`);
 		assert.match(u.notes.at(-1)[1], pattern);
 	}
-	// The removed verb is not a verb: it prints the usage and changes nothing.
-	await command.handler("cot content", ctx);
-	assert.equal(u.notes.at(-1)[0], "info", "an unknown verb is not an error");
-	assert.match(u.notes.at(-1)[1], /prompt <path>/, "it prints the usage");
-	assert.equal(/cot(?![A-Za-z])/.test(u.notes.at(-1)[1]), false, "the usage names no removed verb");
+	// The removed bundle is not a verb: it prints the usage and changes nothing.
+	await command.handler("mode leviathan", ctx);
+	assert.equal(u.notes.at(-1)[0], "error", "an unknown verb is an error");
+	assert.match(u.notes.at(-1)[1], /persona on\|off/, "it prints the usage");
+	assert.equal(/\bmode\b/.test(u.notes.at(-1)[1]), false, "the usage names no removed verb");
 	const row = await panel();
-	assert.ok(row.includes(`prompt=${altPrompt}`), "a rejected verb leaves the settings alone");
-	assert.doesNotMatch(row, /inherit=/);
+	assert.ok(row.includes(altPrompt), "a rejected verb leaves the settings alone");
 	await command.handler("cotTag analysis", { ui: u });
 	assert.equal(u.notes.at(-1)[1], "no model selected");
 
-	// reset drops the settings with the answer, and publishes nothing.
+	// reset drops the slots with the answer, and publishes nothing.
 	await command.handler("reset", ctx);
 	assert.doesNotMatch(await panel(), /^session\s/m);
 	assert.equal(ENV_NAME in process.env, false, "reset removes the published settings with the answer");
 	await run(LEVIATHAN);
 	assert.equal(guardRun([head(""), turn]).messages[0].content, promptText);
 
-	// A bare model switch leaves the settings stored and unapplied.
+	// A bare model switch leaves the slots stored and unapplied.
 	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" },
-		{ provider: "openai", model: "gpt-*", mode: "leviathan" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true },
+		{ provider: "openai", model: "gpt-*", persona: true, gate: true, forge: true },
 	]);
-	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler(`persona ${altPrompt}`, ctx);
 	await select({ type: "model_select" }, { model: NORMAL, ui: u });
-	assert.match(await panel(NORMAL), /\(not applied\)/, "a bare model switch leaves the settings unapplied");
+	assert.match(await panel(NORMAL), /\(not applied\)/, "a bare model switch leaves the slots unapplied");
 	await run(NORMAL);
-	assert.equal(guardRun([head(""), turn], NORMAL).messages[0].content, promptText, "and the config prompt is used");
+	assert.equal(guardRun([head(""), turn], NORMAL).messages[0].content, promptText, "and the config persona is used");
 
-	// A settings verb never flips the mode.
-	writeConfig([{ provider: "openai", model: "gpt-*", mode: "normal" }]);
+	// A slot verb never turns anything else on.
+	writeConfig([{ provider: "openai", model: "gpt-*", persona: false, gate: false, turns: false, forge: false }]);
 	await command.handler("reset", { model: NORMAL, ui: u });
 	await command.handler("cotTag analysis", { model: NORMAL, ui: u });
-	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "a settings verb does not turn the mode on");
+	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "a slot verb changes nothing on the wire but its own slot");
 	assert.equal(JSON.parse(process.env[ENV_NAME]).s.cotTag, "analysis", "the payload carries the setting");
 
-	// The mode verbs keep the settings.
-	writeConfig(jail);
-	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
-	await command.handler("off", ctx);
-	await command.handler("on", ctx);
-	await run(LEVIATHAN);
-	assert.ok(guardRun([head(""), turn]).messages[0].content.startsWith("ALT TEXT"), "on/off keeps the settings");
-
-	// A settings verb re-keys the answer to the model in front of the user.
+	// A slot verb re-keys the answer to the model in front of the user.
 	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" },
-		{ provider: "openai", model: "gpt-*", mode: "leviathan" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true },
+		{ provider: "openai", model: "gpt-*", persona: true, gate: true, forge: true },
 	]);
 	await command.handler("reset", ctx);
-	await command.handler(`prompt ${altPrompt}`, ctx);
+	await command.handler(`persona ${altPrompt}`, ctx);
 	await select({ type: "model_select" }, { model: NORMAL, ui: u });
-	await command.handler(`prompt ${spacedPrompt}`, { model: NORMAL, ui: u });
+	await command.handler(`persona ${spacedPrompt}`, { model: NORMAL, ui: u });
 	await run(NORMAL);
 	assert.ok(guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("SPACED TEXT"), "the verb applies on the live model");
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, modelKey(NORMAL), "and re-keys the answer to it");
 	assert.doesNotMatch(await panel(NORMAL), /not applied/);
-	assert.ok((await panel(NORMAL)).includes(`prompt=${spacedPrompt}`), "the newer value replaces the older one");
+	assert.ok((await panel(NORMAL)).includes(spacedPrompt), "the newer value replaces the older one");
 
-	// A re-key carries the answer's mode, not the config's.
+	// A model the answer does not govern keeps reading the config.
 	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" },
-		{ provider: "openai", model: "gpt-*", mode: "normal" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true },
+		{ provider: "openai", model: "gpt-*", persona: false, gate: false, turns: false, forge: false },
 	]);
 	await command.handler("reset", ctx);
-	await command.handler("on", ctx);
+	await command.handler("gate on", ctx);
 	await select({ type: "model_select" }, { model: NORMAL, ui: u });
 	await run(NORMAL);
-	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "the config leaves the other model normal");
-	await command.handler("cotTag analysis", { model: NORMAL, ui: u });
-	await run(NORMAL);
-	assert.ok(
-		guardRun([head(""), turn], NORMAL).messages[0].content.startsWith("This is YG's context."),
-		"the re-key carries the answer's mode",
-	);
+	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "the config leaves the other model untouched");
 
-	// The completions list the verbs and their literals.
-	assert.deepEqual(command.getArgumentCompletions("cot"), [{ value: "cotTag think", label: "cotTag think" }]);
-	assert.deepEqual(command.getArgumentCompletions("cot "), [{ value: "cotTag think", label: "cotTag think" }], "the trailing space is the same prefix");
-	assert.deepEqual(command.getArgumentCompletions("inherit "), [
-		{ value: "inherit keyed", label: "inherit keyed" },
-		{ value: "inherit tree", label: "inherit tree" },
-		{ value: "inherit none", label: "inherit none" },
-	]);
-
-	await command.handler("reset", ctx);
 	writeConfig(jail);
-	await start({ type: "session_start", reason: "startup" }, {});
+	await command.handler("reset", ctx);
 }
-console.log("ok session settings");
 
 // The session answer survives a new session in the same process.
 {
 	const command = commands.get("leviathan");
 	const ctx = { model: LEVIATHAN, ui: ui() };
 	await start({ type: "session_start", reason: "startup" }, {});
-	await command.handler("on", ctx);
+	await command.handler("gate on", ctx);
 	await start({ type: "session_start", reason: "new" }, {});
 	activeTools = ["read", "bash"];
 	await run(LEVIATHAN);
 	assert.equal(activeTools.includes(GATE_TOOL), true, "a new session keeps the answer this process made");
-	await command.handler("off", ctx);
+	await command.handler("gate off", ctx);
 	await start({ type: "session_start", reason: "new" }, {});
 	activeTools = ["read", "bash"];
 	await run(LEVIATHAN);
@@ -2433,7 +2372,7 @@ console.log("ok session settings");
 }
 console.log("ok override survives a new session");
 
-// A new runtime is a new load of the extension: the mode is the process's, not the runtime's.
+// A new runtime is a new load of the extension: the answer is the process's, not the runtime's.
 {
 	const runner = () => {
 		const own = [];
@@ -2457,17 +2396,17 @@ console.log("ok override survives a new session");
 		};
 	};
 	// `none` publishes nothing, so a runtime that replaces this one has only the process answer.
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "none" });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "none" });
 	const first = runner();
 	const ctx = { model: NORMAL, ui: ui() };
 	await first.start({ type: "session_start", reason: "startup" }, ctx);
-	await first.command.handler("on", ctx);
+	await first.command.handler("gate on", ctx);
 	const second = runner();
 	const u = ui();
 	await second.start({ type: "session_start", reason: "new" }, { model: NORMAL, ui: u });
 	await second.before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
-	assert.equal(second.active.includes(GATE_TOOL), true, "a new runtime keeps the mode this process set");
-	assert.equal(lastStatus(u), "Leviathan on", "and reports it");
+	assert.equal(second.active.includes(GATE_TOOL), true, "a new runtime keeps the slot this process set");
+	assert.equal(statusOf(lastStatus(u)).lost, false, "and reports it");
 	const third = runner();
 	await third.command.handler("reset", ctx);
 	const fourth = runner();
@@ -2476,15 +2415,15 @@ console.log("ok override survives a new session");
 	assert.equal(fourth.active.includes(GATE_TOOL), false, "and a reset reaches the next runtime too");
 	// The process answer is keyed: a runtime on another model still resolves from the config.
 	const first2 = runner();
-	await first2.command.handler("on", ctx);
+	await first2.command.handler("gate on", ctx);
 	const elsewhere = { provider: "zhipu", id: "glm-5" };
 	const fifth = runner();
 	const u5 = ui();
 	await fifth.start({ type: "session_start", reason: "new" }, { model: elsewhere, ui: u5 });
 	await fifth.before({ systemPromptOptions: { sections: {} } }, { model: elsewhere, ui: u5 });
-	assert.equal(fifth.active.includes(GATE_TOOL), false, "the process answer does not cover another model");
+	assert.equal(fifth.active.includes(GATE_TOOL), false, "the process answer does not carry over to another model");
 	await third.command.handler("reset", ctx);
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok a new runtime keeps the process answer");
 
@@ -2511,22 +2450,22 @@ console.log("ok a new runtime keeps the process answer");
 			before: own.find(([name]) => name === "before_agent_start")[1],
 		};
 	};
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "none" });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "none" });
 	const first = runner(def);
 	const ctx = { model: NORMAL, ui: ui() };
 	await first.start({ type: "session_start", reason: "startup" }, ctx);
-	await first.command.handler("on", ctx);
+	await first.command.handler("gate on", ctx);
 	const reloaded = runner((await import(`./index.ts?reload=${Date.now()}`)).default);
 	const u = ui();
 	await reloaded.start({ type: "session_start", reason: "reload" }, { model: NORMAL, ui: u });
 	await reloaded.before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
-	assert.equal(reloaded.active.includes(GATE_TOOL), true, "a reloaded module keeps the mode this process set");
+	assert.equal(reloaded.active.includes(GATE_TOOL), true, "a reloaded module keeps the slot this process set");
 	await first.command.handler("reset", ctx);
 	const afterReset = runner((await import(`./index.ts?reset=${Date.now()}`)).default);
 	await afterReset.start({ type: "session_start", reason: "reload" }, { model: NORMAL, ui: ui() });
 	await afterReset.before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: ui() });
 	assert.equal(afterReset.active.includes(GATE_TOOL), false, "and a reset survives the reload too");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok a reloaded module keeps the process answer");
 
@@ -2534,22 +2473,22 @@ console.log("ok a reloaded module keeps the process answer");
 {
 	const command = commands.get("leviathan");
 	const ctx = { model: LEVIATHAN, ui: ui() };
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "tree" });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "tree" });
 	await start({ type: "session_start", reason: "startup" }, {});
-	await command.handler("on", ctx);
+	await command.handler("gate on", ctx);
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "*", "tree publishes the whole tree");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "keyed" });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "keyed" });
 	await start({ type: "session_start", reason: "startup" }, {});
-	await command.handler("on", ctx);
+	await command.handler("gate on", ctx);
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "CLIProxy-Chat/deepseek-flash", "keyed publishes the model");
 
 	// The same rule applies to an answer taken from the parent at session start.
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "tree" });
-	process.env[ENV_NAME] = encode({ mode: "on", key: "A/B" }, process.ppid);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "tree" });
+	process.env[ENV_NAME] = encode({ key: "A/B" }, process.ppid);
 	await start({ type: "session_start", reason: "startup" }, {});
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "*", "an inherited answer is republished for the whole tree");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "keyed" });
-	process.env[ENV_NAME] = encode({ mode: "on", key: "A/B" }, process.ppid);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "keyed" });
+	process.env[ENV_NAME] = encode({ key: "A/B" }, process.ppid);
 	await start({ type: "session_start", reason: "startup" }, {});
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "A/B", "keyed republishes the inherited key");
 }
@@ -2559,11 +2498,11 @@ console.log("ok inherit chooses the published key");
 {
 	const command = commands.get("leviathan");
 	const ctx = { model: LEVIATHAN, ui: ui() };
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "tree" });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "tree" });
 	await start({ type: "session_start", reason: "startup" }, ctx);
-	await command.handler("on", ctx);
+	await command.handler("gate on", ctx);
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "*");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "keyed" });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "keyed" });
 	await start({ type: "session_start", reason: "startup" }, ctx);
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "CLIProxy-Chat/deepseek-flash", "a keyed config narrows the tree answer");
 }
@@ -2572,63 +2511,53 @@ console.log("ok a keyed config narrows a tree answer");
 // A tree answer covers this process on every model, which is what it publishes.
 {
 	const ctx = { model: NORMAL, ui: ui() };
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "tree" });
-	process.env[ENV_NAME] = encode({ mode: "on", key: "CLIProxy-Chat/deepseek-flash" }, process.ppid);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "tree" });
+	process.env[ENV_NAME] = encode({ key: "CLIProxy-Chat/deepseek-flash", settings: { persona: true, gate: true } }, process.ppid);
 	await start({ type: "session_start", reason: "startup" }, ctx);
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
 	assert.equal(activeTools.includes(GATE_TOOL), true, "the tree answer covers another model in this process");
-	assert.equal(lastStatus(u), "Leviathan on");
+	assert.equal(statusOf(lastStatus(u)).lost, false);
 	// The next run picks up the config going back to keyed, and narrows the channel with it.
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "keyed" });
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "keyed" });
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "CLIProxy-Chat/deepseek-flash", "a run start narrows the channel back to the inherited key");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok a tree answer covers the process");
 
 // A tree answer from a parent narrows to this model, and stays with it.
 {
 	const ctx = { model: NORMAL, ui: ui() };
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { inherit: "keyed" });
-	process.env[ENV_NAME] = encode({ mode: "on", key: "*" }, process.ppid);
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }], { inherit: "keyed" });
+	process.env[ENV_NAME] = encode({ key: "*" }, process.ppid);
 	await start({ type: "session_start", reason: "startup" }, ctx);
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "openai/gpt-5", "an inherited tree answer narrows to this model");
 	const u = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: NORMAL, ui: u });
-	assert.equal(lastStatus(u), "Leviathan on", "and applies to it");
+	assert.equal(statusOf(lastStatus(u)).lost, false, "and applies to it");
 	await before({ systemPromptOptions: { sections: {} } }, { model: { provider: "other", id: "model" }, ui: u });
 	assert.equal(JSON.parse(process.env[ENV_NAME]).k, "openai/gpt-5", "the narrowed key stays with the model that had it");
-	assert.equal(lastStatus(u), "Leviathan off", "the other model falls back to the config");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
+	assert.equal(statusOf(lastStatus(u)).empty, true, "the other model falls back to the config");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 }
 console.log("ok an inherited tree answer narrows");
 
-// No model, no publish.
+// No model, no publish, and the command says why it did nothing.
 {
 	const command = commands.get("leviathan");
 	await command.handler("reset", { model: LEVIATHAN, ui: ui() });
 	const before_ = process.env[ENV_NAME];
 	const u = ui();
-	await command.handler("on", { ui: u });
+	await command.handler("gate on", { ui: u });
 	assert.equal(process.env[ENV_NAME], before_, "a context without a model writes nothing");
-	assert.ok(u.notes.some(([type, message]) => type === "warning" && /no model/.test(message)));
-	assert.equal(u.notes.at(-1)[1], "leviathan off (unchanged)", "the command says nothing changed");
-	assert.ok(u.notes.some(([type, message]) => type === "warning" && /^pi-leviathan: no model selected$/.test(message)));
+	assert.equal(u.notes.at(-1)[0], "error", "the command refuses rather than writing a value it cannot place");
+	assert.equal(u.notes.at(-1)[1], "no model selected");
+	// A run without a model reads the config for the empty key and publishes nothing: the missing model
+	// is the command's to report, and it already did.
+	assert.equal(u.notes.at(-1)[1], "no model selected", "and nothing after it overwrote that receipt");
 }
-console.log("ok no model publishes nothing");
-
-// A no-model receipt reports the mode the session resolves, not the one that was asked for.
-{
-	const command = commands.get("leviathan");
-	const u = ui();
-	await command.handler("reset", { model: LEVIATHAN, ui: u });
-	writeConfig([], { default: "leviathan" });
-	await command.handler("off", { ui: u });
-	assert.equal(u.notes.at(-1)[1], "leviathan on (unchanged)", "the resolved mode is reported");
-	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }]);
-}
-console.log("ok a no-model receipt reports the resolved mode");
+console.log("ok no model refuses a slot verb");
 
 // A filtered gate locks one attempt and reports once; a model switch tries again.
 {
@@ -2676,11 +2605,11 @@ console.log("ok a refused tool-set write is reported");
 	// A loss belongs to the request that produced it, not to a model the session came back to.
 	await select({ type: "model_select", model: LEVIATHAN }, { model: LEVIATHAN, ui: u });
 	guard({ type: "context_with_system", messages: [turn] }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan !", "a loss shows on the model that lost it");
+	assert.equal(statusOf(lastStatus(u)).lost, true, "a loss shows on the model that lost it");
 	await select({ type: "model_select", model: NORMAL }, { model: NORMAL, ui: u });
-	assert.equal(lastStatus(u), "Leviathan off", "and not on another model");
+	assert.equal(statusOf(lastStatus(u)).empty, true, "and not on another model");
 	await select({ type: "model_select", model: LEVIATHAN }, { model: LEVIATHAN, ui: u });
-	assert.equal(lastStatus(u), "Leviathan on", "nor after switching back, before a new request");
+	assert.equal(statusOf(lastStatus(u)).lost, false, "nor after switching back, before a new request");
 }
 console.log("ok model_select");
 
@@ -2947,16 +2876,21 @@ console.log("ok gate");
 	const parsed = parseConfig(JSON.stringify(example), PACKAGE_DIR);
 	assert.equal(parsed.error, undefined, "the example config must parse");
 	assert.ok(parsed.config.rules.length > 0);
+	// Every file the example names has to be one that exists: `true` is the shipped copy, and a path
+	// resolves next to the file.
+	const named = (spec, resolvePath) => (typeof spec === "string" ? resolvePath(parsed.config, spec) : null);
 	for (const rule of parsed.config.rules) {
-		const path = promptPath(parsed.config, rule.prompt ?? parsed.config.prompt);
-		assert.ok(existsSync(path), `the example names a missing prompt: ${path}`);
+		const persona = named(rule.persona, promptPath);
+		if (persona) assert.ok(existsSync(persona), `the example names a missing persona: ${persona}`);
+		const turns = named(rule.turns, turnsPath);
+		if (turns) assert.ok(existsSync(turns), `the example names a missing turn file: ${turns}`);
 	}
 	// The block a reader copies has to be the file that ships.
 	const readme = readFileSync(new URL("./README.md", import.meta.url), "utf8");
 	const block = readme.split("```json\n")[1]?.split("```")[0];
 	assert.ok(block, "README carries the example as a json block");
 	assert.deepEqual(JSON.parse(block), example, "the README block and the example file agree");
-	assert.ok(readme.includes("Leviathan !"), "the footer's third state is documented");
+	assert.ok(readme.includes("Leviathan \u{1F3AD}"), "the footer's glyphs are documented");
 }
 console.log("ok example config");
 

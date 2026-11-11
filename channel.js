@@ -26,7 +26,7 @@ export function modelKey(model) {
  * writes no `s`, so a session that set nothing publishes the bytes it always published. */
 export function encode(value, pid) {
 	if (!value) return null;
-	const out = { m: value.mode, k: value.key, p: pid };
+	const out = { k: value.key, p: pid };
 	const settings = value.settings && typeof value.settings === "object" ? value.settings : null;
 	if (settings && Object.keys(settings).length) out.s = { ...settings };
 	return JSON.stringify(out);
@@ -48,12 +48,11 @@ export function decode(raw, { ppid, pid }) {
 		return null;
 	}
 	if (!data || typeof data !== "object") return null;
-	if (data.m !== "on" && data.m !== "off") return null;
 	if (typeof data.k !== "string" || !data.k) return null;
 	if (data.p !== ppid && data.p !== pid) return null;
 	const read = sessionSettings(data.s === undefined ? {} : data.s);
 	if (read.error) return null;
-	return { mode: data.m, key: data.k, self: data.p === pid, settings: read.settings };
+	return { key: data.k, self: data.p === pid, settings: read.settings };
 }
 
 /** Write the process mirror: the decision, or nothing at all. */

@@ -1,11 +1,9 @@
 {
-	"default": "normal",
+	"default": { "persona": false, "gate": false, "turns": false, "forge": false },
 	"inherit": "keyed",
-	"prompt": "prompt.md",
-	"forge": "auto",
 	"rules": [
-		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "leviathan" },
-		{ "provider": "deepseek", "mode": "leviathan" },
-		{ "model": "*deepseek*", "mode": "leviathan" }
+		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "persona": true, "gate": true, "turns": true, "forge": true },
+		{ "provider": "deepseek", "persona": true, "gate": true },
+		{ "model": "*deepseek*", "persona": true, "forge": { "maxChars": 1200 }, "cotTag": "analysis" }
 	]
 }

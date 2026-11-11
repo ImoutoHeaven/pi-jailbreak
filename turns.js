@@ -14,7 +14,7 @@
  */
 
 import { createRequire } from "node:module";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 
 // A missing package disables injection and leaves the system-prompt half working, so the import is
@@ -46,31 +46,27 @@ function firstLine(error) {
 }
 
 /**
- * Read one file once per revision, per kind of parse. The mtime and the size are what make a
- * revision, and the parse result is kept whether it succeeded or failed, so a bad file reports once
- * and a good one costs one stat per call.
+ * Read one file once per revision, per kind of parse. The bytes are what make a revision, and the
+ * parse result is kept whether it succeeded or failed, so a bad file reports once and a good one
+ * costs one `.readFile` per call. A stat is not enough: two writes in one timestamp tick share an
+ * `mtimeMs`, and two spellings of one shape share a `size`.
  *
- * The kind is part of the key: a config may point `prompt` and `turns` at the same path, and each
+ * The kind is part of the key: a config may point `persona` and `turns` at the same path, and each
  * side parses those bytes its own way.
  *
- * `parse` returns `{ value }` or `{ error }`. Both turns and the prompt text cache through here.
+ * `parse` returns `{ value }` or `{ error }`. Both turns and the persona text cache through here.
  */
 export function cachedFile(path, kind, parse) {
 	const key = `${kind}\u0000${path}`;
-	let stat;
+	let text;
 	try {
-		stat = statSync(path);
+		text = readFileSync(path, "utf8");
 	} catch {
 		return { error: `${basename(path)} unreadable` };
 	}
 	const hit = files.get(key);
-	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit;
-	let entry;
-	try {
-		entry = { mtimeMs: stat.mtimeMs, size: stat.size, ...parse(readFileSync(path, "utf8")) };
-	} catch {
-		entry = { mtimeMs: stat.mtimeMs, size: stat.size, error: `${basename(path)} unreadable` };
-	}
+	if (hit && hit.text === text) return hit;
+	const entry = { text, ...parse(text) };
 	files.set(key, entry);
 	return entry;
 }

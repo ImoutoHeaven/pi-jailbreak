@@ -1,58 +1,63 @@
 /**
- * `on`, `off` and `toggle` set this session, and `reset` drops that answer. `remember` writes it
- * into the config file, so the next process resolves the same way without the environment channel.
+ * The `leviathan` command.
  *
- * `prompt`, `turns`, `cotTag` and `inherit` set one session setting each. They last as long as
- * the process, are written only by `remember`, and never touch the mode.
+ * One verb per slot, and no verb that means "all of them": `on` and `off` used to name a bundle of
+ * four things at once, which is how a config ended up unable to say "forge and nothing else". The
+ * completion table is the documentation the user actually meets, so it lists the verbs a record has
+ * and nothing else.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { SLOTS } from "./config.js";
 
 type Hooks = {
-	set(ctx: any, mode: "on" | "off" | "toggle"): { mode: "on" | "off"; applied: boolean };
-	reset(ctx: any): "on" | "off";
-	remember(ctx: any, mode: "on" | "off"): { ok: boolean; message: string };
-	configure(ctx: any, name: string, value: string): { ok: boolean; message: string };
-	panel(ctx: any): string;
+	reset: (ctx: any) => any;
+	remember: (ctx: any) => { ok: boolean; message: string };
+	configure: (ctx: any, name: string, value: string) => { ok: boolean; message: string };
+	panel: (ctx: any) => string;
 };
 
 const ARGS = [
-	"on",
-	"off",
-	"toggle",
-	"reset",
-	"remember on",
-	"remember off",
-	"prompt",
-	"turns",
+	"persona on",
+	"persona off",
+	"persona default",
+	"gate on",
+	"gate off",
+	"gate default",
+	"turns on",
 	"turns off",
-	"cotTag think",
-	"forge auto",
+	"turns default",
+	"forge on",
 	"forge off",
-	"forgeMaxChars 1200",
-	"forgeMaxChars none",
+	"forge default",
+	"forge maxChars 1200",
+	"forge maxChars none",
+	"cotTag think",
+	"cotTag default",
 	"inherit keyed",
 	"inherit tree",
 	"inherit none",
+	"remember",
+	"reset",
 ];
 
 const USAGE =
-	"on | off | toggle | reset | remember on | remember off | prompt <path> | turns <path|off> | cotTag <tag> | forge auto|off | forgeMaxChars <n|none> | inherit keyed|tree|none";
+	"persona on|off|<path>|default · gate on|off|default · turns on|off|<path>|default · forge on|off|maxChars <n|none>|default · cotTag <tag>|default · inherit keyed|tree|none · remember · reset";
 
-/** The verbs that set one session setting. The first token is lowercased, so `cotTag` arrives as `cottag`. */
-const SETTINGS = ["prompt", "turns", "cottag", "forge", "forgemaxchars", "inherit"];
+/** The verbs that set one slot, plus the scope key. The first token is lowercased, so `cotTag`
+ * arrives as `cottag`. */
+const SETTINGS = [...SLOTS.map((slot) => slot.toLowerCase()), "inherit"];
 
 function say(ctx: any, text: string, type: "info" | "error" = "info") {
 	try {
 		ctx?.ui?.notify?.(text, type);
 	} catch {
-		// A mode without a UI still runs the command.
+		// A session without a UI still runs the command.
 	}
 }
 
-export function registerCommands(pi: ExtensionAPI, hooks: Hooks) {
+export function registerCommands(pi: any, hooks: Hooks) {
 	pi.registerCommand("leviathan", {
-		description: "Show or set the mode and the session settings: on, off, toggle, reset, remember, prompt, turns, cotTag, forge, forgeMaxChars, inherit",
+		description: "Show or set this model's record: persona, gate, turns, forge, cotTag, inherit, remember, reset",
 		getArgumentCompletions: (prefix: string) => {
 			const typed = String(prefix ?? "").trim().toLowerCase();
 			const items = ARGS.filter((value) => value.toLowerCase().startsWith(typed));
@@ -64,27 +69,26 @@ export function registerCommands(pi: ExtensionAPI, hooks: Hooks) {
 				say(ctx, hooks.panel(ctx));
 				return;
 			}
-			// Only the verb is case-insensitive: the value is a path, and a path keeps its case.
+			// Only the verb is case-insensitive: the value is a path or a tag, and a path keeps its case.
 			const cut = raw.search(/\s/);
 			const first = (cut < 0 ? raw : raw.slice(0, cut)).toLowerCase();
 			const value = cut < 0 ? "" : raw.slice(cut + 1).trim();
-			if (first === "on" || first === "off" || first === "toggle") {
-				const result = hooks.set(ctx, first);
-				say(ctx, result.applied ? `leviathan ${result.mode}` : `leviathan ${result.mode} (unchanged)`);
-				return;
-			}
 			if (first === "reset") {
-				say(ctx, `leviathan ${hooks.reset(ctx)} (config)`);
+				const current = hooks.reset(ctx);
+				// The receipt says what the file answers now, one word per slot.
+				const said = SLOTS.map((slot) => {
+					const value = current[slot === "turns" ? "turnsSpec" : slot];
+					if (slot === "forge") return value === false ? "forge off" : `forge ${value.maxChars === null ? "on" : value.maxChars}`;
+					if (value === true) return `${slot} on`;
+					if (value === false) return `${slot} off`;
+					return `${slot} ${value}`;
+				});
+				say(ctx, `leviathan reset (config: ${said.join(", ")})`);
 				return;
 			}
 			if (first === "remember") {
-				const mode = value.toLowerCase();
-				if (mode !== "on" && mode !== "off") {
-					say(ctx, "remember on | remember off");
-					return;
-				}
-				const result = hooks.remember(ctx, mode);
-				say(ctx, result.ok ? `remembered: leviathan ${mode} in ${result.message}` : result.message, result.ok ? "info" : "error");
+				const result = hooks.remember(ctx);
+				say(ctx, result.message, result.ok ? "info" : "error");
 				return;
 			}
 			if (SETTINGS.includes(first)) {
@@ -92,7 +96,7 @@ export function registerCommands(pi: ExtensionAPI, hooks: Hooks) {
 				say(ctx, result.message, result.ok ? "info" : "error");
 				return;
 			}
-			say(ctx, USAGE);
+			say(ctx, USAGE, "error");
 		},
 	});
 }

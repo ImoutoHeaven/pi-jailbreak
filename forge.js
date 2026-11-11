@@ -20,7 +20,7 @@
  * Four invariants, all load-bearing:
  *
  * 1. Pure. The result depends only on the message's own persisted bytes, the live
- *    `provider`/`api`/`id` triple, and the tag. No clock, no model call, no mutable state. A pure
+ *    `provider`/`api`/`id` triple, and the tags. No clock, no model call, no mutable state. A pure
  *    answer is what keeps a grown conversation byte-identical at every position it already sent, so
  *    the provider's prompt cache keeps hitting.
  * 2. No re-stamp. The forged message keeps its original `provider`, `api` and `model`. Re-stamping
@@ -38,6 +38,10 @@
  * blocks are joined with no separator between them, so two blocks would concatenate the fence and
  * the reply; one block, `\n\n` between the fence and the reply, is the shape the turn file already
  * writes.
+ *
+ * The tag is per model, so the set of tags the config names travels with it: a turn already fenced
+ * under one model's tag counts as fenced for every other, or a model switch would stack a second
+ * fence on it.
  *
  * Nothing here reads or writes the session, and nothing here knows about any other extension.
  */
@@ -70,22 +74,13 @@ export function ownCot(message) {
 	return parts.join("\n\n");
 }
 
-/** Whether the visible text already opens with a fence this tag writes. */
-function fencePattern(tag) {
-	return new RegExp("^<" + String(tag ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ">\\n");
-}
-
-/**
- * Whether the visible text already opens with a fence this tag writes.
- *
- * The match is exact on purpose. Forge's own fence is always the tag then a newline, so a loose match
- * buys nothing inside one process, and it costs something: a hand-written fence with a stray space
- * that a loose match accepted would skip a refill the turn genuinely needs, losing the cot, while a
- * near-miss hand fence that is not matched only gets a second fence, which is visible and harmless.
- * The asymmetry favors strict.
- */
-function fenced(text, tag) {
-	return fencePattern(tag).test(String(text ?? ""));
+/** Whether the visible text already opens with a fence, under any tag the config names. */
+export function fenced(text, tags) {
+	const value = String(text ?? "");
+	for (const tag of tags) {
+		if (new RegExp("^<" + String(tag).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ">\\n").test(value)) return true;
+	}
+	return false;
 }
 
 /**
@@ -96,7 +91,7 @@ function fenced(text, tag) {
  * thinking has reason to distrust the turn it is being shown. The bound is applied before the fence
  * is built, so it is part of the pure answer rather than a second pass.
  */
-export function forgeOne(message, live, tag, maxChars = null) {
+export function forgeOne(message, live, tag, maxChars = null, tags = [tag]) {
 	if (message?.role !== "assistant") return null;
 	// Pi carries this message's CoT already, so the turn is left exactly as it is.
 	if (isSameModel(message, live)) return null;
@@ -115,8 +110,10 @@ export function forgeOne(message, live, tag, maxChars = null) {
 	}
 	const content = Array.isArray(message.content) ? message.content : [];
 	const lead = content.findIndex((block) => block?.type === "text");
-	// Already fenced, by us on an earlier request or by a pasted message: idempotent.
-	if (lead >= 0 && fenced(content[lead].text, tag)) return null;
+	// Already fenced, by us on an earlier request or by a pasted message: idempotent. Any tag the
+	// config names counts as a fence, so a turn this extension already fenced under another model's
+	// tag is not fenced a second time: two fences on one turn read as two reasoning traces.
+	if (lead >= 0 && fenced(content[lead].text, tags)) return null;
 	const fence = `<${tag}>\n${cot}\n</${tag}>`;
 	const next = content.slice();
 	if (lead >= 0) {
@@ -138,11 +135,11 @@ export function forgeOne(message, live, tag, maxChars = null) {
  * The whole message list, forged. Returns the input array itself when nothing changed, so a request
  * with nothing to refill allocates nothing and stays byte-identical.
  */
-export function forgeHistory(messages, live, tag, maxChars = null) {
+export function forgeHistory(messages, live, tag, maxChars = null, tags = [tag]) {
 	if (!Array.isArray(messages) || !live?.provider || !live?.id) return messages;
 	let changed = false;
 	const out = messages.map((message) => {
-		const forged = forgeOne(message, live, tag, maxChars);
+		const forged = forgeOne(message, live, tag, maxChars, tags);
 		if (!forged) return message;
 		changed = true;
 		return forged;

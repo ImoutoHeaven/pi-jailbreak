@@ -1,15 +1,26 @@
 /**
  * The rule table and the resolver.
  *
- * A session model matches at most one rule: the first one whose provider and model both match.
- * Both fields are optional, a missing field matches anything, and a pattern without `*` is exact.
- * `*` is the only wildcard, and every other regex metacharacter is escaped first, so a dot in a
- * model id stays a dot.
+ * The record has five slots and they are independent: `persona`, `gate`, `turns`, `forge` and
+ * `cotTag`. Nothing here says "this model is a leviathan" — a model is whatever its five slots
+ * resolve to. That is the whole point: a model can carry forge alone, or persona and gate with no
+ * turns, and no slot drags another along.
+ *
+ * Every slot resolves on its own, down the same three layers, and reports which layer answered:
+ *
+ *     session  ->  the first matching rule  ->  the file's `default`  ->  the built-in record
+ *
+ * The built-in record is false for all four switches, so an extension with nothing configured
+ * changes nothing. `cotTag` falls back to `think`.
+ *
+ * A rule matches by provider and model: both optional, a missing field matches anything, a pattern
+ * without `*` is exact, and `*` is the only wildcard. Every other regex metacharacter is escaped
+ * first, so a dot in a model id stays a dot. The first matching rule wins.
  *
  * The resolver is pure, so the check runs it as a table without a session.
  */
 
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -17,72 +28,104 @@ import { homedir } from "node:os";
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
 
 export const CONFIG_NAME = "leviathan.json";
+/** The two files that ship with the extension. A slot set to `true` names one of them. */
 export const DEFAULT_PROMPT = "prompt.md";
 export const DEFAULT_TURNS = "turn0.yml";
-export const MODES = Object.freeze(["leviathan", "normal"]);
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
-/** The tag that fences the cot at the head of the reply. `<think>` and `think` name the same tag. */
+/** The tag that fences the cot at the head of a fabricated or refilled turn. `think` and `<think>`
+ * are one tag. */
 export const DEFAULT_COT_TAG = "think";
-/**
- * How a message whose CoT pi drops is refilled. `auto` follows pi, which is the only setting that
- * keeps the two predicates complements; `off` refills nothing.
- */
-export const FORGE_MODES = Object.freeze(["auto", "off"]);
-export const DEFAULT_FORGE = "auto";
-/** The keys a config file and a rule carry. A file takes these and nothing else. */
-const CONFIG_KEYS = Object.freeze(["default", "inherit", "prompt", "turns", "cotTag", "forge", "forgeMaxChars", "rules"]);
-const RULE_KEYS = Object.freeze(["mode", "provider", "model", "prompt", "turns", "cotTag", "forge", "forgeMaxChars"]);
-const TAG_ERROR = "cotTag must be a tag name, such as think or <think>";
-const FORGE_ERROR = `forge must be ${FORGE_MODES.join(", ")}`;
-const FORGE_MAX_CHARS_ERROR = "forgeMaxChars must be a positive whole number, or null for no bound";
 
-/** The keys a session answer carries. `turns` is three-state, and the rest are single values. */
-export const SETTINGS_KEYS = Object.freeze(["prompt", "turns", "cotTag", "forge", "forgeMaxChars", "inherit"]);
+/** The slots, in the order the footer renders them. */
+export const SLOTS = Object.freeze(["persona", "gate", "turns", "forge", "cotTag"]);
+/** The four switches, which are what a footer glyph and a panel row report as on or off. */
+export const SWITCHES = Object.freeze(["persona", "gate", "turns", "forge"]);
+/** The slots a session answer may carry. `inherit` is the scope, not a slot. */
+export const SETTINGS_KEYS = Object.freeze([...SLOTS, "inherit"]);
+
+const CONFIG_KEYS = Object.freeze(["default", "inherit", "rules"]);
+const RULE_KEYS = Object.freeze(["provider", "model", ...SLOTS]);
+const TAG_ERROR = "cotTag must be a tag name, such as think or <think>";
+const HUMAN_ERROR = (slot) => `${slot} must be false, true, or a non-empty path`;
+const FORGE_ERROR = "forge must be false, true, or { maxChars: <positive whole number> | null }";
+const MAX_CHARS_ERROR = "maxChars must be a positive whole number, or null for no bound";
+
+/**
+ * The record a session uses when nothing is configured, and the tail of every resolution. All four
+ * switches are off: installing the extension and writing no config changes no request.
+ */
+export function emptyRecord() {
+	return { persona: false, gate: false, turns: false, forge: false, cotTag: DEFAULT_COT_TAG };
+}
 
 /** A tag name from either spelling, or null when the value is not one. A bracketed value has to be
  * exactly one tag, so a stray `>` or a second pair is rejected rather than trimmed away. */
-export function tagName(value) {
+function tagName(value) {
 	if (typeof value !== "string") return null;
 	const trimmed = value.trim();
 	const name = /^<([^<>]+)>$/.exec(trimmed)?.[1] ?? trimmed;
 	return /^[A-Za-z][A-Za-z0-9_-]*$/.test(name) ? name : null;
 }
 
-/** What a session uses when no config file loads. */
-export function emptyConfig(dir) {
-	return {
-		default: "normal",
-		inherit: "keyed",
-		prompt: DEFAULT_PROMPT,
-		turns: DEFAULT_TURNS,
-		cotTag: DEFAULT_COT_TAG,
-		forge: DEFAULT_FORGE,
-		// Nothing is cut unless a config asks for it: a truncated trace is not the reasoning the turn
-		// wrote, and a model reading a cut-off version of its own thinking has reason to distrust it.
-		forgeMaxChars: null,
-		rules: [],
-		dir,
-		path: null,
-	};
-}
-
-/** A forge mode from the config, or null when the value is not one. */
-export function forgeMode(value) {
-	const wanted = typeof value === "string" ? value.toLowerCase() : value;
-	return FORGE_MODES.includes(wanted) ? wanted : null;
-}
-
-/** A character bound for the refilled CoT as `{ chars }`, where `chars: null` is no bound at all.
- * `null` is the only value outside the bound, and a value that is neither is rejected rather than
- * read as one of the two. */
-export function forgeChars(value) {
-	if (value === null) return { chars: null };
-	return Number.isSafeInteger(value) && value > 0 ? { chars: value } : null;
+/** A character bound as `{ maxChars }`, where `null` is no bound at all. `null` is the only value
+ * outside the bound, and a value that is neither is rejected rather than read as one of the two. */
+function charBound(value) {
+	if (value === null) return { bound: { maxChars: null } };
+	return Number.isSafeInteger(value) && value > 0 ? { bound: { maxChars: value } } : null;
 }
 
 /**
- * The file a session reads. It sits in the agent directory: a persona is a property of the
- * session, and a repository copy would decide what the model gets for everyone who opens it.
+ * One path slot as the spec it names, or null when the value is not one. `true` means the file that
+ * ships with the extension, so a config written on one machine reads the same on another.
+ */
+function pathSlot(value, shipped) {
+	if (value === false) return { spec: false };
+	if (value === true) return { spec: shipped };
+	if (typeof value === "string" && value.trim() !== "") return { spec: value };
+	return null;
+}
+
+/** One switch that takes no argument. */
+function plainSlot(value) {
+	return value === false || value === true ? { spec: value } : null;
+}
+
+/** The forge slot: off, on with no bound, or on with a bound. */
+function forgeSlot(value) {
+	if (value === false) return { spec: false };
+	if (value === true) return { spec: { maxChars: null } };
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	for (const key of Object.keys(value)) {
+		if (key !== "maxChars") return null;
+	}
+	if (!("maxChars" in value)) return null;
+	const read = charBound(value.maxChars);
+	return read ? { spec: read.bound } : null;
+}
+
+/**
+ * One slot from a value, or the reason it is not one. Every slot rejects what it cannot read, so a
+ * typo is never quietly read as "off".
+ */
+function slotSpec(slot, value) {
+	if (slot === "persona") return pathSlot(value, DEFAULT_PROMPT);
+	if (slot === "turns") return pathSlot(value, DEFAULT_TURNS);
+	if (slot === "gate") return plainSlot(value);
+	if (slot === "forge") return forgeSlot(value);
+	const tag = tagName(value);
+	return tag ? { spec: tag } : null;
+}
+
+/** A slot's error message, which names the slot and what it takes. */
+function slotError(slot) {
+	if (slot === "forge") return FORGE_ERROR;
+	if (slot === "cotTag") return TAG_ERROR;
+	return HUMAN_ERROR(slot);
+}
+
+/**
+ * The file a session reads. It sits in the agent directory: what a model does is a property of the
+ * session, and a repository copy would decide it for everyone who opens the file.
  */
 export function configPath(env = process.env, home = homedir()) {
 	if (env?.PI_LEVIATHAN_CONFIG) return env.PI_LEVIATHAN_CONFIG;
@@ -100,38 +143,42 @@ export function globMatch(pattern, value) {
 }
 
 /**
- * The absolute path a rule's prompt names. `prompt.md` is the text that ships with the extension,
- * so a config anywhere resolves it to the package copy; every other relative path sits next to
- * the config file.
+ * The absolute path a `persona` spec names. The shipped name resolves to the package copy wherever
+ * the config sits; every other relative path sits next to the config file.
  */
-export function promptPath(config, prompt) {
-	if (isAbsolute(prompt)) return prompt;
-	if (prompt === DEFAULT_PROMPT) return join(PACKAGE_DIR, prompt);
-	return join(config.dir, prompt);
+export function promptPath(config, spec) {
+	if (isAbsolute(spec)) return spec;
+	if (spec === DEFAULT_PROMPT) return join(PACKAGE_DIR, spec);
+	return join(config.dir, spec);
 }
 
-/**
- * The absolute path a `turns` value names. `turn0.yml` is the text that ships with the extension, so
- * a config anywhere resolves it to the package copy; every other relative path sits next to the
- * config file.
- */
-export function turnsPath(config, turns) {
-	if (isAbsolute(turns)) return turns;
-	if (turns === DEFAULT_TURNS) return join(PACKAGE_DIR, turns);
-	return join(config.dir, turns);
+/** The absolute path a `turns` spec names, resolved the same way. */
+export function turnsPath(config, spec) {
+	if (isAbsolute(spec)) return spec;
+	if (spec === DEFAULT_TURNS) return join(PACKAGE_DIR, spec);
+	return join(config.dir, spec);
 }
 
-/**
- * A `turns` value is three-state: absent takes the shipped file, `null` turns injection off, a
- * string names a file. Every other type rejects the file whole, so a typo never reads as "off".
- */
-function turnsValue(value) {
-	return value === null || (typeof value === "string" && value !== "");
+/** One record from a parsed object, or the reason it is not one. Absent slots stay absent. */
+function readRecord(value, keys, at) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return { error: `${at} is not an object` };
+	const prefix = at === "default" ? "default: " : `${at}: `;
+	for (const key of Object.keys(value)) {
+		if (!keys.includes(key)) return { error: `${prefix}${key} is not one of ${keys.join(", ")}` };
+	}
+	const record = {};
+	for (const slot of SLOTS) {
+		if (value[slot] === undefined) continue;
+		const read = slotSpec(slot, value[slot]);
+		if (!read) return { error: `${prefix}${slotError(slot)}` };
+		record[slot] = read.spec;
+	}
+	return { record };
 }
 
 /**
  * Parse and validate one file. A file with a single bad value is rejected whole: a table that
- * silently dropped the entry it could not read would answer with a rule the user did not write.
+ * silently dropped what it could not read would answer with a record nobody wrote.
  */
 export function parseConfig(text, dir) {
 	let data;
@@ -142,28 +189,15 @@ export function parseConfig(text, dir) {
 	}
 	if (!data || typeof data !== "object" || Array.isArray(data)) return { error: "not an object" };
 	for (const key of Object.keys(data)) {
-		if (!CONFIG_KEYS.includes(key)) return { error: `${key} is not a config key (${CONFIG_KEYS.join(", ")})` };
+		if (!CONFIG_KEYS.includes(key)) {
+			const hint = key === "mode" || key === "prompt" || key === "forgeMaxChars" ? " (the record has persona, gate, turns, forge and cotTag)" : "";
+			return { error: `${key} is not a config key (${CONFIG_KEYS.join(", ")})${hint}` };
+		}
 	}
-	const mode = data.default ?? "normal";
-	if (!MODES.includes(mode)) return { error: `default must be ${MODES.join(" or ")}` };
 	const inherit = data.inherit ?? "keyed";
 	if (!INHERITS.includes(inherit)) return { error: `inherit must be ${INHERITS.join(", ")}` };
-	const prompt = data.prompt ?? DEFAULT_PROMPT;
-	if (typeof prompt !== "string" || !prompt) return { error: "prompt must be a non-empty string" };
-	// Absent takes the file that ships with the package: the fabricated conversation is on unless a
-	// config turns it off with `null`.
-	const turns = data.turns === undefined ? DEFAULT_TURNS : data.turns;
-	if (!turnsValue(turns)) return { error: "turns must be a non-empty string or null" };
-	// The tag names the fence the fabricated cot is written in, and either spelling of it is the
-	// same tag.
-	const cotTag = data.cotTag === undefined ? DEFAULT_COT_TAG : tagName(data.cotTag);
-	if (!cotTag) return { error: TAG_ERROR };
-	// A missing value follows pi; a value outside the set rejects the file whole, so a typo never
-	// reads as `auto` and silently changes what a request carries.
-	const forge = data.forge === undefined ? DEFAULT_FORGE : forgeMode(data.forge);
-	if (!forge) return { error: FORGE_ERROR };
-	const forgeMaxChars = data.forgeMaxChars === undefined ? { chars: null } : forgeChars(data.forgeMaxChars);
-	if (!forgeMaxChars) return { error: FORGE_MAX_CHARS_ERROR };
+	const fallback = readRecord(data.default ?? {}, ["persona", "gate", "turns", "forge", "cotTag"], "default");
+	if (fallback.error) return { error: fallback.error };
 	const rules = data.rules ?? [];
 	if (!Array.isArray(rules)) return { error: "rules must be an array" };
 	const out = [];
@@ -171,64 +205,79 @@ export function parseConfig(text, dir) {
 		const at = `rule ${index + 1}`;
 		if (!rule || typeof rule !== "object" || Array.isArray(rule)) return { error: `${at} is not an object` };
 		for (const key of Object.keys(rule)) {
-			if (!RULE_KEYS.includes(key)) return { error: `${at}: ${key} is not a rule key (${RULE_KEYS.join(", ")})` };
+			if (!RULE_KEYS.includes(key)) return { error: `${at}: ${key} is not one of ${RULE_KEYS.join(", ")}` };
 		}
-		if (!MODES.includes(rule.mode)) return { error: `${at} needs mode: ${MODES.join(" or ")}` };
-		for (const field of ["provider", "model", "prompt"]) {
+		for (const field of ["provider", "model"]) {
 			if (rule[field] === undefined) continue;
 			if (typeof rule[field] !== "string" || !rule[field]) return { error: `${at}: ${field} must be a non-empty string` };
 		}
-		// A rule keeps `undefined` apart from `null`: the first inherits the config-level value, the
-		// second turns injection off even when the config names a file.
-		if (rule.turns !== undefined && !turnsValue(rule.turns)) return { error: `${at}: turns must be a non-empty string or null` };
-		const ruleTag = rule.cotTag === undefined ? undefined : tagName(rule.cotTag);
-		if (rule.cotTag !== undefined && !ruleTag) return { error: `${at}: ${TAG_ERROR}` };
-		const ruleForge = rule.forge === undefined ? undefined : forgeMode(rule.forge);
-		if (rule.forge !== undefined && !ruleForge) return { error: `${at}: ${FORGE_ERROR}` };
-		const ruleForgeChars = rule.forgeMaxChars === undefined ? undefined : forgeChars(rule.forgeMaxChars);
-		if (rule.forgeMaxChars !== undefined && !ruleForgeChars) return { error: `${at}: ${FORGE_MAX_CHARS_ERROR}` };
-		out.push({
-			mode: rule.mode,
-			provider: rule.provider,
-			model: rule.model,
-			prompt: rule.prompt,
-			turns: rule.turns,
-			cotTag: ruleTag,
-			forge: ruleForge,
-			forgeMaxChars: ruleForgeChars?.chars,
-		});
+		const read = readRecord(rule, RULE_KEYS, at);
+		if (read.error) return { error: read.error };
+		out.push({ provider: rule.provider, model: rule.model, ...read.record });
 	}
-	return { config: { default: mode, inherit, prompt, turns, cotTag, forge, forgeMaxChars: forgeMaxChars.chars, rules: out, dir, path: null } };
+	return { config: { default: fallback.record, inherit, rules: out, dir, path: null } };
 }
 
-/** The first rule that matches, or the default. `ruleIndex` is -1 for the default. */
-export function resolve(config, model) {
+/** What no config file gives a session. */
+export function emptyConfig(dir) {
+	return { default: {}, inherit: "keyed", rules: [], dir, path: null };
+}
+
+/** The layer a slot's value came from, in the order `resolve` tries them. */
+const LAYERS = Object.freeze(["session", "rule", "default", "builtin"]);
+
+/**
+ * Every tag the config names, plus the built-in one. `forge` and `turns` both write a fence, and a
+ * turn fenced under one tag must be recognised as fenced by a model configured with another, so the
+ * set travels together with the resolved tag.
+ */
+export function configTags(config) {
+	const tags = new Set([DEFAULT_COT_TAG]);
+	if (config?.default?.cotTag) tags.add(config.default.cotTag);
+	for (const rule of config?.rules ?? []) {
+		if (rule.cotTag) tags.add(rule.cotTag);
+	}
+	return tags;
+}
+
+/**
+ * One model's record, every slot resolved on its own, with the layer that answered for each. The
+ * built-in record closes the chain, so every slot always has a value and a source.
+ *
+ * `session` is the settings of a session answer that governs this model; a slot it names wins over
+ * every file layer, and one it does not name leaves the file in charge.
+ */
+export function resolve(config, model, session = {}) {
 	const provider = String(model?.provider ?? "");
 	const id = String(model?.id ?? "");
-	for (let ruleIndex = 0; ruleIndex < config.rules.length; ruleIndex++) {
-		const rule = config.rules[ruleIndex];
-		if (rule.provider !== undefined && !globMatch(rule.provider, provider)) continue;
-		if (rule.model !== undefined && !globMatch(rule.model, id)) continue;
-		return {
-			mode: rule.mode,
-			prompt: rule.prompt ?? config.prompt,
-			turns: rule.turns === undefined ? config.turns : rule.turns,
-			cotTag: rule.cotTag ?? config.cotTag,
-			forge: rule.forge ?? config.forge,
-			// `null` is a value here, not an absence: a rule turns the bound off by naming it.
-			forgeMaxChars: rule.forgeMaxChars === undefined ? config.forgeMaxChars : rule.forgeMaxChars,
-			ruleIndex,
-		};
+	let ruleIndex = -1;
+	let rule = null;
+	for (let i = 0; i < config.rules.length; i++) {
+		const candidate = config.rules[i];
+		if (candidate.provider !== undefined && !globMatch(candidate.provider, provider)) continue;
+		if (candidate.model !== undefined && !globMatch(candidate.model, id)) continue;
+		ruleIndex = i;
+		rule = candidate;
+		break;
 	}
-	return {
-		mode: config.default,
-		prompt: config.prompt,
-		turns: config.turns,
-		cotTag: config.cotTag,
-		forge: config.forge,
-		forgeMaxChars: config.forgeMaxChars,
-		ruleIndex: -1,
+	const layers = {
+		session: session ?? {},
+		rule: rule ?? {},
+		default: config.default ?? {},
+		builtin: emptyRecord(),
 	};
+	const record = { ruleIndex, rule, sources: {} };
+	for (const slot of SLOTS) {
+		for (const layer of LAYERS) {
+			const value = layers[layer][slot];
+			if (value === undefined) continue;
+			record[slot] = value;
+			record.sources[slot] = layer;
+			break;
+		}
+	}
+	record.inherit = session?.inherit ?? config.inherit;
+	return record;
 }
 
 /** A path a session setting names. A typed path means the session's cwd, and an absolute one stays. */
@@ -236,48 +285,31 @@ function absolutePath(value) {
 	return isAbsolute(value) ? value : resolvePath(process.cwd(), value);
 }
 
-/** One key's value, or the reason it is not one. `undefined` removes the key. */
+/**
+ * One session setting from a typed or stored value. `undefined` removes the slot, so the file
+ * decides again. A path slot accepts a path, and a path that is not absolute is taken from the
+ * session's cwd, because a command line names what the user can see.
+ */
 function settingValue(key, value) {
 	if (value === undefined) return { value: undefined };
-	if (key === "prompt") {
-		if (typeof value !== "string" || !value.trim()) return { error: "prompt must be a non-empty path" };
-		return { value: absolutePath(value.trim()) };
-	}
-	if (key === "turns") {
-		if (value === null) return { value: null };
-		if (typeof value !== "string" || !value.trim()) return { error: "turns must be a non-empty path or null" };
-		return { value: absolutePath(value.trim()) };
-	}
-	if (key === "cotTag") {
-		const tag = tagName(value);
-		if (!tag) return { error: TAG_ERROR };
-		return { value: tag };
-	}
-	if (key === "forge") {
-		const mode = forgeMode(value);
-		if (!mode) return { error: FORGE_ERROR };
-		return { value: mode };
-	}
-	if (key === "forgeMaxChars") {
-		// A command line carries text, so a numeric string is read as the number it spells, and the
-		// two words for no bound are read as the absence of one.
-		const lower = typeof value === "string" ? value.trim().toLowerCase() : value;
-		const bound = lower === "none" || lower === "null" ? { chars: null } : forgeChars(typeof lower === "string" ? Number(lower) : lower);
-		if (!bound) return { error: FORGE_MAX_CHARS_ERROR };
-		return { value: bound.chars };
-	}
 	if (key === "inherit") {
 		const wanted = typeof value === "string" ? value.toLowerCase() : value;
 		if (!INHERITS.includes(wanted)) return { error: `inherit must be ${INHERITS.join(", ")}` };
 		return { value: wanted };
 	}
-	// A key the list above does not name has no value, so a key added to `SETTINGS_KEYS` without a
-	// branch here is rejected instead of validating as something it is not.
-	return { error: `unknown setting: ${key}` };
+	if (key === "persona" || key === "turns") {
+		if (value === false) return { value: false };
+		if (value === true) return { value: key === "persona" ? DEFAULT_PROMPT : DEFAULT_TURNS };
+		if (typeof value !== "string" || !value.trim()) return { error: `a ${key} path must be non-empty` };
+		return { value: absolutePath(value.trim()) };
+	}
+	const read = slotSpec(key, value);
+	if (!read) return { error: slotError(key) };
+	return { value: read.spec };
 }
 
 /**
- * A whole settings object, as the channel and the process answer carry it. Every key is checked and
+ * A whole settings object, as the channel and the process answer carry it. Every slot is checked and
  * every path normalized, so a value written by one side names the same file on the other. Rejection
  * is whole: a half-applied answer would publish a decision nobody wrote.
  */
@@ -293,53 +325,77 @@ export function sessionSettings(value) {
 	return { settings: out };
 }
 
+/** The two words a command may use for a slot's off and on state. */
+const OFF = new Set(["off", "false", "no"]);
+const ON = new Set(["on", "true", "yes"]);
+
 /**
- * One assignment from the command. `default` removes the key, `off`/`none`/`null` turn injection
- * off, and any other value is a path, so a file literally named `off` is `./off`.
+ * One assignment from the command, or the reason it is not one. `default` removes the slot, `off`
+ * and `on` are the two switch values, and anything else is a path or a tag.
  *
- * The command lowercases only the verb, so the two camel-cased keys arrive lowercased and are matched
- * here: `cotTag` as `cottag`, `forgeMaxChars` as `forgemaxchars`.
+ * The command lowercases only the verb, so a camel-cased slot arrives lowercased. `forge` also takes
+ * `maxChars <n>` and `maxChars none`, which set the bound and turn the slot on.
  */
 export function settingFromCommand(name, value) {
 	const lower = String(name ?? "").toLowerCase();
-	const key = lower === "cottag" ? "cotTag" : lower === "forgemaxchars" ? "forgeMaxChars" : lower;
+	const key = lower === "cottag" ? "cotTag" : lower;
 	if (!SETTINGS_KEYS.includes(key)) return { error: `unknown setting: ${name}` };
 	const text = String(value ?? "").trim();
 	const keyword = text.toLowerCase();
 	if (keyword === "default") return { key, value: undefined };
-	if (key === "turns" && (keyword === "off" || keyword === "none" || keyword === "null")) return { key, value: null };
-	// `forge off` names the mode `off`, so the injection keywords above stay turns-only.
 	if (!text) return { error: `${key} needs a value` };
+	if (key === "cotTag") {
+		const read = settingValue("cotTag", text);
+		return read.error ? { error: read.error } : { key, value: read.value };
+	}
+	if (key === "inherit") {
+		const read = settingValue("inherit", text);
+		return read.error ? { error: read.error } : { key, value: read.value };
+	}
+	if (OFF.has(keyword)) return { key, value: false };
+	if (ON.has(keyword)) {
+		if (key === "persona") return { key, value: DEFAULT_PROMPT };
+		if (key === "turns") return { key, value: DEFAULT_TURNS };
+		// `forge on` is the slot with no bound: the bound is a value, and no bound is a value too.
+		if (key === "forge") return { key, value: { maxChars: null } };
+		return { key, value: true };
+	}
+	// `forge maxChars 1200` and `forge maxChars none` name the bound and turn the slot on with it.
+	if (key === "forge" && keyword.startsWith("maxchars")) {
+		const argument = keyword.slice("maxchars".length).trim();
+		const bound = argument === "none" || argument === "null" ? { bound: { maxChars: null } } : charBound(Number(argument));
+		if (!bound) return { error: MAX_CHARS_ERROR };
+		return { key, value: bound.bound };
+	}
 	const read = settingValue(key, text);
-	if (read.error) return { error: read.error };
-	return { key, value: read.value };
+	return read.error ? { error: read.error } : { key, value: read.value };
 }
 
 /**
- * Read once per file revision: the prompt and the table are read at run start, not per request.
- * A file that does not load is reported and the empty config takes over.
+ * Read once per revision: the table is read at run start, not per request. A file that does not
+ * load is reported and the built-in record takes over, which changes nothing.
+ *
+ * The revision is the bytes, not the stat. Two writes inside one timestamp tick share an `mtimeMs`,
+ * and two spellings of one shape share a `size` (`{"gate":true}` and `{"turns":true}` are the same
+ * width), so a stat-keyed cache hands back the record of a file that is no longer there. The text is
+ * already being read; comparing it costs nothing the stat was saving.
  */
 const cache = new Map();
 
 export function loadConfig(path, fallbackDir) {
-	let stat;
+	let text;
 	try {
-		stat = statSync(path);
-	} catch {
+		text = readFileSync(path, "utf8");
+	} catch (readError) {
 		return { config: emptyConfig(fallbackDir) };
 	}
 	const hit = cache.get(path);
-	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) {
+	if (hit && hit.text === text) {
 		if (hit.config) return { config: { ...hit.config, path } };
 		return { config: emptyConfig(fallbackDir), error: `${path}: ${hit.error}` };
 	}
-	let parsed;
-	try {
-		parsed = parseConfig(readFileSync(path, "utf8"), dirname(path));
-	} catch (readError) {
-		parsed = { error: readError.message };
-	}
-	cache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, config: parsed.config, error: parsed.error });
+	const parsed = parseConfig(text, dirname(path));
+	cache.set(path, { text, config: parsed.config, error: parsed.error });
 	if (parsed.config) return { config: { ...parsed.config, path } };
 	return { config: emptyConfig(fallbackDir), error: `${path}: ${parsed.error}` };
 }

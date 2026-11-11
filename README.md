@@ -1,10 +1,13 @@
 # pi-leviathan
 
-A Pi extension that puts the text of `prompt.md` at the head of the system prompt for the sessions a
-rule selects, splices a fabricated conversation ahead of the first real user message for the
-sessions a turn file selects, and declares the `ask_authorize_gate` tool while that text is in force.
+A Pi extension with five independent slots per model: `persona` puts text at the head of the system
+prompt, `gate` declares the `ask_authorize_gate` tool, `turns` splices a fabricated conversation
+ahead of the first real user message, `forge` refills the reasoning Pi drops for a turn another model
+wrote, and `cotTag` names the fence both writers use.
 
-The extension ships no rules. Nothing is injected until a config file names the model.
+The slots are orthogonal. A model can carry `forge` alone, or `persona` and `gate` with no `turns`,
+and no slot drags another along. Every slot is off until a config file or a command turns it on:
+installing the extension changes nothing.
 
 ## Install
 
@@ -20,90 +23,82 @@ pi install /path/to/pi-leviathan
 
 `pi -e ./index.ts` loads it for one run. The extension reads its own directory, so `prompt.md`,
 `config.js`, `channel.js`, `gate.js`, `turns.js`, `forge.js` and `commands.ts` travel with
-`index.ts`. A missing `yaml` package disables the fabricated conversation and leaves the prompt text
-in force.
+`index.ts`. A missing `yaml` package disables `turns` and leaves every other slot working.
 
 ## Configure
 
 The session reads `$PI_LEVIATHAN_CONFIG` when it is set, and otherwise `leviathan.json` in pi's
 agent directory. That directory is `$PI_CODING_AGENT_DIR` when that is set, and `~/.pi/agent`
-otherwise. When no file loads, the empty config applies: `default: "normal"` and no rules.
+otherwise. When no file loads, every slot falls through to the built-in record: four switches off
+and `cotTag` set to `think`.
 
 Start from `leviathan.example.json`:
 
 ```json
 {
-	"default": "normal",
+	"default": { "persona": false, "gate": false, "turns": false, "forge": false },
 	"inherit": "keyed",
-	"prompt": "prompt.md",
-	"forge": "auto",
 	"rules": [
-		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "leviathan" },
-		{ "provider": "deepseek", "mode": "leviathan" },
-		{ "model": "*deepseek*", "mode": "leviathan" }
+		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "persona": true, "gate": true, "turns": true, "forge": true },
+		{ "provider": "deepseek", "persona": true, "gate": true },
+		{ "model": "*deepseek*", "persona": true, "forge": { "maxChars": 1200 }, "cotTag": "analysis" }
 	]
 }
 ```
 
-A model takes the first rule whose `provider` and `model` both match. A missing field matches
-anything. A pattern without `*` is exact, `*` matches any run of characters, and matching ignores
-case. `mode` is `leviathan` or `normal`. `prompt.md` is the text that ships with the extension; any
-other `prompt` path is relative to the config file. A file with one bad value is rejected whole and
-reported once, and the empty config applies instead. A key the extension does not take is one of
-those values, so a typo or a key from another version fails loudly instead of being ignored.
+A config takes three keys: `default` (a record), `inherit` (the scope), and `rules`. A rule adds
+`provider` and `model` to a record. A model takes the first rule whose `provider` and `model` both
+match; a missing field matches anything, a pattern without `*` is exact, `*` matches any run of
+characters, and matching ignores case.
 
-`turns` names the YAML file whose messages are spliced ahead of the first real user message. It has
-three states: absent takes `turn0.yml`, the file that ships with the extension, `null` turns the
-block off, and a string names another file. A rule's own value wins over the config-level one, and a
-rule that sets `null` keeps it off even when the config names a file. `turn0.yml` resolves to the
-package copy wherever the config lives; every other relative path resolves against the directory
-holding the config file.
+A file with one bad value is rejected whole and reported once, and the built-in record applies
+instead. A key the extension does not take is one of those values, so a typo or a key from another
+version fails loudly instead of being ignored.
 
-```json
-{
-	"turns": "team/turn0.yml",
-	"rules": [{ "provider": "deepseek", "mode": "leviathan", "turns": null }]
-}
+### The five slots
+
+| Slot | Values | What it does |
+|---|---|---|
+| `persona` | `false`, `true`, or a path | Places that text at the head of the system prompt. `true` names `prompt.md`, which ships with the extension; any other path resolves against the directory holding the config file |
+| `gate` | `false` or `true` | Declares `ask_authorize_gate` while the slot is on |
+| `turns` | `false`, `true`, or a path | Splices that YAML file ahead of the first real user message. `true` names `turn0.yml`, which ships with the extension |
+| `forge` | `false`, `true`, or `{ "maxChars": n }` | Refills a foreign turn's cot when the request targets this model. `true` is no bound; `maxChars` cuts the trace |
+| `cotTag` | a tag name | The fence both writers use. `think` and `<think>` are one tag |
+
+Each slot resolves on its own, down the same layers, and reports which layer answered:
+
+```
+session  ->  the first matching rule  ->  the file's default  ->  the built-in record
 ```
 
-`cotTag` names the tag the fabricated cot is fenced in at the head of the assistant reply. It
-defaults to `think`, and either spelling of one tag is the same tag: `think` and `<think>` both
-write `<think>` and `</think>`. A rule's own value wins over the config-level one.
+So a rule that names only `gate` leaves the other four to the layers below it, and changing
+`default.forge` moves nothing else.
 
-```json
-{
-	"cotTag": "think",
-	"rules": [{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "leviathan", "cotTag": "reasoning" }]
-}
-```
+### forge
 
-`forge` decides what a request carries for an assistant turn another model wrote. Pi drops that
-turn's thinking block whenever the request targets a different model, which leaves the conversation
-reading as if the reasoning had never happened. `auto`, the default, refills a turn exactly when pi
-drops it: the turn's own cot goes back in, fenced in `cotTag`, and the turn keeps the model stamp
-that says it came from elsewhere. `off` refills nothing. The mode has no third state: whether a turn
-is refilled is pi's answer to give, and a switch that refills a turn pi carries would put two
-reasoning traces in one turn.
+Pi drops an assistant turn's thinking block whenever the request targets a different model than the
+one that wrote it, which leaves the conversation reading as if the reasoning had never happened.
+`forge` puts that reasoning back as fenced text in the turn's own reply, so the turn keeps the model
+stamp that says it came from elsewhere and no turn ever shows two reasoning traces. The destination
+model's record decides: switching to a model whose `forge` is off refills nothing, and the model
+being left behind has no say.
 
-```json
-{
-	"forge": "auto",
-	"forgeMaxChars": null,
-	"rules": [{ "provider": "CLIProxy-Chat", "mode": "leviathan", "forgeMaxChars": 1200 }]
-}
-```
-
-`forgeMaxChars` bounds the refilled cot and defaults to no bound. A trace is cut only when a config
-asks for it, because a truncated trace is not the reasoning the turn wrote, and a model shown a
-cut-off version of its own thinking has a reason to distrust the turn. A cut that was backed off to
-keep a character whole and so reached the end of a short trace states no truncation: the marker is
-written only when something was actually dropped. The value is a positive whole number or `null`.
-Both keys sit at the config level and on a rule, and a rule's own value wins: a rule names `null` to
-lift a bound the config sets.
+`forge` has no bound unless a config asks for one. A truncated trace is not the reasoning the turn
+wrote, and a model shown a cut-off version of its own thinking has a reason to distrust the turn. A
+cut that was backed off to keep a character whole and so reached the end of a short trace states no
+truncation: the marker is written only when something was actually dropped.
 
 The refill is a pure function of the message's own bytes, so a grown conversation keeps every
 already-sent position byte-identical: switching a model costs one cache miss, and the turns after it
 stay on the same prefix.
+
+### cotTag
+
+`cotTag` fences both `turns` and `forge`, and it is per model. Every tag the file names travels with
+the record, so a turn already fenced under one model's tag counts as fenced for a model configured
+with another: no turn is ever fenced twice.
+
+### inherit
 
 `inherit` decides what a session hands to the processes it starts: `keyed` (the same model only),
 `tree` (every model, in this process and in the ones it starts), or `none` (nothing, and inherited
@@ -112,74 +107,68 @@ values are dropped).
 ## Precedence
 
 ```
-session setting   >   config rule   >   config level   >   default
-/leviathan on|off >   inherited value   >   the config-resolved answer
+session slot  >  config rule  >  config default  >  built-in record
 ```
-
-The two lines are orthogonal: the settings decide what an active session sends, and `on`/`off`
-decide whether that answer is in force at all. `off` keeps the settings stored and inert, and
-`reset` drops both.
 
 An answer lasts as long as the process, including `/new` and `/reload`, until `/leviathan reset`.
 Nothing is written to disk unless `remember` asks for it. Each loaded instance keeps its own answer,
 decision, delivery record and gate activation, so two sessions in one process do not share them, and
-the mode the process set is what a new instance reads. A model switch keeps the settings stored
-without applying them until the next command re-keys the answer to the live model, mode included.
-Under an effective
-`tree`, the first command creates the answer every model in the tree shares, so its mode is the one
-the live model resolves at that moment.
+the answers the process set are what a new instance reads. A model switch keeps the slots stored
+without applying them until the next command re-keys the answer to the live model. Under an effective
+`tree`, the first command creates the answer every model in the tree shares.
 
 ## Commands
 
 | Command | Effect |
 |---|---|
-| `/leviathan` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the session settings it carries, the prompt file, the turn file, the refill mode and its bound, the config file, and the inherited value if there is one |
-| `/leviathan on` / `off` / `toggle` | Set the mode for this session, keeping its settings |
-| `/leviathan reset` | Drop the session answer and its settings, so the config decides again |
-| `/leviathan prompt <path>` / `prompt default` | Point the session at another prompt file, or back at the config |
-| `/leviathan turns <path>` / `turns off` / `turns default` | Inject another turn file, turn the block off, or take the config value. `./off` names a file literally called `off` |
-| `/leviathan cotTag <tag>` / `cotTag default` | The tag that fences the fabricated cot; `think` and `<think>` are one tag |
-| `/leviathan forge auto\|off` / `forge default` | What a request refills for an assistant turn another model wrote |
-| `/leviathan forgeMaxChars <n>` / `forgeMaxChars none` / `forgeMaxChars default` | The bound on a refilled cot; `none` leaves it whole, and no bound is the default |
-| `/leviathan inherit keyed\|tree\|none` / `inherit default` | What this session hands to the processes it starts |
-| `/leviathan remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, carry the session setting or else the file that model already resolves to, and apply it now |
+| `/leviathan` | Every slot with its value and the layer that answered, the model, the config file, the inherited value, and a table of every rule in the file including the ones an earlier rule makes unreachable |
+| `/leviathan persona on\|off\|<path>\|default` | Place that text, the shipped `prompt.md`, or nothing; `default` drops the session slot |
+| `/leviathan gate on\|off\|default` | Declare the gate tool or withdraw it |
+| `/leviathan turns on\|off\|<path>\|default` | Splice the shipped file, another file, or nothing |
+| `/leviathan forge on\|off\|maxChars <n>\|maxChars none\|default` | Refill with no bound, with a bound, or not at all |
+| `/leviathan cotTag <tag>\|default` | The fence both writers use |
+| `/leviathan inherit keyed\|tree\|none` | What this session hands to the processes it starts |
+| `/leviathan remember` | Write this model's whole record as a rule and apply it |
+| `/leviathan reset` | Drop the session answer, so the config decides again |
 
-The footer shows `Leviathan on` while the text is in force, `Leviathan off` while the mode is normal,
-and `Leviathan !` when the mode is leviathan and the request carried nothing: the prompt file is
-missing or empty, the transcript has nowhere to put the text, the configured turn file did not load,
-or another extension replaced the system prompt. The third state follows the request that was
-actually sent, so a run whose text cannot be placed says so at once instead of showing on.
+`remember` writes all five slots as one complete rule, `false` included, so the file answers for that
+model without being read against its `default` afterwards. The spelling is preserved rather than the
+resolved value: a slot that said `true` keeps saying `true`, and a relative path keeps being
+relative, because writing today's absolute path would tie the record to one machine. The rule goes to
+the front, in front of any wildcard that would shadow it, and a second run leaves the file
+byte-identical.
+
+The footer names the switches that are on, in a fixed order, and nothing else: 🎭 `persona`,
+🛡️ `gate`, 💬 `turns`, ⚒️ `forge`. `Leviathan 🎭🛡️💬⚒️` is all four; `Leviathan ⚒️` is forge alone;
+`Leviathan` is none. A `!` follows when a switch that is on did not reach the request: the persona
+file is missing or empty, the transcript has nowhere to put the text, the configured turn file did
+not load, or another extension replaced the system prompt.
 
 ## Subagents
 
 A subagent is a Pi process launched with the parent's environment, so the parent writes its answer
 into `PI_LEVIATHAN` and the child reads it. Neither extension knows the other exists.
 
-The value is JSON: `{"m":"on","k":"CLIProxy-Chat/glm-5.3","p":1234}`, and an answer that carries
-session settings adds `"s"`, for example `"s":{"prompt":"/abs/alt.md","turns":null}`. `m` is the
-mode, `k` is the model key or `*`, `p` is the publisher pid, and `s` is the settings, absent when
-there are none. A malformed `s` rejects the whole payload, so a child resolves from the config rather
-than from half an answer. A child accepts it when `p` is its parent or itself, and
-rewrites it with its own pid so the next level reads the same answer, and narrows a `*` key to its
-own model once the config asks for `keyed`. Any other value, including one
-exported from a shell, is discarded and replaced.
-
-`k` matching is what `inherit: keyed` produces. A child on the same model inherits; a child on
-another model resolves from the config. `tree` publishes `*` instead, and `none` publishes nothing
-and ignores what it receives.
+The value is JSON: `{"k":"CLIProxy-Chat/glm-5.3","p":1234}`, and an answer that carries session slots
+adds `"s"`, for example `"s":{"persona":"/abs/alt.md","turns":false,"forge":{"maxChars":1200}}`. `k`
+is the model key or `*`, `p` is the publisher pid, and `s` is the slots, absent when there are none.
+A malformed `s` rejects the whole payload, so a child resolves from the config rather than from half
+an answer. A child accepts it when `p` is its parent or itself, and rewrites it with its own pid so
+the next level reads the same answer, and narrows a `*` key to its own model once the config asks for
+`keyed`. Any other value, including one exported from a shell, is discarded and replaced.
 
 A spawner that builds a fresh environment cuts the channel, and the child resolves from the config.
 So does a wrapper that puts a shell between the two: only a direct child keeps the channel. Several
-sessions in one process (an SDK host) share one environment, so the last session to set a mode wins
+sessions in one process (an SDK host) share one environment, so the last session to set a slot wins
 for the processes it starts.
 
-## How the text reaches the request
+## How the persona reaches the request
 
 The text arrives as the head of the leading system message's `content`. A section would render as
 `<name>`, its content and `</name>`, which names the block and leaves a marker the model can point
 at. The `context_with_system` guard places the raw text, with no wrapper, ahead of every section. Pi
-renders that content first, so the order on a request is: `prompt.md` text, tools, rules, docs,
-project context, skills, working directory, MCP servers.
+renders that content first, so the order on a request is: the text, tools, rules, docs, project
+context, skills, working directory, MCP servers.
 
 The leading system message is the first system message in the transcript. An entry written before the
 first run, such as the `bashExecution` record of a `!command`, sits ahead of the prompt patch Pi
@@ -191,25 +180,31 @@ While the text is in force pi's stock identity sentence is withheld: the same gu
 `preamble` section from every system message whose value is one of the stock sentences Pi ships,
 because that sentence contradicts the persona at the front of the same prompt. Pi reworded it in
 1.5.0, so both are known: the 169-character sentence of 1.3.0 through 1.4.0 and the 126-character
-sentence of 1.5.0. The comparison is exact, so any other value in `preamble` stays whole.
-The sentence returns the moment the text is not in force. Both are request-scoped, and neither is
+sentence of 1.5.0. The comparison is exact, so any other value in `preamble` stays whole. The
+sentence returns the moment the text is not in force. Both are request-scoped, and neither is
 recorded in the transcript.
 
 The extension makes one decision per run, and the guard reuses it until the model key or the session
-override changes. A steady conversation parses no config and reads no file, and sends byte-identical prompts
-turn after turn, so the prompt prefix cache stays warm. Switching the mode, the model, or the prompt
-file changes the head and costs one cache miss.
+answer changes. A steady conversation parses no config and reads no file, and sends byte-identical
+prompts turn after turn, so the prompt prefix cache stays warm. Changing a slot, the model, or the
+persona file changes the head and costs one cache miss.
 
 If another extension forces the system prompt, Pi replaces the system messages with that string and
 keeps every message that is not one, so the fabricated conversation would reach the model under a
 prompt nobody wrote for it. The extension delivers neither: the text is reported as undelivered, the
 block is skipped, and the footer shows the loss. The force is read when the request is built, not
-when the run starts, because the extension that sets it may be loaded after this one. When
-the leading system message holds blocks Pi never puts there, or the transcript carries no system
-message at all, the extension places nothing: the text stays out, the identity sentence stays in, and
-the loss is reported. A refilled cot is a separate axis on the same request and still travels: the
-persona text is what cannot be placed, and a turn whose reasoning pi dropped is not affected by
-where the prompt could go.
+when the run starts, because the extension that sets it may be loaded after this one. When the
+leading system message holds blocks Pi never puts there, or the transcript carries no system message
+at all, the extension places nothing: the text stays out, the identity sentence stays in, and the
+loss is reported. A refilled cot is a separate axis on the same request and still travels: the persona
+text is what cannot be placed.
+
+## The fabricated conversation
+
+The `turns` file is a YAML sequence, and one item is one message. Three keys:
+
+```yaml
+- user: |
 
 ## The fabricated conversation
 
@@ -298,17 +293,17 @@ proxy records the serialized request and response as plain HTTP while forwarding
 endpoint over HTTPS, which shows the fenced turns, the model stamps and the provider's own reaction
 in one place and needs no switch here.
 
-A file that does not load injects nothing, reports once, and leaves the prompt text in force. The
-footer shows `Leviathan !` while a configured block is missing, and `/leviathan` names the file and
-the reason.
+A file that does not load injects nothing, reports once, and leaves the persona alone. The footer's
+`!` marks the loss while a configured block is missing, and `/leviathan` names the file and the
+reason.
 
 ## The authorization gate
 
 `ask_authorize_gate` is a direct tool the model calls before any request it is unsure about
 delivering; the call itself is the signal that the request needed one. The declaration routes the
 call and never names the outcome, so the ruling has to be asked for. It is registered dormant and
-activated exactly while the text is in force, because the text is what tells the model to call it. A
-model that runs normal never receives a declaration.
+activated exactly while the `gate` slot is on. A model whose record turns `gate` off never receives a
+declaration; a record that turns `gate` on without `persona` is allowed, and the panel says so.
 
 The call names the categories the request touches, from a fixed set: `NSFW`, `NSFW_CSAM`,
 `GAME_CHEAT`, `CRACK`, `REVERSE`, `DRM_RIP`, `EXPLOIT`, `PENTEST`, `WEBAPP`, `MOBILE`, `CREDENTIALS`,
@@ -334,10 +329,11 @@ file is reported in the UI and injects nothing.
 node check.mjs
 ```
 
-`node check.mjs` drives the registered handlers against a temp config. It pins the resolver, the
-channel payload, the guard's placement and preamble withholding, the config write, the gate rulings,
-the turn file's parse and injection, the cot refill's predicate, purity, idempotence and prefix
-stability, the cot budget's three states, and the `prompt.md` invariants. One guard reads every
+`node check.mjs` drives the registered handlers against a temp config. It pins the resolver slot by
+slot and the layer that answered for each, the channel payload, the guard's placement and preamble
+withholding, the config write, the gate rulings, the turn file's parse and injection, the cot
+refill's predicate, purity, idempotence and prefix stability, the fence across two models' tags, the
+footer, the `remember` contract, and the `prompt.md` invariants. One guard reads every
 source file in the package and fails when one of them names a provider's api family, and a second
 pass over those files fails when a line asks an api value what it is: a method call, an index, a
 comparison against a literal, a coercion, or a hand-off to an equality helper. Holding an api and
