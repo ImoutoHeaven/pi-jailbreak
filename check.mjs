@@ -9,6 +9,7 @@ import { authorizeGate, CSAM_FIELD, GATE_FIELDS, GATE_TOOL } from "./gate.js";
 import { configPath, DEFAULT_TURNS, emptyConfig, globMatch, loadConfig, parseConfig, promptPath, resolve as resolveMode, sessionSettings, SETTINGS_KEYS, turnsPath } from "./config.js";
 import { applies, decode, encode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { loadTurns, parseTurns, toMessages } from "./turns.js";
+import { forgeHistory, forgeOne, isSameModel, ownCot, prefixStable } from "./forge.js";
 
 // ---------------------------------------------------------------------------
 // prompt.md content invariants
@@ -244,6 +245,8 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
+		forge: "auto",
+		forgeMaxChars: 4000,
 		ruleIndex: 0,
 	}, "the first match wins");
 	assert.deepEqual(resolveMode(config, { provider: "CLIProxy-Chat", id: "deepseek-pro" }), {
@@ -251,6 +254,8 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
+		forge: "auto",
+		forgeMaxChars: 4000,
 		ruleIndex: 1,
 	});
 	assert.deepEqual(resolveMode(config, { provider: "zhipu", id: "glm-5.3" }), {
@@ -258,6 +263,8 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		prompt: "prompts/glm.md",
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
+		forge: "auto",
+		forgeMaxChars: 4000,
 		ruleIndex: 2,
 	}, "a missing provider matches any provider");
 	assert.deepEqual(resolveMode(config, { provider: "deepseek", id: "anything" }), {
@@ -265,6 +272,8 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
+		forge: "auto",
+		forgeMaxChars: 4000,
 		ruleIndex: 3,
 	}, "a missing model matches any model");
 	assert.deepEqual(resolveMode(config, { provider: "openai", id: "gpt-5" }), {
@@ -272,6 +281,8 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		prompt: "prompt.md",
 		turns: DEFAULT_TURNS,
 		cotTag: "think",
+		forge: "auto",
+		forgeMaxChars: 4000,
 		ruleIndex: -1,
 	}, "no match falls back to the default");
 	assert.equal(promptPath(config, "prompts/glm.md"), join("/cfg", "prompts", "glm.md"));
@@ -304,8 +315,14 @@ console.log("ok cot tag");
 // The file takes the keys it names and nothing else: one that still carries the removed channel is
 // rejected whole rather than silently ignored.
 {
-	assert.match(parseConfig(JSON.stringify({ cot: "content" }), "/cfg").error, /cot is not a config key \(default, inherit, prompt, turns, cotTag, rules\)/);
-	assert.match(parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", cot: "content" }] }), "/cfg").error, /cot is not a rule key \(mode, provider, model, prompt, turns, cotTag\)/);
+	assert.match(
+		parseConfig(JSON.stringify({ cot: "content" }), "/cfg").error,
+		/cot is not a config key \(default, inherit, prompt, turns, cotTag, forge, forgeMaxChars, rules\)/,
+	);
+	assert.match(
+		parseConfig(JSON.stringify({ rules: [{ mode: "leviathan", cot: "content" }] }), "/cfg").error,
+		/cot is not a rule key \(mode, provider, model, prompt, turns, cotTag, forge, forgeMaxChars\)/,
+	);
 	assert.equal(parseConfig(JSON.stringify({ cotTag: "think", rules: [{ mode: "leviathan", cotTag: "analysis" }] }), "/cfg").error, undefined);
 }
 console.log("ok config keys");
@@ -546,6 +563,206 @@ const fenced = (tag, cot, text) => "<" + tag + ">\n" + cot + "\n</" + tag + ">\n
 console.log("ok turns messages");
 
 // ---------------------------------------------------------------------------
+// The cross-model CoT refill
+// ---------------------------------------------------------------------------
+{
+	const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	const OTHER = { provider: "CLIProxy-Chat", api: "openai-completions", model: "glm-5.3" };
+	const LIVE = { provider: "CLIProxy-Chat", api: "openai-completions", id: "deepseek-flash" };
+	const foreign = (cot = "COT A", text = "reply A") => ({
+		role: "assistant",
+		content: [
+			{ type: "thinking", thinking: cot, thinkingSignature: "sig-a" },
+			{ type: "text", text },
+			{ type: "toolCall", id: "tc_1", name: "ask_authorize_gate", arguments: { fields: ["PENTEST"] }, thoughtSignature: "ts-a" },
+		],
+		...OTHER,
+		usage: zero,
+		stopReason: "toolUse",
+		timestamp: 0,
+	});
+
+	// `isSameModel` is pi's predicate, field for field. A message differing in any one field is foreign.
+	{
+		const message = { provider: "P", api: "a", model: "m" };
+		assert.equal(isSameModel(message, { provider: "P", api: "a", id: "m" }), true);
+		for (const live of [
+			{ provider: "Q", api: "a", id: "m" },
+			{ provider: "P", api: "b", id: "m" },
+			{ provider: "P", api: "a", id: "n" },
+		]) {
+			assert.equal(isSameModel(message, live), false, `a changed field makes the message foreign: ${JSON.stringify(live)}`);
+		}
+		// The load-bearing direction: a message pi carries is never forged as well. The other direction
+		// is not total by design — a turn with no readable cot, a redacted-only turn and an already
+		// fenced one are all dropped by pi and deliberately not refilled.
+		for (const message of [foreign(), foreign("", "no cot"), { role: "user", content: [] }]) {
+			for (const live of [LIVE, { ...LIVE, id: "other" }]) {
+				const carried = isSameModel(message, live);
+				const forged = forgeOne(message, live, "think") !== null;
+				assert.equal(carried && forged, false, "a message pi carries is never forged as well");
+			}
+		}
+	}
+	console.log("ok forge predicate");
+
+	// The CoT is the message's own, and an opaque block contributes nothing.
+	{
+		assert.equal(ownCot(foreign("COT A")), "COT A");
+		assert.equal(ownCot(foreign("")), "", "an empty thinking block has no cot");
+		assert.equal(
+			ownCot({ content: [{ type: "thinking", thinking: "[Reasoning redacted]", thinkingSignature: "blob", redacted: true }] }),
+			"",
+			"a redacted block has no readable cot",
+		);
+		// The flag alone is enough: a block marked redacted is unreadable whatever its text says, so a
+		// hand-built or future provider block is not replayed by accident.
+		assert.equal(ownCot({ content: [{ type: "thinking", thinking: "not for replay", redacted: true }] }), "", "the redacted flag is checked on its own");
+		assert.equal(ownCot({ content: [{ type: "text", text: "x" }] }), "", "a message with no thinking block has no cot");
+	}
+	console.log("ok forge cot");
+
+	// The forged turn: one text block with the fence inside it, and the stamp untouched.
+	{
+		const message = foreign();
+		const forged = forgeOne(message, LIVE, "think");
+		assert.equal(forged.content[0].type, "thinking", "the thinking block is left where it was");
+		assert.equal(forged.content[1].text, fenced("think", "COT A", "reply A"), "the fence is inside the first text block");
+		assert.equal(forged.content.length, message.content.length, "no block is added or dropped");
+		assert.deepEqual(forged.content[2], message.content[2], "the tool call is untouched, thoughtSignature included");
+		for (const field of ["provider", "api", "model", "usage", "stopReason", "timestamp"]) {
+			assert.equal(forged[field], message[field], `the stamp travels unchanged: ${field}`);
+		}
+		assert.notEqual(forged, message, "the original message object is not mutated");
+		assert.equal(message.content[1].text, "reply A", "and neither is its content");
+
+		// A turn with no text block gets one, so a tool-only reply still carries its reasoning. It goes
+		// after the leading reasoning blocks: an assistant message reads reasoning first, then what it
+		// said, and a provider that requires that order would reject the reverse.
+		const callOnly = { role: "assistant", content: [{ type: "thinking", thinking: "COT" }, { type: "toolCall", id: "t", name: "g", arguments: {} }], ...OTHER, stopReason: "toolUse", timestamp: 0 };
+		const callForged = forgeOne(callOnly, LIVE, "think");
+		assert.equal(callForged.content[0].type, "thinking", "the reasoning block stays in front");
+		assert.deepEqual(callForged.content[1], { type: "text", text: "<think>\nCOT\n</think>" }, "the fence follows it, holding the cot alone");
+		assert.equal(callForged.content[2].type, "toolCall", "and the call is last");
+	}
+	console.log("ok forge turn");
+
+	// Idempotence: a message already carrying the fence is left alone, and no other tag counts.
+	{
+		const once = forgeOne(foreign(), LIVE, "think");
+		assert.equal(forgeOne(once, LIVE, "think"), null, "a second pass changes nothing");
+		assert.equal(forgeOne(once, LIVE, "analysis") !== null, true, "a different tag writes its own fence");
+		const pasted = { ...foreign(), content: [{ type: "thinking", thinking: "COT" }, { type: "text", text: "<think>\nalready\n</think>\n\nreply" }] };
+		assert.equal(forgeOne(pasted, LIVE, "think"), null, "a resumed transcript is not fenced twice");
+		assert.equal(forgeOne(foreign(), { ...LIVE, id: OTHER.model }, "think"), null, "pi carries it, so nothing is written");
+		assert.equal(forgeOne({ role: "user", content: [{ type: "thinking", thinking: "x" }] }, LIVE, "think"), null, "only assistant turns are forged");
+	}
+	console.log("ok forge idempotence");
+
+	// The budget is part of the pure answer.
+	{
+		assert.match(forgeOne(foreign("abcdef"), LIVE, "think", 3).content[1].text, /^<think>\nabc\n\[\.\.\. reasoning truncated\]\n<\/think>/);
+		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", -1).content[1].text, fenced("think", "abcdef", "reply A"), "a negative bound means none");
+		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", 999).content[1].text, fenced("think", "abcdef", "reply A"), "a bound above the length changes nothing");
+	}
+	console.log("ok forge budget");
+
+	// The list: an unchanged history keeps its identity, a changed one is a new array.
+	{
+		const history = [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }, foreign()];
+		assert.equal(forgeHistory(history, { ...LIVE, id: OTHER.model }, "think"), history, "nothing to forge returns the same array");
+		const forged = forgeHistory(history, LIVE, "think");
+		assert.notEqual(forged, history, "a change returns a new array");
+		assert.equal(forged[0], history[0], "a message with no cot keeps its object");
+		assert.equal(forged[1].model, "glm-5.3", "no re-stamp");
+		assert.equal(forgeHistory(null, LIVE, "think"), null);
+		assert.equal(forgeHistory(history, {}, "think"), history, "no live model forges nothing");
+	}
+	console.log("ok forge history");
+
+	// Purity, and the cache property it buys: appending never changes an earlier position.
+	{
+		const base = [
+			{ role: "system", content: "prompt", timestamp: 0 },
+			{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 },
+			foreign("COT A"),
+			{ role: "toolResult", toolCallId: "tc_1", toolName: "ask_authorize_gate", content: [{ type: "text", text: "RULING" }], isError: false, timestamp: 0 },
+			foreign("COT B", "reply B"),
+		];
+		const first = forgeHistory(base, LIVE, "think");
+		assert.deepEqual(forgeHistory(base, LIVE, "think"), first, "the same input produces the same output");
+		// A model switch back and forth: the answer depends on the live triple and nothing else.
+		const onOther = forgeHistory(base, { ...LIVE, id: OTHER.model }, "think");
+		assert.equal(onOther, base, "a matching model forges nothing");
+		assert.deepEqual(forgeHistory(base, LIVE, "think"), first, "and switching back reproduces the same bytes");
+
+		// Growth: each new message leaves every earlier position byte-identical. The list is copied each
+		// round, because an unchanged history comes back as the same array reference by contract.
+		let previous = first;
+		const grown = [];
+		for (const message of base) {
+			grown.push(message);
+			const next = forgeHistory(grown.slice(), LIVE, "think");
+			assert.equal(prefixStable(previous, next), null, "an append introduces no earlier-position change");
+			previous = next;
+		}
+		// A run of its own turns enters the history: they are stamped with the live model, so nothing moves.
+		const ownTurn = { role: "assistant", content: [{ type: "thinking", thinking: "MY OWN" }, { type: "text", text: "mine" }], provider: LIVE.provider, api: LIVE.api, model: LIVE.id, timestamp: 0 };
+		assert.equal(prefixStable(previous, forgeHistory([...grown, ownTurn], LIVE, "think")), null, "a live-model turn changes nothing");
+	}
+	console.log("ok forge purity");
+
+	// A history carrying another extension's entries is forged around them, never through them.
+	{
+		const mixed = [
+			{ role: "system", content: "prompt", timestamp: 0 },
+			{ role: "compactionSummary", summary: "ledger recovery", timestamp: 0 },
+			foreign("OLD COT"),
+			{ role: "custom", customType: "ledger-context/usage-notice", content: [{ type: "text", text: "47% used" }], display: true, timestamp: 0 },
+			{ role: "custom", customType: "subagent-result", content: [{ type: "text", text: "member finished" }], display: true, timestamp: 0 },
+			{ role: "user", content: [{ type: "text", text: "go on" }], timestamp: 0 },
+		];
+		const forged = forgeHistory(mixed, LIVE, "think");
+		assert.match(forged[2].content[1].text, /^<think>\nOLD COT/, "the foreign turn is refilled");
+		assert.deepEqual(forged[0], mixed[0]);
+		assert.deepEqual(forged[1], mixed[1], "a compaction summary is not a message to forge");
+		assert.deepEqual(forged[3], mixed[3], "another extension's notice is untouched");
+		assert.deepEqual(forged[4], mixed[4], "a subagent boundary entry is untouched");
+		assert.deepEqual(forged[5], mixed[5]);
+		assert.deepEqual(forgeHistory(mixed, LIVE, "think"), forged, "and the whole list is still pure");
+	}
+	console.log("ok forge mixed history");
+
+	// `native` puts the cot in a real thinking block instead of a fence, and only on the one adapter
+	// that replays it that way. Every other adapter carries a non-empty signature as a real signature:
+	// anthropic-messages sends it to the provider, which rejects the request, and
+	// openai-responses-shared JSON.parses it without a catch. So the emission rule is pinned per api.
+	{
+		const stamp = { provider: "CLIProxy-Chat", model: "deepseek-flash" };
+		const badYaml = (yaml, pattern) => {
+			const read = parseTurns(yaml);
+			assert.ok(read.error, `the file must be rejected: ${yaml}`);
+			assert.match(read.error, pattern);
+		};
+		const nativeSpecs = [{ role: "user", text: "a" }, { role: "assistant", cot: "COT", text: "reply", call: null, native: "reasoning_content" }];
+		const blocksFor = (api) => toMessages(nativeSpecs, { ...stamp, api })[1].content;
+		assert.deepEqual(blocksFor("openai-completions"), [
+			{ type: "thinking", thinking: "COT", thinkingSignature: "reasoning_content" },
+			{ type: "text", text: "reply" },
+		], "the one adapter that reads a reasoning field gets the block");
+		for (const api of ["anthropic-messages", "openai-responses", "google-generative-ai", "mistral-conversations"]) {
+			assert.deepEqual(blocksFor(api), [{ type: "text", text: fenced("think", "COT", "reply") }], `every other adapter gets the fence: ${api}`);
+		}
+		// A file without the key produces the same spec objects it produced before the key existed.
+		assert.deepEqual(parseTurns("- user: a\n- assistant: b\n").specs[1], { role: "assistant", cot: "", text: "b", call: null });
+		badYaml("- user: a\n- assistant: {cot: c, native: '1bad'}\n", /native must be a reasoning field name/);
+		badYaml("- user: a\n- assistant: {native: reasoning_content}\n", /native needs a cot/);
+	}
+	console.log("ok forge native cot");
+}
+
+
+// ---------------------------------------------------------------------------
 // The real extension: drive the handlers it registers
 // ---------------------------------------------------------------------------
 const promptText = raw.trim();
@@ -717,6 +934,158 @@ console.log("ok decision follows the model");
 	assert.equal(guardRun([]), undefined, "an empty transcript is a no-op");
 }
 console.log("ok guard places the text");
+
+// ---------------------------------------------------------------------------
+// The refill as a request carries it: through the handler, not around it
+// ---------------------------------------------------------------------------
+// Every assertion above calls `forgeOne`/`forgeHistory` directly, which cannot see the one failure
+// that matters: the guard computing a forged list and then returning `undefined` because nothing
+// else changed. These run the real handler.
+{
+	const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	const command = commands.get("leviathan");
+	const forgeCtx = { model: LEVIATHAN, ui: ui() };
+	const foreignTurn = {
+		role: "assistant",
+		content: [
+			{ type: "thinking", thinking: "COT FROM ELSEWHERE" },
+			{ type: "text", text: "that reply" },
+			{ type: "toolCall", id: "tc_9", name: "read", arguments: { path: "x" } },
+		],
+		provider: "CLIProxy-Chat",
+		api: "openai-completions",
+		model: "glm-5.3",
+		usage: zero,
+		stopReason: "toolUse",
+		timestamp: 0,
+	};
+	const history = [
+		head(promptText),
+		{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 },
+		foreignTurn,
+		{ role: "toolResult", toolCallId: "tc_9", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 },
+	];
+
+	// (a) Leviathan on, a request that needs no other change: the refill is the only difference, so it
+	// must be returned rather than swallowed by the `undefined` that means "send it as it arrived".
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: null });
+	await run(LEVIATHAN);
+	{
+		const result = guardRun(history);
+		assert.ok(result?.messages, "a refill alone must be delivered");
+		assert.notEqual(result.messages, history, "and it is a new array");
+		assert.match(result.messages[2].content[1].text, /^<think>\nCOT FROM ELSEWHERE\n<\/think>\n\nthat reply$/);
+		assert.equal(result.messages[2].model, "glm-5.3", "the turn keeps its own stamp");
+		assert.deepEqual(result.messages[0], history[0], "the prompt head is untouched");
+		assert.deepEqual(result.messages[1], history[1]);
+		assert.deepEqual(result.messages[3], history[3]);
+		// A turn the live model wrote is not refilled, so the whole request stays a no-op.
+		const ownTurn = { ...foreignTurn, provider: LEVIATHAN.provider, api: LEVIATHAN.api, model: LEVIATHAN.id };
+		assert.equal(guardRun([head(promptText), { ...turn }, ownTurn]), undefined, "nothing to refill returns undefined");
+	}
+
+	// (b) The same refill alongside a prompt mutation: both changes reach the request.
+	{
+		const withStock = [{ ...history[0], sections: { [PREAMBLE]: STOCK_PREAMBLE } }, ...history.slice(1)];
+		const result = guardRun(withStock);
+		assert.equal(result.messages[0].content, promptText, "the prompt head is set");
+		// The withheld key is the only section there was, so the whole `sections` object goes.
+		assert.equal(result.messages[0].sections, undefined, "the stock sentence is withheld");
+		assert.match(result.messages[2].content[1].text, /^<think>/, "and the refill survives beside it");
+	}
+
+	// (c) The refill alongside the fabricated block: the block anchors on the list it splices into.
+	{
+		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: DEFAULT_TURNS });
+		await run(LEVIATHAN);
+		const result = guardRun(history);
+		const loaded = loadTurns(turnsPath(emptyConfig(PACKAGE_DIR), DEFAULT_TURNS));
+		assert.equal(loaded.error, undefined, "the shipped turn file loads");
+		const block = toMessages(loaded.specs, {
+			provider: LEVIATHAN.provider,
+			api: LEVIATHAN.api,
+			model: LEVIATHAN.id,
+			cotTag: "think",
+		});
+		assert.deepEqual(result.messages.slice(1, 1 + block.length), block, "the fabricated block lands right after the head");
+		assert.match(result.messages[1 + block.length + 1].content[1].text, /^<think>/, "and the refilled turn follows it");
+	}
+
+	// (d) The refill is a request property, not a persona property: a normal session refills too, and
+	// `forge: "off"` is the only thing that stops it.
+	{
+		// Back to no fabricated block, so the refill is the only thing this request could change.
+		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: null });
+		await run(NORMAL);
+		const normalHistory = [head(""), ...history.slice(1)];
+		const normal = guardRun(normalHistory, NORMAL);
+		assert.match(normal?.messages?.[2]?.content?.[1]?.text ?? "", /^<think>/, "a normal session refills as well");
+		assert.equal(normal?.messages?.[0]?.content, "", "and still carries no persona text");
+		await run(LEVIATHAN);
+		await command.handler("forge off", forgeCtx);
+		const off = guardRun(history);
+		// Nothing else changes this request, so a switch that refills nothing answers `undefined`.
+		assert.equal(off, undefined, "forge off leaves the request exactly as it arrived");
+		await command.handler("forge default", forgeCtx);
+		assert.match(guardRun(history)?.messages?.[2]?.content?.[1]?.text ?? "", /^<think>/, "and turning it back on refills again");
+	}
+
+	// (e) `always` refills a turn pi would carry, which `auto` leaves alone.
+	{
+		await command.handler("forge always", forgeCtx);
+		await run(LEVIATHAN);
+		const ownTurn = { ...foreignTurn, provider: LEVIATHAN.provider, api: LEVIATHAN.api, model: LEVIATHAN.id };
+		const forced = guardRun([head(promptText), { ...turn }, ownTurn]);
+		assert.match(forced.messages[2].content[1].text, /^<think>/, "always refills even a turn pi would carry");
+		await command.handler("forge default", forgeCtx);
+	}
+	// (f) A head that cannot hold the text must not cost the refill. With `turns` off and the text
+	// undeliverable, `project(forged, false)` used to return undefined by construction and throw the
+	// forged list away, so the refill never reached the request.
+	{
+		writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", mode: "leviathan" }], { turns: null });
+		await run(LEVIATHAN);
+		// A leading system message holding a block pi never puts there.
+		const unusable = [{ role: "system", content: [{ type: "image", mimeType: "image/png", data: "AA==" }], sections: { [PREAMBLE]: STOCK_PREAMBLE }, timestamp: 0 }, ...history.slice(1)];
+		const first = guardRun(unusable);
+		assert.ok(first?.messages, "an unusable head still delivers the refill");
+		assert.match(first.messages[2].content[1].text, /^<think>/, "and the refill is intact");
+		assert.deepEqual(first.messages[0], unusable[0], "the head itself is left alone");
+		// The documented outcome on this path: the identity sentence stays in, because the text that
+		// would contradict it did not arrive. The refill is a separate axis and travels anyway.
+		assert.equal(first.messages[0].sections[PREAMBLE], STOCK_PREAMBLE, "the identity sentence stays when the text does not arrive");
+		// A transcript with no system message at all.
+		const noSystem = history.slice(1);
+		const second = guardRun(noSystem);
+		assert.ok(second?.messages, "a transcript with no system message still delivers the refill");
+		assert.match(second.messages[1].content[1].text, /^<think>/, "and the refill keeps its place");
+		// With nothing to refill either, the request stays a no-op: the unusable head alone is not a
+		// reason to rebuild the list.
+		assert.equal(guardRun([unusable[0], { ...turn }]), undefined, "an unusable head with nothing to refill is a no-op");
+		// The state only the round-4 line covers: a *later* system message carries a stock preamble, so
+		// `project(forged, true)` really does return a stripped array (the round-3 recovery does not
+		// fire), and the unusable head then throws that stripping away while keeping the refill.
+		const midStock = { role: "system", content: "", sections: { [PREAMBLE]: STOCK_PREAMBLE, cwd: "C" }, timestamp: 1 };
+		const mixed = [unusable[0], midStock, ...history.slice(1)];
+		const third = guardRun(mixed);
+		assert.ok(third?.messages, "a stripped array plus an unusable head still delivers the refill");
+		assert.match(third.messages[3].content[1].text, /^<think>/, "the refill survives where only the round-4 line can keep it");
+		assert.equal(third.messages[1].sections[PREAMBLE], STOCK_PREAMBLE, "and the identity sentence comes back, as the loss of the text implies");
+		assert.equal(third.messages[1].sections.cwd, "C", "the sections beside it are untouched");
+		// This block consumed the one report this session makes for an unusable head, so a later case
+		// that asserts on that warning needs the reported set cleared first.
+		await start({ type: "session_start", reason: "reload" }, forgeCtx);
+	}
+		// A selection pi routes per request carries no physical model yet, so nothing here can say
+		// whether pi will drop a turn's reasoning. Refilling against the selection would call every
+		// real turn foreign and show two traces, so a routed selection refills nothing.
+		const routed = { provider: "router", api: "pi-virtual", id: "auto" };
+		await run(routed);
+		const routedHistory = [head(promptText), { ...turn }, foreignTurn];
+		assert.equal(guardRun(routedHistory, routed), undefined, "a routed selection refills nothing");
+		await run(LEVIATHAN);
+}
+console.log("ok forge through the guard");
 
 // Pi reworded the stock identity sentence in 1.5.0. Every known wording is withheld, so a session on
 // either release leaves the persona at the head of the prompt uncontradicted.
@@ -1687,7 +2056,7 @@ console.log("ok reset reports the config mode");
 	// Every key the list names is a setting that can be set: a key with no branch of its own would be a
 	// dead entry that rejects every value it is given.
 	{
-		const sample = { prompt: "p.md", turns: null, cotTag: "think", inherit: "keyed" };
+		const sample = { prompt: "p.md", turns: null, cotTag: "think", forge: "always", forgeMaxChars: 1200, inherit: "keyed" };
 		assert.deepEqual(Object.keys(sample).sort(), [...SETTINGS_KEYS].sort(), "the sample covers the list and nothing else");
 		for (const key of SETTINGS_KEYS) {
 			assert.equal(sessionSettings({ [key]: sample[key] }).error, undefined, `${key} is settable`);
@@ -2191,6 +2560,25 @@ function assertPreambleKnown(file) {
 	assert.ok(existsSync(current), `the resolved pi package has no system prompt: ${current}`);
 	assertPreambleKnown(current);
 	for (const file of files) assertPreambleKnown(file);
+}
+
+// Drift guard: the routed-selection marker is what keeps a routed model from being mistaken for the
+// model a request is sent to, and pi does not export it from the package's public surface, so the
+// value is copied. A release that renames it would leave both copies stale together and the routed
+// assertion would keep passing while the feature quietly regressed to double-tracing. So the
+// installed release's assignment is read and compared, the way the stock preamble is.
+{
+	const file = join(resolvePiPackage(), "dist", "core", "virtual-models.js");
+	assert.ok(existsSync(file), `the resolved pi package has no virtual models: ${file}`);
+	const assigned = [...readFileSync(file, "utf8").matchAll(/VIRTUAL_MODEL_API\s*=\s*"([^"]*)"/g)].map(
+		(match) => match[1],
+	);
+	assert.ok(assigned.length > 0, `no VIRTUAL_MODEL_API assignment in ${file}`);
+	assert.deepEqual(
+		assigned.filter((value) => value !== "pi-virtual"),
+		[],
+		`pi renamed VIRTUAL_MODEL_API in ${file}; index.ts copies the value`,
+	);
 }
 
 // The guard's own failure modes, so it cannot go quiet: an unknown assigned value, an old wording

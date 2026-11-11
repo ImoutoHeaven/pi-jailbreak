@@ -1,6 +1,8 @@
 /**
  * Injects the leviathan text into the system prompt of the sessions a rule selects, and a fabricated
- * conversation ahead of the first real user message in the sessions a turn file selects.
+ * conversation ahead of the first real user message in the sessions a turn file selects. It also
+ * refills, per message, the reasoning pi drops when a request targets a different model than the one
+ * that wrote a turn; `forge.js` owns that and states its invariants.
  *
  * The text goes in as the head of the leading system message's `content`, ahead of every section,
  * on every request. A section would name the block, which marks it as injected. The
@@ -41,10 +43,20 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { authorizeGate, GATE_FIELDS, GATE_TOOL, normalizeFields } from "./gate.js";
 import { configPath, loadConfig, parseConfig, promptPath, resolve, sessionSettings, settingFromCommand, turnsPath } from "./config.js";
 import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
+import { forgeHistory } from "./forge.js";
 import { cachedFile, loadTurns, toMessages } from "./turns.js";
 import { registerCommands } from "./commands.ts";
 
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
+/**
+ * Pi marks a routed selection with this api, and does not export its own check. On such a selection
+ * `ctx.model` is the selection, not the model the request is routed to: pi picks the physical model
+ * per request, after this hook has run. Forging against the selection would compare a recorded
+ * turn's real `provider`/`api`/`model` with `pi-virtual`, call every real turn foreign, and refill
+ * turns pi is in fact carrying — the one state the refill exists to prevent. A routed selection
+ * refills nothing; pi carries each turn's reasoning whenever the route produces the turn's model.
+ */
+const VIRTUAL_MODEL_API = "pi-virtual";
 // The raw, untagged section holding pi's stock identity sentence.
 const PREAMBLE = "preamble";
 // Pi's stock preamble, byte for byte (dist/core/system-prompt.js), for every wording pi has shipped.
@@ -106,6 +118,8 @@ type Decision = {
 	turnsError: string | null;
 	turnsPath: string | null;
 	cotTag: string;
+	forge: string;
+	forgeMaxChars: number;
 	prompt: string;
 	source: string;
 	inherit: string;
@@ -118,6 +132,8 @@ type Settings = {
 	prompt?: string;
 	turns?: string | null;
 	cotTag?: string;
+	forge?: string;
+	forgeMaxChars?: number;
 	inherit?: string;
 };
 
@@ -237,6 +253,8 @@ function buildDecision(s: State, ctx: any): Decision {
 		turnsError,
 		turnsPath: turnsFile,
 		cotTag: settings.cotTag ?? hit.cotTag,
+		forge: settings.forge ?? hit.forge,
+		forgeMaxChars: settings.forgeMaxChars ?? hit.forgeMaxChars,
 		prompt,
 		source: session ? "session" : hit.ruleIndex < 0 ? "default" : `rule ${hit.ruleIndex + 1}`,
 		inherit: settings.inherit ?? config.inherit,
@@ -571,6 +589,11 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 	// The turns value the model resolves, written even when it is null: an absent key would inherit a
 	// config-level default and turn injection back on.
 	const carriedTurns = s0.turns !== undefined ? s0.turns : applied.turns;
+	// The forge settings travel the same way as the tag, with one difference: `auto` is the default, so
+	// writing it is harmless and a rule that never carried the key stays clean.
+	const carriedForge = s0.forge ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].forge : undefined);
+	const carriedForgeMaxChars =
+		s0.forgeMaxChars ?? (applied.ruleIndex >= 0 ? parsed.config.rules[applied.ruleIndex].forgeMaxChars : undefined);
 	const rules = Array.isArray(data.rules) ? data.rules : [];
 	const at = rules.findIndex(
 		(rule: any) =>
@@ -590,17 +613,26 @@ function remember(s: State, ctx: any, mode: "on" | "off"): { ok: boolean; messag
 			mode: next,
 			...(s0.prompt !== undefined ? { prompt: s0.prompt } : updated.prompt === undefined && carried ? { prompt: carried } : {}),
 			...(s0.cotTag !== undefined ? { cotTag: s0.cotTag } : updated.cotTag === undefined && carriedCotTag ? { cotTag: carriedCotTag } : {}),
+			...(s0.forge !== undefined ? { forge: s0.forge } : updated.forge === undefined && carriedForge ? { forge: carriedForge } : {}),
+			...(s0.forgeMaxChars !== undefined
+				? { forgeMaxChars: s0.forgeMaxChars }
+				: updated.forgeMaxChars === undefined && carriedForgeMaxChars
+					? { forgeMaxChars: carriedForgeMaxChars }
+					: {}),
 			...(s0.turns !== undefined ? { turns: s0.turns } : updated.turns === undefined ? { turns: carriedTurns } : {}),
 		});
-	} else
+	} else {
 		rules.unshift({
 			provider,
 			model: id,
 			mode: next,
 			...(carried ? { prompt: carried } : {}),
 			...(carriedCotTag ? { cotTag: carriedCotTag } : {}),
+			...(carriedForge ? { forge: carriedForge } : {}),
+			...(carriedForgeMaxChars ? { forgeMaxChars: carriedForgeMaxChars } : {}),
 			turns: carriedTurns,
 		});
+	}
 	const out = {
 		...data,
 		default: data.default ?? "normal",
@@ -648,6 +680,7 @@ function panel(s: State, ctx: any) {
 		...(shown ? [["session", `${s.override?.mode === "on" ? "on" : "off"}@${s.override?.key ?? ""} ${shown}${current.source === "session" ? "" : " (not applied)"}`]] : []),
 		["prompt", current.prompt],
 		["turns", current.turnsPath ?? "off"],
+		["forge", `${current.forge} (${current.forgeMaxChars < 0 ? "no bound" : `${current.forgeMaxChars} chars`})`],
 	];
 	if (current.mode === "leviathan" && !current.text) rows.push(["text", "missing"]);
 	rows.push(["inherit", current.inherit], ["config", current.configPath ?? "none"]);
@@ -780,19 +813,44 @@ export default function leviathan(pi: ExtensionAPI) {
 		if (current.text && forced) {
 			report(s, ctx, `${basename(current.prompt)} is not delivered (another extension replaced the system prompt)`, "warning");
 		}
-		let next = project(messages, current.text !== null);
+		// 1) Refill the CoT pi drops for a message written by another model. This runs first, on the
+		// transcript as it arrived, so the fabricated block's anchor below is computed on the list it
+		// is actually spliced into and the forge region can never overlap that block. It touches
+		// assistant messages only, and a message already stamped with the live model is left alone.
+		// A routed selection has no reachable physical model here, so it refills nothing.
+		const routed = ctx?.model?.api === VIRTUAL_MODEL_API;
+		const forged =
+			current.forge === "off" || !hasModel(ctx) || routed
+				? messages
+				: forgeHistory(
+						messages,
+						{ provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id },
+						current.cotTag,
+						current.forgeMaxChars,
+						current.forge === "always",
+					);
+		// 2) The prompt head, then the fabricated block. `project` only ever removes a section key
+		// from a system message, which forge never touched.
+		let next = project(forged, current.text !== null);
+		// A refill is a change to the request, so it has to survive both steps below being no-ops.
+		// `undefined` means "send the transcript as it arrived", and a forged list is not that.
+		if (next === undefined && forged !== messages) next = forged;
 		// The leading system message, and where the splice leaves it: pi renders the prompt from
 		// index 0, and the fabricated block is anchored on the first message that is not a system one.
-		let at = leadingSystem(messages);
+		let at = leadingSystem(forged);
 		let delivered = false;
 		if (current.text) {
-			const projected = at < 0 ? undefined : next === undefined ? messages[at] : next[at];
+			const projected = at < 0 ? undefined : next === undefined ? forged[at] : next[at];
 			const existing = projected ? headText(projected.content) : undefined;
 			if (existing === undefined) {
 				// The transcript carries no system message, or the leading one holds blocks pi
 				// never puts there. Rewriting either would drop content, so the text stays out,
 				// the identity sentence stays in, and the loss is reported.
-				next = project(messages, false);
+				// The whole projection is undone, not only the head: `forged` is the list before
+				// the stock preamble was withheld, and it is also the list that carries a refill.
+				// `project(forged, false)` cannot serve here: with `stripIdentity` false it returns
+				// undefined by construction, which would throw that refill away.
+				next = forged === messages ? undefined : forged;
 				report(
 					s,
 					ctx,
@@ -809,7 +867,7 @@ export default function leviathan(pi: ExtensionAPI) {
 				const content = aligned ? existing : existing ? `${current.text}\n\n${existing}` : current.text;
 				if (content !== existing || at !== 0) {
 					// Never mutate the caller's array, message objects or sections objects.
-					next ??= messages.slice();
+					next ??= forged.slice();
 					next[at] = { ...projected, content };
 					if (at !== 0) {
 						// Pi renders the prompt from index 0 only, so the leading system message
@@ -824,7 +882,7 @@ export default function leviathan(pi: ExtensionAPI) {
 		}
 		// The fabricated conversation, spliced ahead of the first real user message. A run whose
 		// system prompt was replaced by another extension skips it and says so.
-		const spliced = injectTurns(s, ctx, current, messages, next, at, forced);
+		const spliced = injectTurns(s, ctx, current, forged, next, at, forced);
 		if (spliced.messages) next = spliced.messages;
 		// The footer reports what the request carried, not only what the mode asked for.
 		if (current.text || current.turns) noteDelivery(s, ctx, current, delivered && !forced, spliced.injected);

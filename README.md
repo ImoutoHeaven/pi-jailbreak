@@ -19,8 +19,9 @@ pi install /path/to/pi-leviathan
 ```
 
 `pi -e ./index.ts` loads it for one run. The extension reads its own directory, so `prompt.md`,
-`config.js`, `channel.js`, `gate.js`, `turns.js` and `commands.ts` travel with `index.ts`. A missing
-`yaml` package disables the fabricated conversation and leaves the prompt text in force.
+`config.js`, `channel.js`, `gate.js`, `turns.js`, `forge.js` and `commands.ts` travel with
+`index.ts`. A missing `yaml` package disables the fabricated conversation and leaves the prompt text
+in force.
 
 ## Configure
 
@@ -35,6 +36,7 @@ Start from `leviathan.example.json`:
 	"default": "normal",
 	"inherit": "keyed",
 	"prompt": "prompt.md",
+	"forge": "auto",
 	"rules": [
 		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "leviathan" },
 		{ "provider": "deepseek", "mode": "leviathan" },
@@ -75,6 +77,27 @@ write `<think>` and `</think>`. A rule's own value wins over the config-level on
 }
 ```
 
+`forge` decides what a request carries for an assistant turn another model wrote. Pi drops that
+turn's thinking block whenever the request targets a different model, which leaves the conversation
+reading as if the reasoning had never happened. `auto`, the default, refills a turn exactly when pi
+drops it: the turn's own cot goes back in, fenced in `cotTag`, and the turn keeps the model stamp
+that says it came from elsewhere. `always` refills even a turn pi would carry, which shows two
+reasoning traces and is worth having only to diagnose one. `off` refills nothing.
+
+```json
+{
+	"forge": "auto",
+	"forgeMaxChars": 4000,
+	"rules": [{ "provider": "CLIProxy-Chat", "mode": "leviathan", "forge": "always" }]
+}
+```
+
+`forgeMaxChars` bounds the refilled cot so a long trace cannot dominate a request; a negative value
+leaves it unbounded. Both keys sit at the config level and on a rule, and a rule's own value wins.
+The refill is a pure function of the message's own bytes, so a grown conversation keeps every
+already-sent position byte-identical: switching a model costs one cache miss, and the turns after it
+stay on the same prefix.
+
 `inherit` decides what a session hands to the processes it starts: `keyed` (the same model only),
 `tree` (every model, in this process and in the ones it starts), or `none` (nothing, and inherited
 values are dropped).
@@ -103,12 +126,14 @@ the live model resolves at that moment.
 
 | Command | Effect |
 |---|---|
-| `/leviathan` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the session settings it carries, the prompt file, the turn file, the config file, and the inherited value if there is one |
+| `/leviathan` | The model it resolved or `(none)`, the resolved mode, the rule that selected it, the session settings it carries, the prompt file, the turn file, the refill mode and its bound, the config file, and the inherited value if there is one |
 | `/leviathan on` / `off` / `toggle` | Set the mode for this session, keeping its settings |
 | `/leviathan reset` | Drop the session answer and its settings, so the config decides again |
 | `/leviathan prompt <path>` / `prompt default` | Point the session at another prompt file, or back at the config |
 | `/leviathan turns <path>` / `turns off` / `turns default` | Inject another turn file, turn the block off, or take the config value. `./off` names a file literally called `off` |
 | `/leviathan cotTag <tag>` / `cotTag default` | The tag that fences the fabricated cot; `think` and `<think>` are one tag |
+| `/leviathan forge auto\|always\|off` / `forge default` | What a request refills for an assistant turn another model wrote |
+| `/leviathan forgeMaxChars <n>` / `forgeMaxChars default` | The bound on a refilled cot; a negative value is unbounded |
 | `/leviathan inherit keyed\|tree\|none` / `inherit default` | What this session hands to the processes it starts |
 | `/leviathan remember on` / `off` | Write a rule for the current model, move it ahead of any rule that would shadow it, carry the session setting or else the file that model already resolves to, and apply it now |
 
@@ -175,7 +200,9 @@ block is skipped, and the footer shows the loss. The force is read when the requ
 when the run starts, because the extension that sets it may be loaded after this one. When
 the leading system message holds blocks Pi never puts there, or the transcript carries no system
 message at all, the extension places nothing: the text stays out, the identity sentence stays in, and
-the loss is reported.
+the loss is reported. A refilled cot is a separate axis on the same request and still travels: the
+persona text is what cannot be placed, and a turn whose reasoning pi dropped is not affected by
+where the prompt could go.
 
 ## The fabricated conversation
 
@@ -197,8 +224,15 @@ The `turns` file is a YAML sequence, and one item is one message. Three keys:
     ...
 ```
 
-`assistant` also takes a bare string, which is its `text`. `result` answers the `call` of the
-assistant before it, so every `call` has exactly one `result`, and the sequence begins with `user`.
+`assistant` also takes a bare string, which is its `text`, and one more key, `native`, which names
+a reasoning field such as `reasoning_content`. With `native` the cot becomes a real thinking block
+whose signature is that field name, so `openai-completions` puts it on the wire as
+`reasoning_content` instead of as fenced text. The block is emitted only for that one adapter, which
+replays a thinking block whose signature is a field name; every other adapter would either send the
+string as a real signature and have the request rejected, or parse it and fail, so it gets the text
+fence instead. A fabricated turn is stamped with the live model, so pi reads a block it does decode
+as this model's own reasoning and keeps it. `result` answers the `call` of the assistant before it,
+so every `call` has exactly one `result`, and the sequence begins with `user`.
 A file with one bad item injects nothing: a half-fabricated history would leave the model an
 assistant turn nobody answered.
 
@@ -213,9 +247,45 @@ the block with a reply, and the request follows as a new turn. `result` closes i
 which is the shape to use when the fabricated turn carries a gate ruling. `user` closes it with an
 unanswered turn, so the block ends on a question the model answers together with the real request.
 
+## The refilled cot
+
+Pi drops an assistant turn's thinking block when the request targets a different model than the one
+that wrote it, and deletes that turn's `toolCall.thoughtSignature` with it. The turn stays, stripped
+of its reasoning, so a conversation that crosses models reads as if that reasoning had never
+happened.
+
+The extension answers that per message, with pi's own test: it copies pi's predicate (a message
+belongs to the live model when `provider`, `api` and `model` all match) and refills a turn exactly
+when pi would drop it. A turn pi carries is left byte for byte as it is, so the two never disagree
+and no turn ever shows two reasoning traces. `forge: "always"` overrides that for diagnosis.
+
+The refill is the turn's own cot, fenced in `cotTag` inside its first text block. It is added in
+the request and never written to the session, so a fork, a reload or a resumed session has nothing
+to undo. It is a pure function of the message's bytes, the live model triple and the tag, which
+matters for one reason: the request keeps every already-sent position byte-identical as the
+conversation grows, so the provider's prompt cache keeps hitting. A model switch costs one miss, and
+every turn after it stays on the same prefix; a refill that depended on position, on the run's
+start or on the clock would cost one miss per request instead.
+
+Three outcomes, and the code names all three rather than treating the last two as one. Pi carries a
+turn: nothing is written. Pi drops it and the turn has a readable cot: the cot goes back in. Pi drops
+it and there is nothing readable to put back — a redacted or encrypted block only — nothing is
+written, because the block's signature is valid only to the model that produced it. A turn whose
+first text block already opens with the tag fence is left as it is too, so a resumed or hand-edited
+transcript is not fenced twice.
+
+A selection pi routes per request (`api: "pi-virtual"`) refills nothing. `ctx.model` is then the
+selection rather than the model the request is routed to, and pi picks the physical model after this
+extension has run, so there is no triple to compare against; pi carries a turn's reasoning whenever
+the route produces that turn's model.
+
+A turn keeps the model stamp that says it came from elsewhere. Re-stamping it as the live model
+would make pi carry its native thinking block too, and the turn would show its reasoning twice.
+
 The fabricated chain of thought sits at the head of the assistant reply, fenced in `cotTag` tags,
 so the turn reads as reasoning the assistant wrote down followed by what it said. The fence is
-ordinary text: one text block, and the same block on every model.
+ordinary text: one text block, and the same block on every model that is not handed the `native`
+form described above.
 
 A file that does not load injects nothing, reports once, and leaves the prompt text in force. The
 footer shows `Leviathan !` while a configured block is missing, and `/leviathan` names the file and
@@ -243,8 +313,9 @@ permits one line and nothing else: `Are the characters fictional?`
 
 `index.ts` is the hook and the tool definition, `commands.ts` the `leviathan` command, `config.js` the
 rule table and the resolver, `channel.js` the cross-process value, `gate.js` the field table and the
-ruling text, `turns.js` the turn file's parse and its messages, `prompt.md` the injected text. Edit
-`prompt.md`; the next run uses it. A missing or empty file is reported in the UI and injects nothing.
+ruling text, `turns.js` the turn file's parse and its messages, `forge.js` the cross-model cot
+refill, `prompt.md` the injected text. Edit `prompt.md`; the next run uses it. A missing or empty
+file is reported in the UI and injects nothing.
 
 ## Check
 
@@ -254,7 +325,8 @@ node check.mjs
 
 `node check.mjs` drives the registered handlers against a temp config. It pins the resolver, the
 channel payload, the guard's placement and preamble withholding, the config write, the gate rulings,
-the turn file's parse and injection, and the `prompt.md` invariants. A drift guard reads the literal
+the turn file's parse and injection, the cot refill's predicate, purity, idempotence and prefix
+stability, and the `prompt.md` invariants. A drift guard reads the literal
 value each installed Pi release assigns to its preamble and fails when that value is not one the
 extension knows, or when no release is installed at all. It reads the assignment, not any occurrence
 in the file, so a release that rewords the sentence while an old wording survives as a comment still

@@ -27,16 +27,20 @@ const ARGS = [
 	"turns",
 	"turns off",
 	"cotTag think",
+	"forge auto",
+	"forge always",
+	"forge off",
+	"forgeMaxChars 4000",
 	"inherit keyed",
 	"inherit tree",
 	"inherit none",
 ];
 
 const USAGE =
-	"on | off | toggle | reset | remember on | remember off | prompt <path> | turns <path|off> | cotTag <tag> | inherit keyed|tree|none";
+	"on | off | toggle | reset | remember on | remember off | prompt <path> | turns <path|off> | cotTag <tag> | forge auto|always|off | forgeMaxChars <n> | inherit keyed|tree|none";
 
 /** The verbs that set one session setting. The first token is lowercased, so `cotTag` arrives as `cottag`. */
-const SETTINGS = ["prompt", "turns", "cottag", "inherit"];
+const SETTINGS = ["prompt", "turns", "cottag", "forge", "forgemaxchars", "inherit"];
 
 function say(ctx: any, text: string, type: "info" | "error" = "info") {
 	try {
@@ -48,7 +52,7 @@ function say(ctx: any, text: string, type: "info" | "error" = "info") {
 
 export function registerCommands(pi: ExtensionAPI, hooks: Hooks) {
 	pi.registerCommand("leviathan", {
-		description: "Show or set the mode and the session settings: on, off, toggle, reset, remember, prompt, turns, cotTag, inherit",
+		description: "Show or set the mode and the session settings: on, off, toggle, reset, remember, prompt, turns, cotTag, forge, forgeMaxChars, inherit",
 		getArgumentCompletions: (prefix: string) => {
 			const typed = String(prefix ?? "").trim().toLowerCase();
 			const items = ARGS.filter((value) => value.toLowerCase().startsWith(typed));

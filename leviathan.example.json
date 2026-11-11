@@ -2,6 +2,7 @@
 	"default": "normal",
 	"inherit": "keyed",
 	"prompt": "prompt.md",
+	"forge": "auto",
 	"rules": [
 		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "mode": "leviathan" },
 		{ "provider": "deepseek", "mode": "leviathan" },

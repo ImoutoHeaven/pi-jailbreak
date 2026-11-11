@@ -23,13 +23,24 @@ export const MODES = Object.freeze(["leviathan", "normal"]);
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
 /** The tag that fences the cot at the head of the reply. `<think>` and `think` name the same tag. */
 export const DEFAULT_COT_TAG = "think";
+/**
+ * How a message whose CoT pi drops is refilled. `auto` follows pi, which is the only setting that
+ * keeps the two predicates complements; `always` also fences a message pi would carry, which shows
+ * a double trace and is worth having only to diagnose one; `off` refills nothing.
+ */
+export const FORGE_MODES = Object.freeze(["auto", "always", "off"]);
+export const DEFAULT_FORGE = "auto";
+/** The most CoT characters a refilled turn may carry, so a long trace cannot dominate a request. */
+export const DEFAULT_FORGE_MAX_CHARS = 4000;
 /** The keys a config file and a rule carry. A file takes these and nothing else. */
-const CONFIG_KEYS = Object.freeze(["default", "inherit", "prompt", "turns", "cotTag", "rules"]);
-const RULE_KEYS = Object.freeze(["mode", "provider", "model", "prompt", "turns", "cotTag"]);
+const CONFIG_KEYS = Object.freeze(["default", "inherit", "prompt", "turns", "cotTag", "forge", "forgeMaxChars", "rules"]);
+const RULE_KEYS = Object.freeze(["mode", "provider", "model", "prompt", "turns", "cotTag", "forge", "forgeMaxChars"]);
 const TAG_ERROR = "cotTag must be a tag name, such as think or <think>";
+const FORGE_ERROR = `forge must be ${FORGE_MODES.join(", ")}`;
+const FORGE_MAX_CHARS_ERROR = "forgeMaxChars must be a whole number other than 0, or negative for no bound";
 
 /** The keys a session answer carries. `turns` is three-state, and the rest are single values. */
-export const SETTINGS_KEYS = Object.freeze(["prompt", "turns", "cotTag", "inherit"]);
+export const SETTINGS_KEYS = Object.freeze(["prompt", "turns", "cotTag", "forge", "forgeMaxChars", "inherit"]);
 
 /** A tag name from either spelling, or null when the value is not one. A bracketed value has to be
  * exactly one tag, so a stray `>` or a second pair is rejected rather than trimmed away. */
@@ -42,7 +53,30 @@ export function tagName(value) {
 
 /** What a session uses when no config file loads. */
 export function emptyConfig(dir) {
-	return { default: "normal", inherit: "keyed", prompt: DEFAULT_PROMPT, turns: DEFAULT_TURNS, cotTag: DEFAULT_COT_TAG, rules: [], dir, path: null };
+	return {
+		default: "normal",
+		inherit: "keyed",
+		prompt: DEFAULT_PROMPT,
+		turns: DEFAULT_TURNS,
+		cotTag: DEFAULT_COT_TAG,
+		forge: DEFAULT_FORGE,
+		forgeMaxChars: DEFAULT_FORGE_MAX_CHARS,
+		rules: [],
+		dir,
+		path: null,
+	};
+}
+
+/** A forge mode from the config, or null when the value is not one. */
+export function forgeMode(value) {
+	const wanted = typeof value === "string" ? value.toLowerCase() : value;
+	return FORGE_MODES.includes(wanted) ? wanted : null;
+}
+
+/** A character budget for the refilled CoT. A negative value means no bound, which is how a
+ * session asks for the whole trace. */
+export function forgeChars(value) {
+	return Number.isSafeInteger(value) && value !== 0 ? value : null;
 }
 
 /**
@@ -123,6 +157,12 @@ export function parseConfig(text, dir) {
 	// same tag.
 	const cotTag = data.cotTag === undefined ? DEFAULT_COT_TAG : tagName(data.cotTag);
 	if (!cotTag) return { error: TAG_ERROR };
+	// A missing value follows pi; a value outside the set rejects the file whole, so a typo never
+	// reads as `auto` and silently changes what a request carries.
+	const forge = data.forge === undefined ? DEFAULT_FORGE : forgeMode(data.forge);
+	if (!forge) return { error: FORGE_ERROR };
+	const forgeMaxChars = data.forgeMaxChars === undefined ? DEFAULT_FORGE_MAX_CHARS : forgeChars(data.forgeMaxChars);
+	if (!forgeMaxChars) return { error: FORGE_MAX_CHARS_ERROR };
 	const rules = data.rules ?? [];
 	if (!Array.isArray(rules)) return { error: "rules must be an array" };
 	const out = [];
@@ -142,9 +182,22 @@ export function parseConfig(text, dir) {
 		if (rule.turns !== undefined && !turnsValue(rule.turns)) return { error: `${at}: turns must be a non-empty string or null` };
 		const ruleTag = rule.cotTag === undefined ? undefined : tagName(rule.cotTag);
 		if (rule.cotTag !== undefined && !ruleTag) return { error: `${at}: ${TAG_ERROR}` };
-		out.push({ mode: rule.mode, provider: rule.provider, model: rule.model, prompt: rule.prompt, turns: rule.turns, cotTag: ruleTag });
+		const ruleForge = rule.forge === undefined ? undefined : forgeMode(rule.forge);
+		if (rule.forge !== undefined && !ruleForge) return { error: `${at}: ${FORGE_ERROR}` };
+		const ruleForgeChars = rule.forgeMaxChars === undefined ? undefined : forgeChars(rule.forgeMaxChars);
+		if (rule.forgeMaxChars !== undefined && !ruleForgeChars) return { error: `${at}: ${FORGE_MAX_CHARS_ERROR}` };
+		out.push({
+			mode: rule.mode,
+			provider: rule.provider,
+			model: rule.model,
+			prompt: rule.prompt,
+			turns: rule.turns,
+			cotTag: ruleTag,
+			forge: ruleForge,
+			forgeMaxChars: ruleForgeChars,
+		});
 	}
-	return { config: { default: mode, inherit, prompt, turns, cotTag, rules: out, dir, path: null } };
+	return { config: { default: mode, inherit, prompt, turns, cotTag, forge, forgeMaxChars, rules: out, dir, path: null } };
 }
 
 /** The first rule that matches, or the default. `ruleIndex` is -1 for the default. */
@@ -155,9 +208,25 @@ export function resolve(config, model) {
 		const rule = config.rules[ruleIndex];
 		if (rule.provider !== undefined && !globMatch(rule.provider, provider)) continue;
 		if (rule.model !== undefined && !globMatch(rule.model, id)) continue;
-		return { mode: rule.mode, prompt: rule.prompt ?? config.prompt, turns: rule.turns === undefined ? config.turns : rule.turns, cotTag: rule.cotTag ?? config.cotTag, ruleIndex };
+		return {
+			mode: rule.mode,
+			prompt: rule.prompt ?? config.prompt,
+			turns: rule.turns === undefined ? config.turns : rule.turns,
+			cotTag: rule.cotTag ?? config.cotTag,
+			forge: rule.forge ?? config.forge,
+			forgeMaxChars: rule.forgeMaxChars ?? config.forgeMaxChars,
+			ruleIndex,
+		};
 	}
-	return { mode: config.default, prompt: config.prompt, turns: config.turns, cotTag: config.cotTag, ruleIndex: -1 };
+	return {
+		mode: config.default,
+		prompt: config.prompt,
+		turns: config.turns,
+		cotTag: config.cotTag,
+		forge: config.forge,
+		forgeMaxChars: config.forgeMaxChars,
+		ruleIndex: -1,
+	};
 }
 
 /** A path a session setting names. A typed path means the session's cwd, and an absolute one stays. */
@@ -181,6 +250,18 @@ function settingValue(key, value) {
 		const tag = tagName(value);
 		if (!tag) return { error: TAG_ERROR };
 		return { value: tag };
+	}
+	if (key === "forge") {
+		const mode = forgeMode(value);
+		if (!mode) return { error: FORGE_ERROR };
+		return { value: mode };
+	}
+	if (key === "forgeMaxChars") {
+		// A command line carries text, so a numeric string is read as the number it spells.
+		const digits = typeof value === "string" ? Number(value.trim()) : value;
+		const chars = forgeChars(digits);
+		if (!chars) return { error: FORGE_MAX_CHARS_ERROR };
+		return { value: chars };
 	}
 	if (key === "inherit") {
 		const wanted = typeof value === "string" ? value.toLowerCase() : value;
@@ -212,14 +293,19 @@ export function sessionSettings(value) {
 /**
  * One assignment from the command. `default` removes the key, `off`/`none`/`null` turn injection
  * off, and any other value is a path, so a file literally named `off` is `./off`.
+ *
+ * The command lowercases only the verb, so the two camel-cased keys arrive lowercased and are matched
+ * here: `cotTag` as `cottag`, `forgeMaxChars` as `forgemaxchars`.
  */
 export function settingFromCommand(name, value) {
-	const key = name === "cottag" ? "cotTag" : name;
+	const lower = String(name ?? "").toLowerCase();
+	const key = lower === "cottag" ? "cotTag" : lower === "forgemaxchars" ? "forgeMaxChars" : lower;
 	if (!SETTINGS_KEYS.includes(key)) return { error: `unknown setting: ${name}` };
 	const text = String(value ?? "").trim();
 	const keyword = text.toLowerCase();
 	if (keyword === "default") return { key, value: undefined };
 	if (key === "turns" && (keyword === "off" || keyword === "none" || keyword === "null")) return { key, value: null };
+	// `forge off` names the mode `off`, so the injection keywords above stay turns-only.
 	if (!text) return { error: `${key} needs a value` };
 	const read = settingValue(key, text);
 	if (read.error) return { error: read.error };

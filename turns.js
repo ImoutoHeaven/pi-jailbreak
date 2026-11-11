@@ -30,7 +30,7 @@ try {
 const MISSING = "the yaml package is not installed (run npm install in the pi-leviathan directory)";
 const KEYS = ["user", "assistant", "result"];
 /** The keys each role's mapping may carry. `result` takes a string and no mapping at all. */
-const TAKES = { user: ["text"], assistant: ["text", "cot", "call"] };
+const TAKES = { user: ["text"], assistant: ["text", "cot", "call", "native"] };
 const CALL_KEYS = ["name", "arguments"];
 
 /** One file, read and parsed once per revision, per kind of parse. */
@@ -170,9 +170,13 @@ export function parseTurns(text) {
 		if (key === "assistant") {
 			const read = fieldsOf("assistant", item.assistant, at);
 			if (read.error) return { error: read.error };
-			const { text = "", cot = "", call } = read.fields;
+			const { text = "", cot = "", call, native } = read.fields;
 			if (typeof text !== "string") return { error: `${at}: text must be a string` };
 			if (typeof cot !== "string") return { error: `${at}: cot must be a string` };
+			if (native !== undefined && (typeof native !== "string" || !/^[A-Za-z][A-Za-z0-9_]*$/.test(native))) {
+				return { error: `${at}: native must be a reasoning field name, such as reasoning_content` };
+			}
+			if (native !== undefined && !cot.trim()) return { error: `${at}: native needs a cot` };
 			let normalized = null;
 			if (call !== undefined) {
 				const readCall = callOf(call, at);
@@ -180,7 +184,9 @@ export function parseTurns(text) {
 				normalized = readCall.call;
 			}
 			if (!text.trim() && !normalized) return { error: `${at}: an assistant needs text or a call` };
-			specs.push({ role: "assistant", cot, text, call: normalized });
+			// `native` is present only when the file names it, so a spec for a file that does not is the
+			// same object it was before this key existed.
+			specs.push({ role: "assistant", cot, text, call: normalized, ...(native === undefined ? {} : { native }) });
 			if (normalized) pending = index;
 			continue;
 		}
@@ -205,15 +211,23 @@ function zeroUsage() {
 
 /**
  * The specs as pi messages. Pure object construction: nothing here reads the clock, the transcript
- * or the file, so two calls with the same specs produce identical bytes.
+ * or the file, so two calls with the same specs, model and tag produce identical bytes.
  *
  * The fabricated cot is written at the head of the reply, fenced in the tag `cotTag` names, so the
  * turn reads as reasoning the assistant wrote down followed by what it said. The fence is text and
- * nothing else: a text block is the one block every message carries unchanged, so the same file
- * produces the same bytes whatever the model behind it.
+ * nothing else: a text block is the one block every message carries unchanged.
  *
- * The messages are stamped with the live model, so pi reads them as that model's own earlier turns
- * rather than as history carried over from somewhere else.
+ * `native` names a reasoning field instead, and it is used on exactly one adapter.
+ * `openai-completions` replays a thinking block whose signature is a field name by writing that
+ * field, so the cot reaches the wire as `reasoning_content` (or `reasoning`, or `reasoning_text`).
+ * Every other adapter is handed the text fence: a non-empty signature is a real signature to
+ * `anthropic-messages`, which sends it and has the request rejected, and
+ * `openai-responses-shared` parses it as JSON and throws. The choice follows the live model's api,
+ * which is part of the model's identity, so it costs a cache miss only when the same
+ * provider and id are re-registered on another api — a change that misses anyway.
+ *
+ * A fabricated block is stamped with the live model, so it survives `transformMessages` and pi reads
+ * it as this model's own earlier turn rather than as history carried over from somewhere else.
  */
 export function toMessages(specs, { provider, api, model, cotTag }) {
 	const messages = [];
@@ -241,9 +255,17 @@ export function toMessages(specs, { provider, api, model, cotTag }) {
 		// The cot leads the reply, fenced so it reads as reasoning the assistant wrote down rather
 		// than as a second thing it said. One block, so the fence and the reply stay one turn.
 		const tag = cotTag || "think";
-		const lead = spec.cot ? `<${tag}>\n${spec.cot}\n</${tag}>` : "";
+		// `native` names a reasoning field, and only `openai-completions` replays a thinking block that
+		// way. On any other adapter a block whose signature is a field name is worse than the fence:
+		// `anthropic-messages` sends that string as a real signature and the provider rejects the
+		// request, and `openai-responses-shared` JSON.parses it and throws. So the native form is used
+		// only where it is understood, and every other adapter gets the text fence it already reads.
+		const native = api === "openai-completions" ? (spec.native ?? null) : null;
+		const lead = spec.cot && !native ? `<${tag}>\n${spec.cot}\n</${tag}>` : "";
 		const visible = [lead, spec.text].filter(Boolean).join("\n\n");
 		if (visible) content.push({ type: "text", text: visible });
+		// Reasoning first, then what was said: a fabricated turn reads in the order the model writes.
+		if (spec.cot && native) content.unshift({ type: "thinking", thinking: spec.cot, thinkingSignature: native });
 		if (spec.call) {
 			lastCall = `tc_${index}`;
 			content.push({ type: "toolCall", id: lastCall, name: spec.call.name, arguments: spec.call.arguments });
