@@ -49,7 +49,7 @@
  * Nothing here reads or writes the session, and nothing here knows about any other extension.
  */
 
-import { clampCot, cotPair, cotText, fenced, isCotCall as isCotCallBlock, pairId } from "./cot.js";
+import { afterCotPair, clampCot, cotPair, cotText, fenced, pairId, stripTags } from "./cot.js";
 
 /** Pi's own predicate, copied so the two never drift. */
 export function isSameModel(message, live) {
@@ -104,7 +104,11 @@ export function forgeOne(message, live, spec, index = 0, maxChars = null, names 
 	if (fenced(content, names)) return null;
 	const own = ownCot(message);
 	if (!own) return null;
-	const cot = clampCot(own, maxChars);
+	// The same strip the promotion applies. A cot that carries the tag would close the fence early, and
+	// `forge` writes the fence just as `transcribe` does — one writer cleaning and the other not is how
+	// the leak survives with `transcribe` off.
+	const cot = clampCot(stripTags(own, names), maxChars);
+	if (!cot.trim()) return null;
 	if (spec.form === "toolcall") {
 		// Insertion, not a rewrite: the message may already carry a call of its own, and a second
 		// `toolCall` in one content would leave two calls waiting for results pi then answers with a
@@ -131,41 +135,20 @@ export function forgeOne(message, live, spec, index = 0, maxChars = null, names 
 	return [{ ...message, content: next }];
 }
 
-/** A text block that carries nothing but a turn marker, which `beat` writes. */
-const MARKER_ONLY = /^\[turn \d+\]$/;
-
-/**
- * Whether a message is the cot call this module writes: a single `toolCall` under one of the names,
- * carrying this extension's id prefix and a `thought` argument. The result after it belongs to it, so
- * a turn preceded by one is a turn whose cot is already in the transcript.
- *
- * The pair lives outside the message it serves, so only a list can see it. `forgeOne` cannot, which
- * is why the idempotence of the toolcall form is decided here.
- *
- * A block carrying nothing but a turn marker is not content: `beat` writes one into every assistant
- * turn, including this one, and a second pair would otherwise be added on the very next request.
- */
-function isCotCall(message, names) {
-	if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
-	const blocks = message.content.filter((block) => !(block?.type === "text" && MARKER_ONLY.test(String(block.text ?? ""))));
-	if (blocks.length !== 1) return false;
-	const block = blocks[0];
-	return isCotCallBlock(block, names) && Boolean(block.arguments && "thought" in block.arguments);
-}
-
 /**
  * The whole message list, forged. Returns the input array itself when nothing changed, so a request
  * with nothing to refill allocates nothing and stays byte-identical.
+ *
+ * A turn already preceded by a cot pair is left alone, through the same predicate `transcribe` uses:
+ * the pair sits ahead of it as a result answering a cot call, and writing another would give one turn
+ * two reasoning traces.
  */
 export function forgeHistory(messages, live, spec, maxChars = null, names = [spec?.name]) {
 	if (!Array.isArray(messages) || !live?.provider || !live?.id || !spec) return messages;
 	let changed = false;
 	const out = [];
 	for (let index = 0; index < messages.length; index++) {
-		// A turn whose cot is already written as a pair stays as it is: the pair sits ahead of it as a
-		// result answering a cot call, and writing another would give one turn two reasoning traces. The
-		// pattern is read off the input, so a second pass over a forged list is a no-op.
-		if (messages[index - 1]?.role === "toolResult" && isCotCall(messages[index - 2], names)) {
+		if (afterCotPair(messages, index, names)) {
 			out.push(messages[index]);
 			continue;
 		}

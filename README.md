@@ -138,9 +138,40 @@ text on the next request, on every model, at every provider.
 
 It reads the message and nothing else — not the live model, not the clock, not the run. That is what
 keeps a model switch free: the same history yields the same bytes whoever asks for it. It is also
-what makes it idempotent, and what makes it fade out by itself: a turn that already carries a cot,
-whoever wrote it, is left alone. Once the model writes its own fence there is nothing left to
-promote, and no state has to record that it learned.
+what makes it idempotent.
+
+A turn that already carries a fence is the case the slot exists for, not an exception. If the block
+behind that fence is signed, the turn shows a fence and an encrypted trace at once, and the signature
+is the piece that goes — a credential vouches for reasoning it carried, and a fence in front of it is
+a different, readable trace. The signature is dropped, not the fence: measured over every such turn in
+a real session, the summary behind the signature is absent from the fence and sometimes longer than
+it, so promoting the block over the fence would overwrite what the model actually wrote. A fenced
+turn with no signature is the loop closed by itself, and is left alone: the absence of a signature is
+the whole test, and no state records that the model learned.
+
+A model that learned the fence leaves the closing tag in its own reasoning, so every cot is stripped
+of every configured fence tag — the union of names, in either case, and before the fence is built, so
+the fence this module writes can not be a candidate. Removal rather than escaping: an escape is a
+spelling the model has never seen, and a model that learns it starts emitting it, while a removal is
+invisible and teaches nothing. Without it a fence closes at the model's tag and the rest of the
+reasoning lands in what the model reads as the reply.
+
+The same strip repairs a fence that is already in the transcript. A turn that carries both a fence and
+a signature is rewritten from its fence interior, so a stray tag left inside heals on the next
+request, and a fence whose opening tag was never closed is closed here rather than opened a second
+time. The interior, not the whole turn, is also what decides whether the turn still has a cot: a reply
+after the fence, or a marker `beat` appends, is not reasoning and must not stand in for it.
+
+Where the fence ends is the one judgement the repair makes, and it rests on placement rather than on
+punctuation: this module writes the closing tag on a line of its own, so a closing tag that starts a
+line is the fence's own and one inside a sentence is a quotation. The last line-initial tag with
+nothing behind it, or with a blank line and the reply behind it, is the fence; a line-initial tag with
+prose straight after it is a quotation, so the scan passes over it and lands on the real close. When
+no tag starts a line at all — a fence someone else wrote — the last line-initial tag is tried, then the
+blank-line reading, then the last tag. One shape still misreads — a reply that quotes the bare close on
+its own line *and* leaves a blank line after it is drawn into the cot — because it is byte-for-byte the
+shape the first reading must accept, and the corpus says that shape is the one worth keeping. A block
+with more than one opening tag is left alone: there is no single interior to rebuild.
 
 Nothing here is written to the session. The transcript keeps its thinking blocks and its signatures,
 so turning the slot off restores the native shape exactly; the promotion lives in the request and
@@ -152,7 +183,9 @@ live model's and a foreign one's alike. That has one consequence worth naming: `
 stops applying to any turn the promotion reached, because the turn is already carrying a cot and
 `forge` leaves it alone. A bound is a decision about what to cut from a trace that is being brought
 back, and `transcribe` exists to make the trace visible in the first place, so a cut there would
-undo the slot.
+undo the slot. The order is a preference rather than a requirement: a signed block behind a fence is
+dropped, and a turn already preceded by a cot pair is skipped by both writers, so either order
+produces the same one-trace request in both forms.
 
 The readable text is what the provider exposes. When that is a summary, the summary is what gets
 promoted, and the full trace stays encrypted where it was; nothing here can recover it.

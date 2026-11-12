@@ -91,9 +91,18 @@ function escapeTag(name) {
 	return String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Whether a text block opens with a fence in `name`. */
+/**
+ * Whether a text block opens with a fence in `name`.
+ *
+ * The tag alone, in either case, with no newline required: a model that learned the fence writes
+ * `<think>` and then its reasoning on the same line, and demanding a newline after the tag made
+ * `fenced` disagree with the repair about what a fence is. The disagreement was costly in one
+ * direction — a turn whose fence has no newline read as unfenced, so the promotion prepended a second
+ * opening tag and the request changed again on the next pass. The `>` is part of the pattern, so
+ * `<thinkable>` is not a fence.
+ */
 export function opensWith(text, name) {
-	return new RegExp(`^<${escapeTag(name)}>\\n`).test(String(text ?? ""));
+	return new RegExp(`^<${escapeTag(name)}>`, "i").test(String(text ?? ""));
 }
 
 /** The id prefix `pairId` always writes. A call carrying it is one this extension fabricated; a call
@@ -119,6 +128,33 @@ export function fenced(blocks, names) {
 		if (block?.type === "text" && names.some((name) => opensWith(block.text, name))) return true;
 	}
 	return false;
+}
+
+/** A text block that carries nothing but a turn marker, which `beat` writes. */
+export const MARKER_ONLY = /^\[turn \d+\]$/;
+
+/**
+ * Whether a message is the cot call this extension writes: one block that is a `cot_`-prefixed call to
+ * a configured name, carrying a `thought` argument, and nothing else that counts as content.
+ *
+ * A block holding nothing but a turn marker does not count: `beat` writes one into every assistant
+ * turn, including this one, and reading the marker as content would make the pair unrecognisable and
+ * put a second pair in front of the same turn on the next request.
+ *
+ * The pair lives outside the message it serves, so only a list can see it — which is why every writer
+ * that walks a list uses this, and none of them decides idempotence message by message.
+ */
+export function isCotPairMessage(message, names) {
+	if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
+	const blocks = message.content.filter((block) => !(block?.type === "text" && MARKER_ONLY.test(String(block.text ?? ""))));
+	if (blocks.length !== 1) return false;
+	const block = blocks[0];
+	return isCotCall(block, names) && Boolean(block.arguments && "thought" in block.arguments);
+}
+
+/** Whether the message at `index` is preceded by a cot pair that answers it. */
+export function afterCotPair(messages, index, names) {
+	return index >= 2 && messages[index - 1]?.role === "toolResult" && isCotPairMessage(messages[index - 2], names);
 }
 
 /**
@@ -224,6 +260,223 @@ export function clampCot(cot, maxChars) {
 }
 
 /**
+ * `text` with every fence tag in `names` removed, opening and closing alike, in either case, until
+ * nothing changes.
+ *
+ * Removal is a rewrite, and a rewrite can create the sequence it removes: `<<think>think>` loses the
+ * inner tag and leaves one behind when the two halves join, `</think</think>>` is left as `</think>`.
+ * So a tag is checked against the buffer as it is now, not against the input: after every `>` the text
+ * between the innermost unclosed `<` and that `>` is compared, and dropped when it names a tag. That
+ * catches an assembled tag on the same pass and costs one scan, where deleting a match at a time and
+ * starting over cost one scan per nesting level.
+ *
+ * Removal rather than escaping, on purpose. An escape would be a spelling the model has never seen,
+ * and a model that learns it starts emitting it; a removal is invisible, so it teaches nothing. The
+ * union of names is what matters: a turn fenced as `think` can carry `</note>` from an earlier model,
+ * and the next reader is configured for `note`.
+ */
+export function stripTags(text, names) {
+	const tags = new Set((names ?? []).map((name) => String(name).toLowerCase()));
+	const body = String(text ?? "");
+	if (tags.size === 0 || !body.includes("<")) return body;
+	let out = "";
+	// Where every `<` in `out` sits, so the text between the innermost one and the current `>` is the
+	// only candidate to check.
+	const opens = [];
+	for (const ch of body) {
+		out += ch;
+		if (ch === "<") {
+			opens.push(out.length - 1);
+			continue;
+		}
+		if (ch !== ">" || opens.length === 0) continue;
+		const at = opens[opens.length - 1];
+		const raw = out.slice(at + 1, out.length - 1).toLowerCase();
+		if (!tags.has(raw.startsWith("/") ? raw.slice(1) : raw)) continue;
+		out = out.slice(0, at);
+		opens.pop();
+	}
+	return out;
+}
+
+/** The tag pair a fence for `name` is written with. */
+function fenceTags(name) {
+	return { open: `<${name}>`, close: `</${name}>` };
+}
+
+/**
+ * What is between the fence's opening tag and its **last** closing tag, or null when the block carries
+ * no fence for `name`.
+ *
+ * The last closing tag, not the first: a model that learned the syntax leaves its own closing tag in
+ * its reasoning, and reading to the first one would take the model's tag as the end of the fence.
+ *
+ * A fence with no closing tag at all is a half-written fence, and its interior is everything after the
+ * opening one. That shape is common — the model writes `<think>` and then its reasoning, never closing
+ * it — and treating it as "no fence" would make this module prepend a second opening tag in front of
+ * the first.
+ *
+ * The comparison is case-insensitive in both directions. `opensWith` accepts `<THINK>` as a fence, so a
+ * case-sensitive anchor here would leave an uppercase fence unfenced to the repair while the turn still
+ * counts as fenced: the repair never runs and the signature stays beside it forever.
+ */
+function fenceInterior(text, name) {
+	const body = String(text ?? "");
+	const { open, close } = fenceTags(name);
+	if (!body.toLowerCase().startsWith(open.toLowerCase())) return null;
+	// The open tag is ASCII (the config validates the name), so its length is the same whatever case the
+	// block wrote it in.
+	const rest = body.slice(open.length);
+	const end = fenceEnd(rest, close);
+	return end < 0 ? rest : rest.slice(0, end);
+}
+
+/**
+ * Where the fence ends: the index of our closing tag in `rest`, or -1.
+ *
+ * `cotText` writes the closing tag on a line of its own, so the fence ends at the **last closing tag
+ * that starts a line**. A reply that merely mentions the tag writes it mid-sentence — `never write
+ * </think>` — which is the common case and the one this separates.
+ *
+ * It separates the two shapes the previous rule could not: a cot that closes an idea, breaks a
+ * paragraph and keeps reasoning, and a reply that quotes the tag and continues. Under the blank-line
+ * rule those were the same bytes, so either reading had to lose one — the first-tag reading left 16 of
+ * 16 real cots with their reasoning in the reply slot, and the last-tag reading swallowed the reply.
+ *
+ * Two readings, because the text cannot say more than this:
+ *
+ *  1. the last line-initial tag with nothing after it, or with a blank line and the reply after it.
+ *     A cot that breaks a paragraph and keeps reasoning ends this way, and such a turn often has no
+ *     reply at all. The same disjunction is also what keeps a reply that quoted the tag on its own
+ *     line out of the cot: prose follows that tag rather than a blank line, so it fails here and the
+ *     scan falls through to the fence's real close.
+ *  2. nothing qualified: the last line-initial tag, then the plain blank-line reading, then the last
+ *     tag at all. That is the shape of a fence someone else wrote, whose close is not line-initial.
+ *
+ * One shape still misreads, and it is a real one: a reply that quotes the bare close on a line of its
+ * own **and** leaves a blank line after it is drawn into the cot, because that is byte-for-byte the
+ * shape in rule 1. Every positional anchor has a counterexample of this kind — first tag, last tag,
+ * last blank-line tag, line-initial tag — so a choice has to be made, and the corpus decides which is
+ * worth losing: the line-initial rule heals the reasoning in all 16 cases that produced this module.
+ * The shape is pinned in the check so a future change makes the trade again on purpose.
+ *
+ * The blank-line rule stays as a fallback for a fence whose close is not line-initial, followed by the
+ * last tag when nothing else applies. A half-written fence — no closing tag at all — runs to the end.
+ *
+ * The scan runs over `rest` itself with a case-insensitive pattern, never over a lowered copy. A
+ * lowercase expansion can change length — U+0130 is one code unit that lowercases to two — so every
+ * index taken from a lowered string would be off by the difference, and slicing `rest` with it cuts
+ * the tag in half and swallows the blank line the reply follows.
+ *
+ * The break is `\r?\n[ \t]*\r?\n`, not `\n\s*\n`: a block with CRLF line endings would never match, and
+ * `\s` would eat the `\r` itself.
+ */
+function fenceEnd(rest, close) {
+	const pattern = new RegExp(escapeTag(close), "gi");
+	const hits = [];
+	for (let hit = pattern.exec(rest); hit; hit = pattern.exec(rest)) hits.push({ at: hit.index, end: hit.index + hit[0].length });
+	if (hits.length === 0) return -1;
+	const last = hits[hits.length - 1];
+	const lineStart = (hit) => hit.at === 0 || rest[hit.at - 1] === "\n";
+	const blankAfter = (hit) => /^\r?\n[ \t]*\r?\n/.test(rest.slice(hit.end));
+	// A closing tag that starts a line, with either nothing or a blank line and the reply behind it,
+	// closes the fence. The LAST such tag: a cot that breaks a paragraph and keeps reasoning ends with
+	// one, and such a turn often has no reply at all.
+	for (let i = hits.length - 1; i >= 0; i--) {
+		if (lineStart(hits[i]) && (rest.slice(hits[i].end).trim() === "" || blankAfter(hits[i]))) return hits[i].at;
+	}
+	// Nothing qualified: either every line-initial tag has prose behind it (a reply that began a line
+	// by quoting the tag, which the loop above already passed over), or no tag starts a line at all.
+	// A close that is not line-initial (a fence someone else wrote), then the last line-initial tag,
+	// then the plain blank-line reading.
+	for (let i = hits.length - 1; i >= 0; i--) if (lineStart(hits[i])) return hits[i].at;
+	const blanked = hits.filter(blankAfter);
+	return blanked.length ? blanked[0].at : last.at;
+}
+/**
+ * A block's text with its fence rebuilt: the opening tag, the interior with every configured tag
+ * removed, one closing tag, then whatever the block said after the fence. An unterminated fence is
+ * closed here. A block whose fence is already whole and clean is returned unchanged, so a clean fence
+ * stays byte-identical.
+ *
+ * Two shapes are left exactly as they are. A block whose interior still contains an opening tag has
+ * more than one fence in it, so there is no single interior to rebuild, and choosing the last closing
+ * tag would pull the second fence into the reasoning. A block whose fence is already whole and clean
+ * is returned unchanged so a clean fence stays byte-identical.
+ *
+ * The tail is emitted raw, always. A reply that quotes the tag keeps its quotation either way, so a
+ * tag in the tail is not a reason to skip the repair — skipping it would leave a stray closing tag
+ * inside the fence, which is the defect this exists to heal.
+ */
+function repairFence(text, name, names) {
+	const body = String(text ?? "");
+	const interior = fenceInterior(body, name);
+	if (interior === null) return body;
+	const { open, close } = fenceTags(name);
+	if (interior.toLowerCase().includes(open.toLowerCase())) return body;
+	const rest = body.slice(open.length);
+	const end = fenceEnd(rest, close);
+	const terminated = end >= 0;
+	const tail = terminated ? rest.slice(end + close.length) : "";
+	const clean = stripTags(interior, names);
+	if (terminated && clean === interior) return body;
+	return `${open}${clean}${close}${tail}`;
+}
+
+/** The message with every fenced text block repaired, or the message itself when none needed it. */
+function repaired(message, names) {
+	let changed = false;
+	const next = message.content.map((block) => {
+		if (block?.type !== "text") return block;
+		for (const name of names) {
+			const text = repairFence(block.text, name, names);
+			if (text === block.text) continue;
+			changed = true;
+			return { ...block, text };
+		}
+		return block;
+	});
+	return changed ? { ...message, content: next } : message;
+}
+
+/**
+ * What a fenced turn says in its cot, stripped of tags, and only that.
+ *
+ * It reads the fence interior, never the whole turn: a reply after the fence, or a turn marker `beat`
+ * appended, is not reasoning, and counting it would let a turn with an empty cot lose the reasoning
+ * block that is its only trace.
+ */
+function fenceContent(message, spec, names) {
+	if (spec.form === "toolcall") {
+		const pair = message.content.find((block) => isCotCall(block, names));
+		return pair && typeof pair.arguments?.thought === "string" ? stripTags(pair.arguments.thought, names).trim() : "";
+	}
+	for (const block of message.content) {
+		if (block?.type !== "text") continue;
+		for (const name of names) {
+			const interior = fenceInterior(block.text, name);
+			if (interior !== null) return stripTags(interior, names).trim();
+		}
+	}
+	return "";
+}
+
+/** Whether a block is a reasoning trace a fence already vouches for. */
+function signed(block) {
+	return block?.type === "thinking" && Boolean(block.thinkingSignature);
+}
+
+/**
+ * The message without its signed reasoning, or the message itself when it has none. A signature beside
+ * a fence is the second trace the invariant forbids; an unsigned block is the model's own reasoning in
+ * the native shape, and is left where it is.
+ */
+function dropSigned(message) {
+	if (!Array.isArray(message?.content) || !message.content.some(signed)) return message;
+	return { ...message, content: message.content.filter((block) => !signed(block)) };
+}
+
+/**
  * One message with its reasoning written as text, or the message itself when it is left alone.
  *
  * This is the opposite trade from `forge`: forge adds a fence beside a thinking block it keeps, so
@@ -232,11 +485,20 @@ export function clampCot(cot, maxChars) {
  * nor summarized. Keeping both would show one turn two reasoning traces, which is the state forge's
  * second invariant exists to prevent.
  *
- * Two turns are left alone, for two different reasons:
+ * A turn already carrying a fence is the case this slot exists for, not an exception. When the block
+ * behind that fence is signed, the turn shows a fence and an encrypted trace at once — the state the
+ * second invariant forbids. The signature is the piece that goes, and only the signature: a credential
+ * vouches for reasoning it carried, and the fence in front of it is a different, readable trace.
  *
- *  - a turn already carrying a cot, whoever wrote it. That is the loop closing by itself: once the
- *    model writes its own fence, this function has nothing to do, and no state has to record that.
- *  - a turn with nothing readable, a redacted or empty block. There is nothing to promote.
+ * The two traces are not copies of each other. Measured over every such turn in a real session, the
+ * summary behind the signature is absent from the fence, sometimes shorter and sometimes longer, so
+ * promoting the block over the fence would overwrite what the model actually wrote with the
+ * provider's summary of a trace it had already decided to write down. Dropping the signature keeps
+ * both readable traces and removes the encrypted third, which is the one that carries nothing a
+ * reader can use.
+ *
+ * One turn is left alone: a fenced turn with no signature, which is the loop closed by itself. There
+ * is no state that records that the model learned; the absence of a signature is the whole test.
  *
  * The decision reads the message and nothing else, in particular not the live model. That is what
  * keeps a model switch free: the same history yields the same bytes whichever model asks for it.
@@ -246,10 +508,23 @@ export function clampCot(cot, maxChars) {
  */
 export function transcribeOne(message, spec, names, maxChars = null, index = 0) {
 	if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
-	if (fenced(message.content, names)) return message;
+	if (fenced(message.content, names)) {
+		// Only a signed block is a second trace. A turn the model fenced itself and left unsigned is the
+		// loop closed by itself, and rewriting it would change what the model said for nothing.
+		if (!message.content.some(signed)) return message;
+		// The fence this turn carries is the one place a stray tag survives: it was written by the model
+		// or by an earlier request, and the unfenced path below never sees it again. Rebuilding it from
+		// its interior is what keeps it closing where it should.
+		const fixed = repaired(message, names);
+		if (!fenceContent(fixed, spec, names)) return fixed;
+		return [dropSigned(fixed)];
+	}
 	const own = ownCot(message);
 	if (!own) return message;
-	const cot = clampCot(own, maxChars);
+	// The tags go before the fence is built, never after: ours is written by `cotText` below, so it can
+	// not be a candidate.
+	const cot = clampCot(stripTags(own, names), maxChars);
+	if (!cot.trim()) return message;
 	const kept = message.content.filter((block) => block?.type !== "thinking");
 	if (spec.form === "toolcall") {
 		// The block is replaced by a pair ahead of the message, and the message's own stamp is what the
@@ -268,13 +543,25 @@ export function transcribeOne(message, spec, names, maxChars = null, index = 0) 
 /**
  * The whole list transcribed. Returns the input array itself when nothing changed, so a request with
  * nothing to promote allocates nothing.
+ *
+ * A turn already preceded by a cot pair is left alone. Promotion writes a pair ahead of the turn, so a
+ * second pass over its own output would write a second pair in front of the same turn — which is the
+ * one shape a transcript may not hold twice, and the reason this walks the list instead of deciding
+ * each message on its own.
  */
 export function transcribeHistory(messages, spec, names, maxChars = null) {
 	if (!Array.isArray(messages) || !spec) return messages;
 	let changed = false;
 	const out = [];
 	for (let index = 0; index < messages.length; index++) {
-		const done = transcribeOne(messages[index], spec, names, maxChars, index);
+		if (afterCotPair(messages, index, names)) {
+			// The reasoning is already in a pair ahead of this turn, so a fence would be a second trace. The
+			// signature is not: it is the encrypted third, and it goes.
+			const bare = dropSigned(messages[index]);
+			if (bare !== messages[index]) changed = true;
+			out.push(bare);
+			continue;
+		}		const done = transcribeOne(messages[index], spec, names, maxChars, index);
 		if (done === messages[index]) {
 			out.push(messages[index]);
 			continue;
