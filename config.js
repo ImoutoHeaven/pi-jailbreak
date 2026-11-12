@@ -2,7 +2,7 @@
  * The rule table and the resolver.
  *
  * The record has five slots and they are independent: `persona`, `gate`, `turns`, `forge` and
- * `cotTag`. Nothing here says "this model is a leviathan" — a model is whatever its five slots
+ * `cot`. Nothing here says "this model is a leviathan" — a model is whatever its five slots
  * resolve to. That is the whole point: a model can carry forge alone, or persona and gate with no
  * turns, and no slot drags another along.
  *
@@ -11,7 +11,7 @@
  *     session  ->  the first matching rule  ->  the file's `default`  ->  the built-in record
  *
  * The built-in record is false for all four switches, so an extension with nothing configured
- * changes nothing. `cotTag` falls back to `think`.
+ * changes nothing. `cot` falls back to `text:think`.
  *
  * A rule matches by provider and model: both optional, a missing field matches anything, a pattern
  * without `*` is exact, and `*` is the only wildcard. Every other regex metacharacter is escaped
@@ -32,12 +32,38 @@ export const CONFIG_NAME = "leviathan.json";
 export const DEFAULT_PROMPT = "prompt.md";
 export const DEFAULT_TURNS = "turn0.yml";
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
-/** The tag that fences the cot at the head of a fabricated or refilled turn. `think` and `<think>`
- * are one tag. */
-export const DEFAULT_COT_TAG = "think";
+/**
+ * How the cot reaches a request, in the two forms it has. The form and the name are one value, so a
+ * slot cannot say "toolcall" without saying which tool: `text:<tag>` fences the reasoning in a tag
+ * at the head of the reply, `toolcall:<name>` sends it as the argument of that real tool's call.
+ */
+export const COT_FORMS = Object.freeze(["text", "toolcall"]);
+/** The value a session uses when nothing names one. */
+export const DEFAULT_COT = "text:think";
+/**
+ * Tool names a `toolcall:` form may not take: every tool pi itself can declare. A cot that borrows a
+ * real tool's name registers a second tool under that name, which replaces pi's own in the session,
+ * and its fabricated call becomes indistinguishable from a real one. `tool_search` and `codemode`
+ * are the extension tools pi ships enabled or one setting away; `ask_authorize_gate` is this
+ * extension's own.
+ */
+export const RESERVED_COT_NAMES = Object.freeze([
+	"read",
+	"write",
+	"edit",
+	"bash",
+	"powershell",
+	"ls",
+	"find",
+	"grep",
+	"glob",
+	"codemode",
+	"tool_search",
+	"ask_authorize_gate",
+]);
 
 /** The slots, in the order the footer renders them. */
-export const SLOTS = Object.freeze(["persona", "gate", "turns", "forge", "cotTag"]);
+export const SLOTS = Object.freeze(["persona", "gate", "turns", "forge", "cot"]);
 /** The four switches, which are what a footer glyph and a panel row report as on or off. */
 export const SWITCHES = Object.freeze(["persona", "gate", "turns", "forge"]);
 /** The slots a session answer may carry. `inherit` is the scope, not a slot. */
@@ -45,7 +71,7 @@ export const SETTINGS_KEYS = Object.freeze([...SLOTS, "inherit"]);
 
 const CONFIG_KEYS = Object.freeze(["default", "inherit", "rules"]);
 const RULE_KEYS = Object.freeze(["provider", "model", ...SLOTS]);
-const TAG_ERROR = "cotTag must be a tag name, such as think or <think>";
+const COT_ERROR = `cot must be text:<tag> or toolcall:<name>, and not ${RESERVED_COT_NAMES.join(", ")}`;
 const HUMAN_ERROR = (slot) => `${slot} must be false, true, or a non-empty path`;
 const FORGE_ERROR = "forge must be false, true, or { maxChars: <positive whole number> | null }";
 const MAX_CHARS_ERROR = "maxChars must be a positive whole number, or null for no bound";
@@ -55,16 +81,40 @@ const MAX_CHARS_ERROR = "maxChars must be a positive whole number, or null for n
  * switches are off: installing the extension and writing no config changes no request.
  */
 export function emptyRecord() {
-	return { persona: false, gate: false, turns: false, forge: false, cotTag: DEFAULT_COT_TAG };
+	return { persona: false, gate: false, turns: false, forge: false, cot: DEFAULT_COT };
 }
 
-/** A tag name from either spelling, or null when the value is not one. A bracketed value has to be
- * exactly one tag, so a stray `>` or a second pair is rejected rather than trimmed away. */
-function tagName(value) {
+/**
+ * One cot spec as `{ form, name }`, or null when the value is not one. The form prefix is required,
+ * because a bare name cannot say whether the fence is a tag or a tool. The one tolerance left is
+ * brackets around a text tag: `text:<think>` and `text:think` are one fence.
+ */
+export function cotSpec(value) {
 	if (typeof value !== "string") return null;
-	const trimmed = value.trim();
-	const name = /^<([^<>]+)>$/.exec(trimmed)?.[1] ?? trimmed;
-	return /^[A-Za-z][A-Za-z0-9_-]*$/.test(name) ? name : null;
+	const text = value.trim();
+	const cut = text.indexOf(":");
+	if (cut < 1) return null;
+	const form = text.slice(0, cut).trim().toLowerCase();
+	if (!COT_FORMS.includes(form)) return null;
+	let name = text.slice(cut + 1).trim();
+	const bracketed = /^<([^<>]+)>$/.exec(name)?.[1];
+	if (bracketed !== undefined) {
+		// A bracketed value has to be exactly one tag, and only the text form writes one.
+		if (form !== "text") return null;
+		name = bracketed;
+	}
+	if (form === "toolcall") {
+		// A tool name travels to a provider as a function name, so the provider's own charset applies.
+		if (!/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(name)) return null;
+		if (RESERVED_COT_NAMES.includes(name.toLowerCase())) return null;
+		return { form, name };
+	}
+	return /^[A-Za-z][A-Za-z0-9_-]*$/.test(name) ? { form, name } : null;
+}
+
+/** A cot spec as the one string a config, a command and a channel payload all spell. */
+export function cotLabel(spec) {
+	return `${spec.form}:${spec.name}`;
 }
 
 /** A character bound as `{ maxChars }`, where `null` is no bound at all. `null` is the only value
@@ -112,14 +162,14 @@ function slotSpec(slot, value) {
 	if (slot === "turns") return pathSlot(value, DEFAULT_TURNS);
 	if (slot === "gate") return plainSlot(value);
 	if (slot === "forge") return forgeSlot(value);
-	const tag = tagName(value);
-	return tag ? { spec: tag } : null;
+	const cot = cotSpec(value);
+	return cot ? { spec: cotLabel(cot) } : null;
 }
 
 /** A slot's error message, which names the slot and what it takes. */
 function slotError(slot) {
 	if (slot === "forge") return FORGE_ERROR;
-	if (slot === "cotTag") return TAG_ERROR;
+	if (slot === "cot") return COT_ERROR;
 	return HUMAN_ERROR(slot);
 }
 
@@ -190,13 +240,13 @@ export function parseConfig(text, dir) {
 	if (!data || typeof data !== "object" || Array.isArray(data)) return { error: "not an object" };
 	for (const key of Object.keys(data)) {
 		if (!CONFIG_KEYS.includes(key)) {
-			const hint = key === "mode" || key === "prompt" || key === "forgeMaxChars" ? " (the record has persona, gate, turns, forge and cotTag)" : "";
+			const hint = key === "mode" || key === "prompt" || key === "forgeMaxChars" || key === "cotTag" ? " (the record has persona, gate, turns, forge and cot)" : "";
 			return { error: `${key} is not a config key (${CONFIG_KEYS.join(", ")})${hint}` };
 		}
 	}
 	const inherit = data.inherit ?? "keyed";
 	if (!INHERITS.includes(inherit)) return { error: `inherit must be ${INHERITS.join(", ")}` };
-	const fallback = readRecord(data.default ?? {}, ["persona", "gate", "turns", "forge", "cotTag"], "default");
+	const fallback = readRecord(data.default ?? {}, ["persona", "gate", "turns", "forge", "cot"], "default");
 	if (fallback.error) return { error: fallback.error };
 	const rules = data.rules ?? [];
 	if (!Array.isArray(rules)) return { error: "rules must be an array" };
@@ -227,17 +277,32 @@ export function emptyConfig(dir) {
 const LAYERS = Object.freeze(["session", "rule", "default", "builtin"]);
 
 /**
- * Every tag the config names, plus the built-in one. `forge` and `turns` both write a fence, and a
- * turn fenced under one tag must be recognised as fenced by a model configured with another, so the
- * set travels together with the resolved tag.
+ * Every cot the config names, plus the built-in one, as label strings. `forge` and `turns` both
+ * write a cot, and a turn already carrying one must be recognised under any of them, so the set
+ * travels with the resolved cot rather than being rebuilt per model.
  */
-export function configTags(config) {
-	const tags = new Set([DEFAULT_COT_TAG]);
-	if (config?.default?.cotTag) tags.add(config.default.cotTag);
+export function configCots(config) {
+	const cots = new Set([DEFAULT_COT]);
+	if (config?.default?.cot) cots.add(config.default.cot);
 	for (const rule of config?.rules ?? []) {
-		if (rule.cotTag) tags.add(rule.cotTag);
+		if (rule.cot) cots.add(rule.cot);
 	}
-	return tags;
+	return cots;
+}
+
+/**
+ * The names a caller must treat as "this turn already carries a cot": every configured cot's name,
+ * whatever its form. A turn fenced as `text:think` is not refenced as `toolcall:think`, because two
+ * fences on one turn read as two reasoning traces.
+ */
+export function cotNames(cots, resolved) {
+	const names = new Set();
+	for (const label of cots) {
+		const spec = cotSpec(label);
+		if (spec) names.add(spec.name);
+	}
+	if (resolved) names.add(cotSpec(resolved)?.name ?? resolved);
+	return [...names];
 }
 
 /**
@@ -289,6 +354,10 @@ function absolutePath(value) {
  * One session setting from a typed or stored value. `undefined` removes the slot, so the file
  * decides again. A path slot accepts a path, and a path that is not absolute is taken from the
  * session's cwd, because a command line names what the user can see.
+ *
+ * The two shipped names are the exception: `prompt.md` and `turn0.yml` mean the package copy on
+ * every layer, so they are kept bare. Turning one into a path would name a different file — the one
+ * in whatever directory the recovering process happens to sit in.
  */
 function settingValue(key, value) {
 	if (value === undefined) return { value: undefined };
@@ -299,9 +368,12 @@ function settingValue(key, value) {
 	}
 	if (key === "persona" || key === "turns") {
 		if (value === false) return { value: false };
-		if (value === true) return { value: key === "persona" ? DEFAULT_PROMPT : DEFAULT_TURNS };
+		const shipped = key === "persona" ? DEFAULT_PROMPT : DEFAULT_TURNS;
+		if (value === true) return { value: shipped };
 		if (typeof value !== "string" || !value.trim()) return { error: `a ${key} path must be non-empty` };
-		return { value: absolutePath(value.trim()) };
+		const text = value.trim();
+		if (text === shipped) return { value: shipped };
+		return { value: absolutePath(text) };
 	}
 	const read = slotSpec(key, value);
 	if (!read) return { error: slotError(key) };
@@ -331,21 +403,21 @@ const ON = new Set(["on", "true", "yes"]);
 
 /**
  * One assignment from the command, or the reason it is not one. `default` removes the slot, `off`
- * and `on` are the two switch values, and anything else is a path or a tag.
+ * and `on` are the two switch values, and anything else is a path or a cot spec.
  *
- * The command lowercases only the verb, so a camel-cased slot arrives lowercased. `forge` also takes
+ * The command lowercases only the verb, so a slot arrives as typed. `forge` also takes
  * `maxChars <n>` and `maxChars none`, which set the bound and turn the slot on.
  */
 export function settingFromCommand(name, value) {
-	const lower = String(name ?? "").toLowerCase();
-	const key = lower === "cottag" ? "cotTag" : lower;
+	const key = String(name ?? "").toLowerCase();
 	if (!SETTINGS_KEYS.includes(key)) return { error: `unknown setting: ${name}` };
 	const text = String(value ?? "").trim();
 	const keyword = text.toLowerCase();
 	if (keyword === "default") return { key, value: undefined };
 	if (!text) return { error: `${key} needs a value` };
-	if (key === "cotTag") {
-		const read = settingValue("cotTag", text);
+	// `cot` names a form and a name rather than a switch, so `off` and `on` say nothing here.
+	if (key === "cot") {
+		const read = settingValue("cot", text);
 		return read.error ? { error: read.error } : { key, value: read.value };
 	}
 	if (key === "inherit") {

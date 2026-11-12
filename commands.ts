@@ -31,8 +31,9 @@ const ARGS = [
 	"forge default",
 	"forge maxChars 1200",
 	"forge maxChars none",
-	"cotTag think",
-	"cotTag default",
+	"cot text:think",
+	"cot toolcall:think",
+	"cot default",
 	"inherit keyed",
 	"inherit tree",
 	"inherit none",
@@ -41,10 +42,10 @@ const ARGS = [
 ];
 
 const USAGE =
-	"persona on|off|<path>|default · gate on|off|default · turns on|off|<path>|default · forge on|off|maxChars <n|none>|default · cotTag <tag>|default · inherit keyed|tree|none · remember · reset";
+	"persona on|off|<path>|default · gate on|off|default · turns on|off|<path>|default · forge on|off|maxChars <n|none>|default · cot <form>:<name>|default · inherit keyed|tree|none · remember · reset";
 
-/** The verbs that set one slot, plus the scope key. The first token is lowercased, so `cotTag`
- * arrives as `cottag`. */
+/** The verbs that set one slot, plus the scope key. The first token is lowercased, so a slot's verb
+ * compares case-insensitively while its value keeps the case the user typed. */
 const SETTINGS = [...SLOTS.map((slot) => slot.toLowerCase()), "inherit"];
 
 function say(ctx: any, text: string, type: "info" | "error" = "info") {
@@ -57,7 +58,7 @@ function say(ctx: any, text: string, type: "info" | "error" = "info") {
 
 export function registerCommands(pi: any, hooks: Hooks) {
 	pi.registerCommand("leviathan", {
-		description: "Show or set this model's record: persona, gate, turns, forge, cotTag, inherit, remember, reset",
+		description: "Show or set this model's record: persona, gate, turns, forge, cot, inherit, remember, reset",
 		getArgumentCompletions: (prefix: string) => {
 			const typed = String(prefix ?? "").trim().toLowerCase();
 			const items = ARGS.filter((value) => value.toLowerCase().startsWith(typed));

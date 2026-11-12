@@ -20,10 +20,11 @@
  * Four invariants, all load-bearing:
  *
  * 1. Pure. The result depends only on the message's own persisted bytes, the live
- *    `provider`/`api`/`id` triple, and the tags. No clock, no model call, no mutable state. A pure
- *    answer is what keeps a grown conversation byte-identical at every position it already sent, so
- *    the provider's prompt cache keeps hitting.
- * 2. No re-stamp. The forged message keeps its original `provider`, `api` and `model`. Re-stamping
+ *    `provider`/`api`/`id` triple, and the cot spec. No clock, no model call, no mutable state. A
+ *    pure answer is what keeps a grown conversation byte-identical at every position it already
+ *    sent, so the provider's prompt cache keeps hitting, and it is what makes a refill idempotent:
+ *    the same history asked twice produces the same messages.
+ * 2. No re-stamp. The forged turn keeps its original `provider`, `api` and `model`. Re-stamping
  *    would make pi treat the message as the live model's own and carry its thinking block as well,
  *    giving one turn two reasoning traces.
  * 3. No floor and no run boundary. Skipping the messages at or after the last user message looks
@@ -31,20 +32,24 @@
  *    enters the forge region in the next, and bytes already sent change under it. Purity covers the
  *    whole history, and `isSameModel` alone keeps the live run's own turns out, because those are
  *    stamped with the live model. The extension never needs to know where a run started.
- * 4. Add only. The forged turn is the original with the fence written in front of its visible text.
- *    Nothing else about the message changes.
+ * 4. Add only. Nothing the message already said changes, and no message is dropped.
  *
- * The fence goes inside the first text block rather than in a block of its own. An assistant's text
- * blocks are joined with no separator between them, so two blocks would concatenate the fence and
- * the reply; one block, `\n\n` between the fence and the reply, is the shape the turn file already
- * writes.
+ * The two forms write the cot differently, and `cot.js` owns both:
  *
- * The tag is per model, so the set of tags the config names travels with it: a turn already fenced
- * under one model's tag counts as fenced for every other, or a model switch would stack a second
- * fence on it.
+ *  - `text:<tag>` rewrites the first text block in place: `<tag>\n...cot...\n</tag>\n\n<reply>`. One
+ *    block, because an assistant's text blocks are joined with no separator between them.
+ *  - `toolcall:<name>` inserts a call and its result ahead of the message. Insertion rather than a
+ *    rewrite: the message may already carry a call of its own, and a second `toolCall` in the same
+ *    content would leave two calls waiting for results pi will then invent errors for.
+ *
+ * The name is per model, so the set of names the config names travels with it: a turn already
+ * fenced under one model's name counts as fenced for every other, or a model switch would stack a
+ * second fence on it.
  *
  * Nothing here reads or writes the session, and nothing here knows about any other extension.
  */
+
+import { clampCot, cotPair, cotText, fenced, isCotCall as isCotCallBlock, pairId } from "./cot.js";
 
 /** Pi's own predicate, copied so the two never drift. */
 export function isSameModel(message, live) {
@@ -74,47 +79,42 @@ export function ownCot(message) {
 	return parts.join("\n\n");
 }
 
-/** Whether the visible text already opens with a fence, under any tag the config names. */
-export function fenced(text, tags) {
-	const value = String(text ?? "");
-	for (const tag of tags) {
-		if (new RegExp("^<" + String(tag).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ">\\n").test(value)) return true;
-	}
-	return false;
-}
-
 /**
- * One assistant message's forged form, or null when it is left exactly as it is.
+ * One assistant message's forged form as the messages that replace it, or null when it is left
+ * exactly as it is. The result is a list because the toolcall form inserts a call and its result
+ * ahead of the message while the text form replaces the message with one copy of itself.
  *
  * `maxChars` bounds the refilled CoT, and `null` means no bound, which is the default: a truncated
  * trace is not the reasoning the turn wrote, and a model that reads a cut-off version of its own
- * thinking has reason to distrust the turn it is being shown. The bound is applied before the fence
+ * thinking has reason to distrust the turn it is being shown. The bound is applied before the cot
  * is built, so it is part of the pure answer rather than a second pass.
+ *
+ * `index` is the message's position, and it salts the call id. Two foreign turns carrying the same
+ * reasoning under the same stamp would otherwise produce one id twice, and a transcript may not hold
+ * two calls with one id.
  */
-export function forgeOne(message, live, tag, maxChars = null, tags = [tag]) {
+export function forgeOne(message, live, spec, index = 0, maxChars = null, names = [spec?.name]) {
 	if (message?.role !== "assistant") return null;
 	// Pi carries this message's CoT already, so the turn is left exactly as it is.
 	if (isSameModel(message, live)) return null;
-	let cot = ownCot(message);
-	if (!cot) return null;
-	if (Number.isSafeInteger(maxChars) && maxChars > 0 && cot.length > maxChars) {
-		// A cut inside a surrogate pair would leave a lone code unit in the request bytes, and the whole
-		// design leans on those bytes being reproducible. Backing off a pair that starts the trace would
-		// leave nothing, so the pair is kept whole instead: an empty fence with only a marker reads as a
-		// reasoning block the turn never wrote.
-		let cut = maxChars;
-		if (/[\uD800-\uDBFF]/.test(cot[cut - 1])) cut = cut > 1 ? cut - 1 : 2;
-		// Keeping a leading pair whole can reach the end of a short trace, and a marker on a trace that is
-		// entirely present would tell the model its reasoning was cut when none of it was.
-		cot = cut < cot.length ? `${cot.slice(0, cut)}\n[... reasoning truncated]` : cot.slice(0, cut);
-	}
 	const content = Array.isArray(message.content) ? message.content : [];
+	// Already carrying a cot, by us on an earlier request or by a pasted message: idempotent. Any name
+	// the config names counts, whatever form it was written in, so a turn this extension already
+	// fenced under another model's name is not fenced a second time.
+	if (fenced(content, names)) return null;
+	const own = ownCot(message);
+	if (!own) return null;
+	const cot = clampCot(own, maxChars);
+	if (spec.form === "toolcall") {
+		// Insertion, not a rewrite: the message may already carry a call of its own, and a second
+		// `toolCall` in one content would leave two calls waiting for results pi then answers with a
+		// fabricated error. The pair is stamped with the turn's own stamp, so it stays part of the same
+		// foreign turn rather than becoming the live model's second reasoning trace.
+		const pair = cotPair(cot, spec.name, pairId(`${index}\u0000${cot}`, message), message);
+		return [...pair, message];
+	}
 	const lead = content.findIndex((block) => block?.type === "text");
-	// Already fenced, by us on an earlier request or by a pasted message: idempotent. Any tag the
-	// config names counts as a fence, so a turn this extension already fenced under another model's
-	// tag is not fenced a second time: two fences on one turn read as two reasoning traces.
-	if (lead >= 0 && fenced(content[lead].text, tags)) return null;
-	const fence = `<${tag}>\n${cot}\n</${tag}>`;
+	const fence = cotText(cot, spec.name);
 	const next = content.slice();
 	if (lead >= 0) {
 		// One block: an assistant's text blocks are joined with no separator.
@@ -128,22 +128,47 @@ export function forgeOne(message, live, tag, maxChars = null, tags = [tag]) {
 		next.splice(at, 0, { type: "text", text: fence });
 	}
 	// The stamp travels unchanged: `provider`, `api`, `model`, `usage`, `stopReason`, everything.
-	return { ...message, content: next };
+	return [{ ...message, content: next }];
+}
+
+/**
+ * Whether a message is the cot call this module writes: a single `toolCall` under one of the names,
+ * carrying this extension's id prefix and a `thought` argument. The result after it belongs to it, so
+ * a turn preceded by one is a turn whose cot is already in the transcript.
+ *
+ * The pair lives outside the message it serves, so only a list can see it. `forgeOne` cannot, which
+ * is why the idempotence of the toolcall form is decided here.
+ */
+function isCotCall(message, names) {
+	if (message?.role !== "assistant" || !Array.isArray(message.content) || message.content.length !== 1) return false;
+	const block = message.content[0];
+	return isCotCallBlock(block, names) && Boolean(block.arguments && "thought" in block.arguments);
 }
 
 /**
  * The whole message list, forged. Returns the input array itself when nothing changed, so a request
  * with nothing to refill allocates nothing and stays byte-identical.
  */
-export function forgeHistory(messages, live, tag, maxChars = null, tags = [tag]) {
-	if (!Array.isArray(messages) || !live?.provider || !live?.id) return messages;
+export function forgeHistory(messages, live, spec, maxChars = null, names = [spec?.name]) {
+	if (!Array.isArray(messages) || !live?.provider || !live?.id || !spec) return messages;
 	let changed = false;
-	const out = messages.map((message) => {
-		const forged = forgeOne(message, live, tag, maxChars, tags);
-		if (!forged) return message;
+	const out = [];
+	for (let index = 0; index < messages.length; index++) {
+		// A turn whose cot is already written as a pair stays as it is: the pair sits ahead of it as a
+		// result answering a cot call, and writing another would give one turn two reasoning traces. The
+		// pattern is read off the input, so a second pass over a forged list is a no-op.
+		if (messages[index - 1]?.role === "toolResult" && isCotCall(messages[index - 2], names)) {
+			out.push(messages[index]);
+			continue;
+		}
+		const forged = forgeOne(messages[index], live, spec, index, maxChars, names);
+		if (!forged) {
+			out.push(messages[index]);
+			continue;
+		}
 		changed = true;
-		return forged;
-	});
+		out.push(...forged);
+	}
 	return changed ? out : messages;
 }
 

@@ -6,10 +6,18 @@ import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import def from "./index.ts";
 import { authorizeGate, CSAM_FIELD, GATE_FIELDS, GATE_TOOL } from "./gate.js";
-import { configPath, configTags, DEFAULT_PROMPT, DEFAULT_TURNS, emptyConfig, emptyRecord, globMatch, loadConfig, parseConfig, promptPath, resolve as resolveMode, sessionSettings, settingFromCommand, SETTINGS_KEYS, SLOTS, SWITCHES, turnsPath } from "./config.js";
+import { configCots, configPath, cotNames, cotSpec, DEFAULT_COT, DEFAULT_PROMPT, DEFAULT_TURNS, emptyConfig, emptyRecord, globMatch, loadConfig, parseConfig, promptPath, RESERVED_COT_NAMES, resolve as resolveMode, sessionSettings, settingFromCommand, SETTINGS_KEYS, SLOTS, SWITCHES, turnsPath } from "./config.js";
 import { applies, decode, encode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { loadTurns, parseTurns, toMessages } from "./turns.js";
 import { forgeHistory, forgeOne, isSameModel, ownCot, prefixStable } from "./forge.js";
+import { COT_ACK, fenced as carriesCot } from "./cot.js";
+
+/** A cot spec, as the config parses one. */
+const TEXT_THINK = { form: "text", name: "think" };
+const TEXT_ANALYSIS = { form: "text", name: "analysis" };
+const TOOL_THINK = { form: "toolcall", name: "think" };
+/** The text form's forged message, or null when the turn is left as it is. */
+const forgeText = (message, live, spec = TEXT_THINK, maxChars = null, names = [spec.name]) => forgeOne(message, live, spec, 0, maxChars, names)?.[0] ?? null;
 
 // ---------------------------------------------------------------------------
 // prompt.md content invariants
@@ -214,14 +222,14 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 	assert.equal(bare.config.inherit, "keyed");
 	assert.equal(bare.config.dir, "/cfg");
 	assert.deepEqual(emptyConfig("/cfg").default, {}, "and neither does the empty config");
-	assert.deepEqual(emptyRecord(), { persona: false, gate: false, turns: false, forge: false, cotTag: "think" });
+	assert.deepEqual(emptyRecord(), { persona: false, gate: false, turns: false, forge: false, cot: "text:think" });
 	const resolved = resolveMode(bare.config, { provider: "any", id: "model" });
 	assert.deepEqual(
-		{ persona: resolved.persona, gate: resolved.gate, turns: resolved.turns, forge: resolved.forge, cotTag: resolved.cotTag },
+		{ persona: resolved.persona, gate: resolved.gate, turns: resolved.turns, forge: resolved.forge, cot: resolved.cot },
 		emptyRecord(),
 		"every slot falls through to the built-in record",
 	);
-	assert.deepEqual(resolved.sources, { persona: "builtin", gate: "builtin", turns: "builtin", forge: "builtin", cotTag: "builtin" });
+	assert.deepEqual(resolved.sources, { persona: "builtin", gate: "builtin", turns: "builtin", forge: "builtin", cot: "builtin" });
 	assert.equal(resolved.ruleIndex, -1);
 }
 
@@ -230,11 +238,11 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 {
 	const config = parseConfig(
 		JSON.stringify({
-			default: { persona: true, cotTag: "think" },
+			default: { persona: true, cot: "text:think" },
 			rules: [
 				{ provider: "a", model: "one", gate: true },
 				{ provider: "a", model: "two", turns: true, forge: { maxChars: 800 } },
-				{ provider: "a", model: "three", persona: false, cotTag: "<analysis>" },
+				{ provider: "a", model: "three", persona: false, cot: "text:analysis" },
 				{ model: "*three*", forge: false },
 			],
 		}),
@@ -243,11 +251,11 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 	assert.equal(config.error, undefined);
 	const one = resolveMode(config, { provider: "a", id: "one" });
 	assert.deepEqual(
-		{ persona: one.persona, gate: one.gate, turns: one.turns, forge: one.forge, cotTag: one.cotTag },
-		{ persona: DEFAULT_PROMPT, gate: true, turns: false, forge: false, cotTag: "think" },
+		{ persona: one.persona, gate: one.gate, turns: one.turns, forge: one.forge, cot: one.cot },
+		{ persona: DEFAULT_PROMPT, gate: true, turns: false, forge: false, cot: "text:think" },
 		"a rule that names gate leaves the other four to the layers below it",
 	);
-	assert.deepEqual(one.sources, { persona: "default", gate: "rule", turns: "builtin", forge: "builtin", cotTag: "default" });
+	assert.deepEqual(one.sources, { persona: "default", gate: "rule", turns: "builtin", forge: "builtin", cot: "default" });
 
 	const two = resolveMode(config, { provider: "a", id: "two" });
 	assert.deepEqual(
@@ -255,11 +263,11 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		{ persona: DEFAULT_PROMPT, gate: false, turns: DEFAULT_TURNS, forge: { maxChars: 800 } },
 		"a rule that names turns and forge leaves persona and gate alone",
 	);
-	assert.deepEqual(two.sources, { persona: "default", gate: "builtin", turns: "rule", forge: "rule", cotTag: "default" });
+	assert.deepEqual(two.sources, { persona: "default", gate: "builtin", turns: "rule", forge: "rule", cot: "default" });
 
 	const three = resolveMode(config, { provider: "a", id: "three" });
 	assert.equal(three.persona, false, "a rule turns a slot off that the file turned on");
-	assert.equal(three.cotTag, "analysis", "angle brackets are not part of the tag name");
+	assert.equal(three.cot, "text:analysis", "the form is part of the value, and brackets are one spelling of a tag");
 	assert.equal(three.forge, false, "a wildcard rule behind it is shadowed by the exact one");
 
 	// The session wins over every file layer, and only for the slots it names.
@@ -277,7 +285,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		"/cfg",
 	).config;
 	const x = resolveMode(moved, { provider: "a", id: "x" });
-	assert.deepEqual({ ...x.sources }, { persona: "default", gate: "rule", turns: "default", forge: "default", cotTag: "builtin" });
+	assert.deepEqual({ ...x.sources }, { persona: "default", gate: "rule", turns: "default", forge: "default", cot: "builtin" });
 	assert.equal(x.gate, false);
 }
 console.log("ok record resolution");
@@ -294,7 +302,7 @@ console.log("ok record resolution");
 	assert.deepEqual(one("forge", { maxChars: null }).config.default.forge, { maxChars: null });
 	assert.equal(one("forge", false).config.default.forge, false);
 	assert.equal(one("gate", true).config.default.gate, true);
-	assert.equal(one("cotTag", "<analysis>").config.default.cotTag, "analysis");
+	assert.equal(one("cot", "text:<analysis>").config.default.cot, "text:analysis", "brackets are one spelling of a text tag");
 
 	for (const [slot, bad] of [
 		["persona", 1],
@@ -314,15 +322,42 @@ console.log("ok record resolution");
 		["forge", { maxChars: 1.5 }],
 		["forge", { maxChars: "1200" }],
 		["forge", { bound: 1200 }],
-		["cotTag", ""],
-		["cotTag", "<>"],
-		["cotTag", "a b"],
-		["cotTag", "1tag"],
-		["cotTag", "<a><b>"],
+		["cot", ""],
+		["cot", "<>"],
+		["cot", "a b"],
+		["cot", "1tag"],
+		["cot", "<a><b>"],
+		// The form is required: a bare name cannot say whether the fence is a tag or a tool.
+		["cot", "think"],
+		["cot", "analysis"],
+		["cot", "text:"],
+		["cot", "text:1tag"],
+		["cot", "text:a b"],
+		["cot", "toolcall:"],
+		["cot", "toolcall:1tag"],
+		["cot", "toolcall:a b"],
+		["cot", "toolcall:<think>"],
+		["cot", "other:think"],
 	]) {
 		assert.ok(one(slot, bad).error, `the file rejects ${slot}: ${JSON.stringify(bad)}`);
 		assert.ok(parseConfig(JSON.stringify({ rules: [{ [slot]: bad }] }), "/cfg").error, `a rule rejects ${slot}: ${JSON.stringify(bad)}`);
 	}
+	// Every name pi already declares a tool for is refused, read off the list itself: a hand-written
+	// copy is what went stale when pi grew a tool this extension had not named yet. The literal set is
+	// pinned separately, so renaming an entry cannot keep the count while losing the name.
+	assert.deepEqual(
+		[...RESERVED_COT_NAMES].sort(),
+		["ask_authorize_gate", "bash", "codemode", "edit", "find", "glob", "grep", "ls", "powershell", "read", "tool_search", "write"],
+		"the reserved list is every tool pi can declare",
+	);
+	for (const name of RESERVED_COT_NAMES) {
+		// A fabricated call to a real tool is indistinguishable from the model's own, and registering
+		// over one would replace pi's tool for the session.
+		assert.equal(cotSpec(`toolcall:${name}`), null, `the cot refuses a reserved name: ${name}`);
+		assert.equal(cotSpec(`toolcall:${name.toUpperCase()}`), null, `and refuses it in any case: ${name}`);
+		assert.ok(one("cot", `toolcall:${name}`).error, `the file rejects a reserved name: ${name}`);
+	}
+	assert.deepEqual(cotSpec("toolcall:boss"), { form: "toolcall", name: "boss" }, "a name no tool holds is accepted");
 	// A rule names slots and a match, and nothing else.
 	assert.equal(parseConfig(JSON.stringify({ rules: [{ provider: "x" }] }), "/cfg").error, undefined, "a rule whose slots all fall through is a match and nothing else");
 	assert.match(parseConfig(JSON.stringify({ rules: [{ provider: 1 }] }), "/cfg").error ?? "", /provider must be a non-empty string/);
@@ -355,11 +390,11 @@ console.log("ok slot shapes");
 	assert.match(parseConfig(JSON.stringify({ mode: "leviathan" }), "/cfg").error, /mode is not a config key \(default, inherit, rules\)/);
 	assert.match(parseConfig(JSON.stringify({ prompt: "p.md" }), "/cfg").error, /prompt is not a config key/);
 	assert.match(parseConfig(JSON.stringify({ forgeMaxChars: 4000 }), "/cfg").error, /forgeMaxChars is not a config key/);
-	assert.match(parseConfig(JSON.stringify({ default: { mode: "leviathan" } }), "/cfg").error, /default: mode is not one of persona, gate, turns, forge, cotTag/);
+	assert.match(parseConfig(JSON.stringify({ default: { mode: "leviathan" } }), "/cfg").error, /default: mode is not one of persona, gate, turns, forge, cot/);
 	assert.match(parseConfig(JSON.stringify({ default: { prompt: "p.md" } }), "/cfg").error, /default: prompt is not one of/);
 	assert.match(
 		parseConfig(JSON.stringify({ rules: [{ provider: "x", forgeMaxChars: 1200 }] }), "/cfg").error,
-		/rule 1: forgeMaxChars is not one of provider, model, persona, gate, turns, forge, cotTag/,
+		/rule 1: forgeMaxChars is not one of provider, model, persona, gate, turns, forge, cot/,
 	);
 	assert.match(parseConfig(JSON.stringify({ inherit: "yes" }), "/cfg").error, /inherit must be/);
 	assert.match(parseConfig(JSON.stringify({ default: "on" }), "/cfg").error, /default is not an object/);
@@ -369,18 +404,33 @@ console.log("ok slot shapes");
 }
 console.log("ok config keys");
 
-// Every tag the file names travels with the resolved record, because a turn fenced under one model's
-// tag has to count as fenced for the model configured with another.
+// Every cot the file names travels with the resolved record, because a turn carrying one under one
+// model's cot has to count as carrying it for the model configured with another. The set is of
+// labels, so `text:think` and `toolcall:think` are two cots with one name.
 {
 	const config = parseConfig(
-		JSON.stringify({ default: { cotTag: "think" }, rules: [{ model: "a", cotTag: "analysis" }, { model: "b", cotTag: "<reasoning>" }] }),
+		JSON.stringify({ default: { cot: "text:think" }, rules: [{ model: "a", cot: "text:analysis" }, { model: "b", cot: "toolcall:reasoning" }] }),
 		"/cfg",
 	).config;
-	assert.deepEqual([...configTags(config)].sort(), ["analysis", "reasoning", "think"]);
-	assert.deepEqual([...configTags(emptyConfig("/cfg"))], ["think"], "the built-in tag is always in the set");
-	assert.equal(resolveMode(config, { provider: "x", id: "a" }).cotTag, "analysis", "a model's own tag still decides what it writes");
+	assert.deepEqual([...configCots(config)].sort(), ["text:analysis", "text:think", "toolcall:reasoning"]);
+	assert.deepEqual([...configCots(emptyConfig("/cfg"))], ["text:think"], "the built-in cot is always in the set");
+	assert.deepEqual(cotNames(configCots(config), "text:analysis").sort(), ["analysis", "reasoning", "think"], "a name is what a turn is matched by");
+	assert.equal(DEFAULT_COT, "text:think", "the built-in cot is the text form of the tag pi reads as reasoning");
+	assert.deepEqual(cotSpec(DEFAULT_COT), { form: "text", name: "think" }, "and it parses to the spec the writers use");
+	for (const [value, wanted] of [
+		["text:think", { form: "text", name: "think" }],
+		["text:<think>", { form: "text", name: "think" }],
+		["TEXT:THINK", { form: "text", name: "THINK" }],
+		["toolcall:think", { form: "toolcall", name: "think" }],
+	]) {
+		assert.deepEqual(cotSpec(value), wanted, `parses: ${value}`);
+	}
+	for (const value of [null, 1, "think", "", "text", ":think", "toolcall:", "tag:think"]) {
+		assert.equal(cotSpec(value), null, `rejects: ${JSON.stringify(value)}`);
+	}
+	assert.equal(resolveMode(config, { provider: "x", id: "a" }).cot, "text:analysis", "a model's own cot still decides what it writes");
 }
-console.log("ok config tags");
+console.log("ok config cots");
 
 {
 	const dir = mkdtempSync(join(tmpdir(), "pi-leviathan-config-"));
@@ -474,8 +524,8 @@ console.log("ok config path");
 	assert.equal(decode(`{"k":"*"}`, { ppid, pid }), null, "a payload without a publisher is rejected");
 	assert.equal(decode(undefined, { ppid, pid }), null);
 	// A slot travels as its own value, and one that does not validate rejects the whole payload.
-	const carried = decode(encode({ key: "*", settings: { persona: "/abs/p.md", turns: false, forge: { maxChars: 1200 }, gate: true, cotTag: "analysis" } }, pid), { ppid, pid });
-	assert.deepEqual(carried.settings, { persona: "/abs/p.md", turns: false, forge: { maxChars: 1200 }, gate: true, cotTag: "analysis" });
+	const carried = decode(encode({ key: "*", settings: { persona: "/abs/p.md", turns: false, forge: { maxChars: 1200 }, gate: true, cot: "text:analysis" } }, pid), { ppid, pid });
+	assert.deepEqual(carried.settings, { persona: "/abs/p.md", turns: false, forge: { maxChars: 1200 }, gate: true, cot: "text:analysis" });
 	assert.equal(decode(`{"k":"*","p":${pid},"s":{"forge":{"maxChars":0}}}`, { ppid, pid }), null, "a bad slot rejects the payload");
 	assert.equal(decode(`{"k":"*","p":${pid},"s":{"mode":"on"}}`, { ppid, pid }), null, "and so does a key the record does not have");
 	const env = { [ENV_NAME]: "junk" };
@@ -487,6 +537,20 @@ console.log("ok config path");
 	assert.equal(applies({ key: "a/b" }, "A/B"), true, "keys compare case-insensitively");
 	assert.equal(applies({ key: "A/C" }, "A/B"), false);
 	assert.equal(modelKey({ provider: "P", id: "M" }), "P/M");
+
+	// The two shipped file names mean the package copy on every layer, so they survive the channel and
+	// the process answer as bare names. A path would name whatever directory the reading process sits
+	// in, which is a different file, and the failure would look like a missing built-in file.
+	for (const [key, shipped] of [["persona", DEFAULT_PROMPT], ["turns", DEFAULT_TURNS]]) {
+		assert.deepEqual(sessionSettings({ [key]: shipped }), { settings: { [key]: shipped } }, `${shipped} stays the shipped name`);
+		assert.deepEqual(sessionSettings({ [key]: true }), { settings: { [key]: shipped } }, "and so does `true`");
+		const round = decode(encode({ key: "*", settings: { [key]: shipped } }, pid), { ppid, pid });
+		assert.equal(round.settings[key], shipped, `${shipped} survives the channel`);
+		// A path that is not the shipped name is still taken from the session's cwd, because a command
+		// line names what the user can see.
+		assert.equal(sessionSettings({ [key]: `./${shipped}` }).settings[key], join(process.cwd(), shipped), `./${shipped} is a path`);
+		assert.equal((key === "persona" ? promptPath : turnsPath)(emptyConfig("/cfg"), round.settings[key]), join(PACKAGE_DIR, shipped), "and resolves to the package copy");
+	}
 }
 
 console.log("ok channel");
@@ -614,8 +678,8 @@ const fenced = (tag, cot, text) => "<" + tag + ">\n" + cot + "\n</" + tag + ">\n
 		{ role: "assistant", cot: "", text: "done", call: null },
 	];
 	const options = { provider: "deepseek", api: "openai-completions", model: "deepseek-chat" };
-	const built = toMessages(specs, options);
-	const again = toMessages(specs, options);
+	const built = toMessages(specs, { ...options, cot: TEXT_THINK });
+	const again = toMessages(specs, { ...options, cot: TEXT_THINK });
 	assert.deepEqual(built, again, "two builds produce identical messages");
 	assert.equal(JSON.stringify(built), JSON.stringify(again));
 	for (const message of built) {
@@ -636,12 +700,46 @@ const fenced = (tag, cot, text) => "<" + tag + ">\n" + cot + "\n</" + tag + ">\n
 
 	// The fence is not a protocol: every api gets the same text block, and none gets a thinking block.
 	for (const api of ["anthropic-messages", "openai-responses", "openai-completions"]) {
-		const content = toMessages(specs, { ...options, api }).map((message) => message.content);
+		const content = toMessages(specs, { ...options, api, cot: TEXT_THINK }).map((message) => message.content);
 		assert.deepEqual(content, built.map((message) => message.content), `the block is the same on ${api}`);
 		assert.equal(content.some((blocks) => blocks.some((block) => block.type === "thinking")), false, `regression guard: no thinking block on ${api}`);
 	}
-	const custom = toMessages(specs, { ...options, cotTag: "analysis" });
+	const custom = toMessages(specs, { ...options, cot: TEXT_ANALYSIS });
 	assert.equal(custom[1].content[0].text, fenced("analysis", "think", "ok"), "the fence tag follows the config");
+
+	// The toolcall form: one spec becomes a call, its result, then the reply. The reasoning is the
+	// call's argument, because the call is what the assistant wrote; the result is the harness's short
+	// ack, and a pair that is ever half-written would let pi invent an error result for it.
+	const tool = toMessages(specs, { ...options, cot: TOOL_THINK });
+	assert.equal(tool.length, built.length + 2, "one call and one result are inserted");
+	assert.deepEqual(tool[1], {
+		role: "assistant",
+		content: [{ type: "toolCall", id: tool[1].content[0].id, name: "think", arguments: { thought: "think" } }],
+		api: "openai-completions",
+		provider: "deepseek",
+		model: "deepseek-chat",
+		usage: tool[1].usage,
+		stopReason: "toolUse",
+		timestamp: 0,
+	});
+	assert.equal(tool[2].role, "toolResult", "the call is answered immediately");
+	assert.equal(tool[2].toolCallId, tool[1].content[0].id, "by the result carrying its id");
+	assert.equal(tool[2].toolName, "think");
+	assert.deepEqual(tool[2].content, [{ type: "text", text: COT_ACK }], "the ack is the whole result");
+	assert.equal(tool[3].role, "assistant", "then the reply the cot belongs to");
+	assert.equal(tool[3].content[0].text, "ok", "and the reply carries no fence of its own");
+	assert.deepEqual(toMessages(specs, { ...options, cot: TOOL_THINK }), tool, "the pair is pure like the fence");
+	// Two turns carrying the same cot get two ids, because a transcript may not hold one id twice.
+	const twins = toMessages(
+		[
+			{ role: "user", text: "q" },
+			{ role: "assistant", cot: "same", text: "a", call: null },
+			{ role: "assistant", cot: "same", text: "b", call: null },
+		],
+		{ ...options, cot: TOOL_THINK },
+	);
+	assert.equal(twins.length, 7, "a question and two replies, each with its pair");
+	assert.notEqual(twins[1].content[0].id, twins[4].content[0].id, "two turns carrying one cot are two calls");
 }
 console.log("ok turns messages");
 
@@ -682,7 +780,7 @@ console.log("ok turns messages");
 		for (const message of [foreign(), foreign("", "no cot"), { role: "user", content: [] }]) {
 			for (const live of [LIVE, { ...LIVE, id: "other" }]) {
 				const carried = isSameModel(message, live);
-				const forged = forgeOne(message, live, "think") !== null;
+				const forged = forgeText(message, live, TEXT_THINK) !== null;
 				assert.equal(carried && forged, false, "a message pi carries is never forged as well");
 			}
 		}
@@ -708,7 +806,7 @@ console.log("ok turns messages");
 	// The forged turn: one text block with the fence inside it, and the stamp untouched.
 	{
 		const message = foreign();
-		const forged = forgeOne(message, LIVE, "think");
+		const forged = forgeText(message, LIVE, TEXT_THINK);
 		assert.equal(forged.content[0].type, "thinking", "the thinking block is left where it was");
 		assert.equal(forged.content[1].text, fenced("think", "COT A", "reply A"), "the fence is inside the first text block");
 		assert.equal(forged.content.length, message.content.length, "no block is added or dropped");
@@ -723,50 +821,101 @@ console.log("ok turns messages");
 		// after the leading reasoning blocks: an assistant message reads reasoning first, then what it
 		// said, and a provider that requires that order would reject the reverse.
 		const callOnly = { role: "assistant", content: [{ type: "thinking", thinking: "COT" }, { type: "toolCall", id: "t", name: "g", arguments: {} }], ...OTHER, stopReason: "toolUse", timestamp: 0 };
-		const callForged = forgeOne(callOnly, LIVE, "think");
+		const callForged = forgeText(callOnly, LIVE, TEXT_THINK);
 		assert.equal(callForged.content[0].type, "thinking", "the reasoning block stays in front");
 		assert.deepEqual(callForged.content[1], { type: "text", text: "<think>\nCOT\n</think>" }, "the fence follows it, holding the cot alone");
 		assert.equal(callForged.content[2].type, "toolCall", "and the call is last");
 	}
 	console.log("ok forge turn");
 
+	// The toolcall form inserts a pair instead of rewriting the reply: the message may carry a call of
+	// its own, and a second `toolCall` in one content would leave two calls waiting for results.
+	{
+		const message = foreign();
+		const forged = forgeOne(message, LIVE, TOOL_THINK, 0);
+		assert.equal(forged.length, 3, "a call, its result, then the turn itself");
+		assert.deepEqual(forged[0].content, [{ type: "toolCall", id: forged[0].content[0].id, name: "think", arguments: { thought: "COT A" } }], "the reasoning is the call's argument");
+		assert.equal(forged[1].role, "toolResult");
+		assert.equal(forged[1].toolCallId, forged[0].content[0].id, "the result answers that call");
+		assert.deepEqual(forged[1].content, [{ type: "text", text: COT_ACK }]);
+		assert.equal(forged[2], message, "the turn is left exactly as it was, call and stamp included");
+		for (const field of ["provider", "api", "model"]) {
+			assert.equal(forged[0][field], message[field], `the pair carries the turn's own stamp: ${field}`);
+		}
+		assert.equal(message.content.length, 3, "the original message is not touched");
+		assert.deepEqual(forgeOne(message, LIVE, TOOL_THINK, 0), forged, "the pair is pure");
+		assert.notEqual(forgeOne(message, LIVE, TOOL_THINK, 1)[0].content[0].id, forged[0].content[0].id, "a different position is a different call");
+
+		// Idempotence is by name, across forms: a turn fenced as text is not refenced as a call, and a
+		// turn carrying a call of the cot's name is not refenced as text. Either would show two traces.
+		const asText = forgeText(message, LIVE, TEXT_THINK);
+		assert.equal(forgeOne(asText, LIVE, TOOL_THINK, 0), null, "a text fence counts as carrying the cot");
+		const asCall = forgeOne(message, LIVE, TOOL_THINK, 0);
+		// The pair lives ahead of the turn, so only a list can see it; `forgeOne` on the turn alone cannot.
+		assert.deepEqual(forgeHistory([{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }, ...asCall], LIVE, TOOL_THINK).length, 4, "a second pass over a forged list adds nothing");
+		const otherName = forgeOne(message, LIVE, { form: "toolcall", name: "note" }, 0);
+		assert.notEqual(forgeOne(otherName[2], LIVE, TOOL_THINK, 0), null, "a different name writes its own pair");
+
+		// A real call to the cot tool is the model's own reasoning, not a cot this extension wrote: the
+		// turn's thinking must still come back, or a model that uses the tool is never refilled.
+		const realCall = { ...message, content: [{ type: "toolCall", id: "call_real_1", name: "think", arguments: { thought: "the model's own" } }, ...message.content] };
+		assert.notEqual(forgeOne(realCall, LIVE, TOOL_THINK, 0), null, "a genuine call to the cot tool is not this extension's pair");
+		assert.notEqual(forgeText(realCall, LIVE, TEXT_THINK), null, "and it does not count as a fence either");
+		// The id this extension writes is what makes a call its own, so a call that only borrowed the
+		// name is not one.
+		const borrowed = { ...message, content: [{ type: "toolCall", id: forged[0].content[0].id, name: "think", arguments: {} }, ...message.content] };
+		assert.equal(forgeOne(borrowed, LIVE, TOOL_THINK, 0), null, "the id prefix is the whole difference");
+
+		// A model switch is the one request whose shape changes; after it, the same history yields the
+		// same messages, so the prompt cache is lost once and then holds.
+		const history = [
+			{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 },
+			message,
+		];
+		const once = forgeHistory(history, LIVE, TOOL_THINK);
+		assert.equal(once.length, 4, "the pair is spliced in");
+		assert.deepEqual(forgeHistory(history, LIVE, TOOL_THINK), once, "the second request is byte-identical");
+		assert.deepEqual(forgeHistory(once, LIVE, TOOL_THINK), once, "and a forged history is already done");
+	}
+	console.log("ok forge toolcall");
+
 	// Idempotence: a message already carrying the fence is left alone, and no other tag counts.
 	{
-		const once = forgeOne(foreign(), LIVE, "think");
-		assert.equal(forgeOne(once, LIVE, "think"), null, "a second pass changes nothing");
-		assert.equal(forgeOne(once, LIVE, "analysis") !== null, true, "a different tag writes its own fence");
+		const once = forgeText(foreign(), LIVE, TEXT_THINK);
+		assert.equal(forgeText(once, LIVE, TEXT_THINK), null, "a second pass changes nothing");
+		assert.equal(forgeText(once, LIVE, TEXT_ANALYSIS) !== null, true, "a different tag writes its own fence");
 		const pasted = { ...foreign(), content: [{ type: "thinking", thinking: "COT" }, { type: "text", text: "<think>\nalready\n</think>\n\nreply" }] };
-		assert.equal(forgeOne(pasted, LIVE, "think"), null, "a resumed transcript is not fenced twice");
-		assert.equal(forgeOne(foreign(), { ...LIVE, id: OTHER.model }, "think"), null, "pi carries it, so nothing is written");
-		assert.equal(forgeOne({ role: "user", content: [{ type: "thinking", thinking: "x" }] }, LIVE, "think"), null, "only assistant turns are forged");
+		assert.equal(forgeText(pasted, LIVE, TEXT_THINK), null, "a resumed transcript is not fenced twice");
+		assert.equal(forgeText(foreign(), { ...LIVE, id: OTHER.model }, TEXT_THINK), null, "pi carries it, so nothing is written");
+		assert.equal(forgeText({ role: "user", content: [{ type: "thinking", thinking: "x" }] }, LIVE, TEXT_THINK), null, "only assistant turns are forged");
 	}
 	console.log("ok forge idempotence");
 
 	// The budget is part of the pure answer, and its default is no bound at all.
 	{
-		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think").content[1].text, fenced("think", "abcdef", "reply A"), "no bound unless one is asked for");
-		assert.match(forgeOne(foreign("abcdef"), LIVE, "think", 3).content[1].text, /^<think>\nabc\n\[\.\.\. reasoning truncated\]\n<\/think>/);
-		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", null).content[1].text, fenced("think", "abcdef", "reply A"), "null is no bound");
-		assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", 999).content[1].text, fenced("think", "abcdef", "reply A"), "a bound above the length changes nothing");
+		assert.equal(forgeText(foreign("abcdef"), LIVE, TEXT_THINK).content[1].text, fenced("think", "abcdef", "reply A"), "no bound unless one is asked for");
+		assert.match(forgeText(foreign("abcdef"), LIVE, TEXT_THINK, 3).content[1].text, /^<think>\nabc\n\[\.\.\. reasoning truncated\]\n<\/think>/);
+		assert.equal(forgeText(foreign("abcdef"), LIVE, TEXT_THINK, null).content[1].text, fenced("think", "abcdef", "reply A"), "null is no bound");
+		assert.equal(forgeText(foreign("abcdef"), LIVE, TEXT_THINK, 999).content[1].text, fenced("think", "abcdef", "reply A"), "a bound above the length changes nothing");
 		// Only a positive integer bounds. The config refuses these values, so the only way one arrives is
 		// a caller that built it, and the safe reading is the one that keeps the trace whole.
 		for (const value of [0, -1, -4000]) {
-			assert.equal(forgeOne(foreign("abcdef"), LIVE, "think", value).content[1].text, fenced("think", "abcdef", "reply A"), `nothing bounds: ${value}`);
+			assert.equal(forgeText(foreign("abcdef"), LIVE, TEXT_THINK, value).content[1].text, fenced("think", "abcdef", "reply A"), `nothing bounds: ${value}`);
 		}
 		// A cut never lands inside a surrogate pair: half of one is not text, and the request bytes are
 		// what the whole design leans on.
 		const pair = "ab\u{1F600}cd";
-		const cut = forgeOne(foreign(pair), LIVE, "think", 3).content[1].text;
+		const cut = forgeText(foreign(pair), LIVE, TEXT_THINK, 3).content[1].text;
 		assert.equal(cut, "<think>\nab\n[... reasoning truncated]\n</think>\n\nreply A", "the cut backs off a split pair");
 		assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cut), false, "no lone high surrogate survives");
-		assert.equal(forgeOne(foreign(pair), LIVE, "think", 4).content[1].text, "<think>\nab\u{1F600}\n[... reasoning truncated]\n</think>\n\nreply A", "a cut between the pair's halves keeps the pair whole");
-		assert.equal(forgeOne(foreign(pair), LIVE, "think", 6).content[1].text, fenced("think", pair, "reply A"), "a bound at the full length changes nothing");
+		assert.equal(forgeText(foreign(pair), LIVE, TEXT_THINK, 4).content[1].text, "<think>\nab\u{1F600}\n[... reasoning truncated]\n</think>\n\nreply A", "a cut between the pair's halves keeps the pair whole");
+		assert.equal(forgeText(foreign(pair), LIVE, TEXT_THINK, 6).content[1].text, fenced("think", pair, "reply A"), "a bound at the full length changes nothing");
 		// A trace that starts with a pair cannot back off to nothing: an empty fence with only the
 		// marker reads as a reasoning block the turn never wrote. The pair is kept whole instead.
 		const leading = "\u{1F600}abcd";
 		for (const [bound, kept] of [[1, "\u{1F600}"], [2, "\u{1F600}"], [3, "\u{1F600}a"], [4, "\u{1F600}ab"]]) {
 			assert.equal(
-				forgeOne(foreign(leading), LIVE, "think", bound).content[1].text,
+				forgeText(foreign(leading), LIVE, TEXT_THINK, bound).content[1].text,
 				`<think>\n${kept}\n[... reasoning truncated]\n</think>\n\nreply A`,
 				`a bound of ${bound} keeps the leading pair whole`,
 			);
@@ -774,12 +923,12 @@ console.log("ok turns messages");
 		// A marker states a truncation that happened. Keeping a pair whole can reach the end of the
 		// trace, and a marker there would tell the model its reasoning was cut when all of it is present.
 		assert.equal(
-			forgeOne(foreign("\u{1F600}"), LIVE, "think", 1).content[1].text,
+			forgeText(foreign("\u{1F600}"), LIVE, TEXT_THINK, 1).content[1].text,
 			"<think>\n\u{1F600}\n</think>\n\nreply A",
 			"the whole trace carries no truncation marker",
 		);
 		assert.equal(
-			forgeOne(foreign("\u{1F600}\u{1F600}"), LIVE, "think", 1).content[1].text,
+			forgeText(foreign("\u{1F600}\u{1F600}"), LIVE, TEXT_THINK, 1).content[1].text,
 			"<think>\n\u{1F600}\n[... reasoning truncated]\n</think>\n\nreply A",
 			"a trace with more after the pair still carries the marker",
 		);
@@ -789,13 +938,13 @@ console.log("ok turns messages");
 	// The list: an unchanged history keeps its identity, a changed one is a new array.
 	{
 		const history = [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }, foreign()];
-		assert.equal(forgeHistory(history, { ...LIVE, id: OTHER.model }, "think"), history, "nothing to forge returns the same array");
-		const forged = forgeHistory(history, LIVE, "think");
+		assert.equal(forgeHistory(history, { ...LIVE, id: OTHER.model }, TEXT_THINK), history, "nothing to forge returns the same array");
+		const forged = forgeHistory(history, LIVE, TEXT_THINK);
 		assert.notEqual(forged, history, "a change returns a new array");
 		assert.equal(forged[0], history[0], "a message with no cot keeps its object");
 		assert.equal(forged[1].model, "glm-5.3", "no re-stamp");
-		assert.equal(forgeHistory(null, LIVE, "think"), null);
-		assert.equal(forgeHistory(history, {}, "think"), history, "no live model forges nothing");
+		assert.equal(forgeHistory(null, LIVE, TEXT_THINK), null);
+		assert.equal(forgeHistory(history, {}, TEXT_THINK), history, "no live model forges nothing");
 	}
 	console.log("ok forge history");
 
@@ -808,12 +957,12 @@ console.log("ok turns messages");
 			{ role: "toolResult", toolCallId: "tc_1", toolName: "ask_authorize_gate", content: [{ type: "text", text: "RULING" }], isError: false, timestamp: 0 },
 			foreign("COT B", "reply B"),
 		];
-		const first = forgeHistory(base, LIVE, "think");
-		assert.deepEqual(forgeHistory(base, LIVE, "think"), first, "the same input produces the same output");
+		const first = forgeHistory(base, LIVE, TEXT_THINK);
+		assert.deepEqual(forgeHistory(base, LIVE, TEXT_THINK), first, "the same input produces the same output");
 		// A model switch back and forth: the answer depends on the live triple and nothing else.
-		const onOther = forgeHistory(base, { ...LIVE, id: OTHER.model }, "think");
+		const onOther = forgeHistory(base, { ...LIVE, id: OTHER.model }, TEXT_THINK);
 		assert.equal(onOther, base, "a matching model forges nothing");
-		assert.deepEqual(forgeHistory(base, LIVE, "think"), first, "and switching back reproduces the same bytes");
+		assert.deepEqual(forgeHistory(base, LIVE, TEXT_THINK), first, "and switching back reproduces the same bytes");
 
 		// Growth: each new message leaves every earlier position byte-identical. The list is copied each
 		// round, because an unchanged history comes back as the same array reference by contract.
@@ -821,13 +970,13 @@ console.log("ok turns messages");
 		const grown = [];
 		for (const message of base) {
 			grown.push(message);
-			const next = forgeHistory(grown.slice(), LIVE, "think");
+			const next = forgeHistory(grown.slice(), LIVE, TEXT_THINK);
 			assert.equal(prefixStable(previous, next), null, "an append introduces no earlier-position change");
 			previous = next;
 		}
 		// A run of its own turns enters the history: they are stamped with the live model, so nothing moves.
 		const ownTurn = { role: "assistant", content: [{ type: "thinking", thinking: "MY OWN" }, { type: "text", text: "mine" }], provider: LIVE.provider, api: LIVE.api, model: LIVE.id, timestamp: 0 };
-		assert.equal(prefixStable(previous, forgeHistory([...grown, ownTurn], LIVE, "think")), null, "a live-model turn changes nothing");
+		assert.equal(prefixStable(previous, forgeHistory([...grown, ownTurn], LIVE, TEXT_THINK)), null, "a live-model turn changes nothing");
 	}
 	console.log("ok forge purity");
 
@@ -841,14 +990,14 @@ console.log("ok turns messages");
 			{ role: "custom", customType: "subagent-result", content: [{ type: "text", text: "member finished" }], display: true, timestamp: 0 },
 			{ role: "user", content: [{ type: "text", text: "go on" }], timestamp: 0 },
 		];
-		const forged = forgeHistory(mixed, LIVE, "think");
+		const forged = forgeHistory(mixed, LIVE, TEXT_THINK);
 		assert.match(forged[2].content[1].text, /^<think>\nOLD COT/, "the foreign turn is refilled");
 		assert.deepEqual(forged[0], mixed[0]);
 		assert.deepEqual(forged[1], mixed[1], "a compaction summary is not a message to forge");
 		assert.deepEqual(forged[3], mixed[3], "another extension's notice is untouched");
 		assert.deepEqual(forged[4], mixed[4], "a subagent boundary entry is untouched");
 		assert.deepEqual(forged[5], mixed[5]);
-		assert.deepEqual(forgeHistory(mixed, LIVE, "think"), forged, "and the whole list is still pure");
+		assert.deepEqual(forgeHistory(mixed, LIVE, TEXT_THINK), forged, "and the whole list is still pure");
 	}
 	console.log("ok forge mixed history");
 
@@ -867,10 +1016,10 @@ console.log("ok turns messages");
 		const ADAPTERS = [/openai/i, /anthropic/i, /mistral/i, /google-generative/i, /google-vertex/i, /azure-openai/i];
 		// Asking an api value what it is. A method call, an index, a comparison against a literal, a
 		// coercion into one, or a hand-off to a helper that reads it. Pi's own handle is not a model's
-		// api, so it is cut out before these run; the cut is keyed on the two calls only an ExtensionAPI
+		// api, so it is cut out before these run; the cut is keyed on the calls only an ExtensionAPI
 		// can make, so a local named the same way cannot borrow the exemption and a rename cannot lose
 		// it.
-		const HANDLE = /\b[\w$]+\s*\??\.api\s*\??\.\s*(?:getActiveTools|setActiveTools)\s*(?:\?\.)?\s*\(/g;
+		const HANDLE = /\b[\w$]+\s*\??\.api\s*\??\.\s*(?:getActiveTools|setActiveTools|registerTool)\s*(?:\?\.)?\s*\(/g;
 		const METHOD = /\bapi\b\s*\??\.\s*(?:[\w$]+\s*\(|\[)/;
 		const BRACKET = /\bapi\b\s*\??\.?\s*\[/;
 		const TO_LITERAL = /\bapi\b\s*(?:===|!==|==|!=)\s*["'`]|["'`][^"'`]*["'`]\s*(?:===|!==|==|!=)\s*[\w$.]*\bapi\b/;
@@ -1204,7 +1353,7 @@ console.log("ok guard places the text");
 			provider: LEVIATHAN.provider,
 			api: LEVIATHAN.api,
 			model: LEVIATHAN.id,
-			cotTag: "think",
+			cot: TEXT_THINK,
 		});
 		assert.deepEqual(result.messages.slice(1, 1 + block.length), block, "the fabricated block lands right after the head");
 		assert.match(result.messages[1 + block.length + 1].content[1].text, /^<think>/, "and the refilled turn follows it");
@@ -1250,7 +1399,7 @@ console.log("ok guard places the text");
 			["forge maxChars 0", /maxChars must be a positive whole number/],
 			["forge maxChars -4000", /maxChars must be a positive whole number/],
 			["gate maybe", /gate must be/],
-			["cotTag 1bad", /cotTag must be a tag name/],
+			["cot 1bad", /cot must be text:/],
 		]) {
 			await command.handler(command_, refusing);
 			assert.match(said?.text ?? "", pattern, `the command is refused: ${command_}`);
@@ -1672,7 +1821,7 @@ console.log("ok turns nowhere to splice");
 	writeConfig(
 		[
 			{ provider: "deepseek", model: "deepseek-*", persona: true, gate: true, forge: true },
-			{ provider: "anthropic", model: "claude*", persona: true, gate: true, forge: true, cotTag: "analysis" },
+			{ provider: "anthropic", model: "claude*", persona: true, gate: true, forge: true, cot: "text:analysis" },
 		],
 		{ turns: turnFile },
 	);
@@ -1690,7 +1839,7 @@ console.log("ok turns nowhere to splice");
 	assert.equal(tagged.at(-2).content[0].text, fenced("analysis", "think", "ok"), "the rule's tag fences it");
 
 	// One tag, two models: the spliced content is the same, and only the message stamps differ.
-	writeConfig([{ model: "*", persona: true, gate: true, forge: true }], { turns: turnFile, cotTag: "think" });
+	writeConfig([{ model: "*", persona: true, gate: true, forge: true }], { turns: turnFile, cot: "text:think" });
 	const u3 = ui();
 	await before({ systemPromptOptions: { sections: {} } }, { model: reasoning, ui: u3 });
 	const deep = guard({ type: "context_with_system", messages: [head(""), turn] }, { model: reasoning, ui: u3 }).messages;
@@ -1711,7 +1860,7 @@ console.log("ok turns fence");
 	const ctx = { model: LEVIATHAN, ui: ui() };
 	await command.handler("reset", ctx);
 	await command.handler(`turns ${fenceFile}`, ctx);
-	await command.handler("cotTag analysis", ctx);
+	await command.handler("cot text:analysis", ctx);
 	await run(LEVIATHAN);
 	const once = guardRun([head(""), turn]);
 	const first = once.messages[2].content[0].text;
@@ -1956,14 +2105,14 @@ console.log("ok remember refuses a file it cannot read whole");
 	const write = (data) => writeFileSync(configFile, JSON.stringify(data, null, "\t"));
 	const read = () => JSON.parse(readFileSync(configFile, "utf8"));
 	const resolved = () => resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, LEVIATHAN);
-	const slots = (rule) => ({ persona: rule.persona, gate: rule.gate, turns: rule.turns, forge: rule.forge, cotTag: rule.cotTag });
+	const slots = (rule) => ({ persona: rule.persona, gate: rule.gate, turns: rule.turns, forge: rule.forge, cot: rule.cot });
 
 	// A wildcard in force: the exact rule takes its values and moves in front of it.
 	const custom = join(tempDir, "custom.md");
 	writeFileSync(custom, "CUSTOM");
 	write({
 		default: { persona: false },
-		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cotTag: "reasoning" }],
+		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cot: "text:reasoning" }],
 	});
 	assert.equal(resolved().persona, custom);
 	await command.handler("reset", ctx);
@@ -1972,7 +2121,7 @@ console.log("ok remember refuses a file it cannot read whole");
 	assert.equal(data.rules.length, 2, "the exact rule mounts in front of the wildcard, which is kept");
 	assert.equal(data.rules[0].provider, "CLIProxy-Chat", "the rule is written for the live model, literally");
 	assert.equal(data.rules[0].model, "deepseek-flash", "and never with a pattern");
-	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cotTag: "reasoning" });
+	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cot: "text:reasoning" });
 	assert.equal(data.default.persona, false, "the file's default is left alone");
 	assert.equal(resolved().ruleIndex, 0, "and the model now resolves through the new rule");
 
@@ -1986,23 +2135,23 @@ console.log("ok remember refuses a file it cannot read whole");
 	const receiptTurn = join(tempDir, "receipt-turn0.yml");
 	writeFileSync(receiptTurn, "- user: q\n");
 	await command.handler(`turns ${receiptTurn}`, ctx);
-	await command.handler("cotTag analysis", ctx);
+	await command.handler("cot text:analysis", ctx);
 	await command.handler("remember", ctx);
 	assert.match(ctx.ui.notes.at(-1)[1], /turns\s+"[^"]*receipt-turn0[^"]*" \(was session\)/, "a session slot is reported as the session's");
-	assert.match(ctx.ui.notes.at(-1)[1], /cotTag\s+"analysis" \(was session\)/, "and so is a session tag");
+	assert.match(ctx.ui.notes.at(-1)[1], /cot\s+"text:analysis" \(was session\)/, "and so is a session cot");
 	await command.handler("reset", ctx);
 
 	// A slot the session set is written as the session holds it, and the session stops repeating it.
 	write({
 		default: { persona: false },
-		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cotTag: "reasoning" }],
+		rules: [{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cot: "text:reasoning" }],
 	});
 	await command.handler("reset", ctx);
 	await command.handler("forge maxChars none", ctx);
 	await command.handler("remember", ctx);
 	data = read();
 	assert.equal(data.rules[0].forge, true, "no bound is written as the short spelling");
-	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: true, cotTag: "reasoning" });
+	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: true, cot: "text:reasoning" });
 	await command.handler("forge maxChars 1200", ctx);
 	await command.handler("remember", ctx);
 	assert.deepEqual(read().rules[0].forge, { maxChars: 1200 }, "a bound is written as a bound");
@@ -2021,7 +2170,7 @@ console.log("ok remember refuses a file it cannot read whole");
 	await command.handler("remember", ctx);
 	data = read();
 	assert.equal(data.rules.length, 2, "a rule is added in front of the one that did not match");
-	assert.deepEqual(slots(data.rules[0]), { persona: false, gate: false, turns: false, forge: false, cotTag: "think" });
+	assert.deepEqual(slots(data.rules[0]), { persona: false, gate: false, turns: false, forge: false, cot: "text:think" });
 	assert.equal(data.rules[1].persona, true, "and the rule that did not match is untouched");
 
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
@@ -2038,7 +2187,7 @@ console.log("ok remember writes the whole record");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: false, forge: false }]);
 	await command.handler("", ctx);
 	const text = u.notes.at(-1)[1];
-	for (const slot of ["persona", "gate", "turns", "forge", "cotTag"]) {
+	for (const slot of ["persona", "gate", "turns", "forge", "cot"]) {
 		assert.match(text, new RegExp(`${slot}\\s+\\S`), `the panel has a row for ${slot}`);
 	}
 	assert.match(text, /rules\s*\n\s*1\s+CLIProxy-Chat\/deepseek-\*/, "and a table of the file's rules");
@@ -2073,12 +2222,12 @@ console.log("ok remember refuses a broken file");
 	await command.handler("reset", { model: LEVIATHAN, ui: u });
 	assert.equal(
 		u.notes.at(-1)[1],
-		"leviathan reset (config: persona off, gate off, turns off, forge off, cotTag think)",
+		"leviathan reset (config: persona off, gate off, turns off, forge off, cot text:think)",
 		"a model no rule names gets the built-in record",
 	);
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
 	await command.handler("reset", { model: LEVIATHAN, ui: u });
-	assert.match(u.notes.at(-1)[1], /persona \S+prompt\.md, gate on, turns off, forge on, cotTag think/, "and a matched one gets its own");
+	assert.match(u.notes.at(-1)[1], /persona \S+prompt\.md, gate on, turns off, forge on, cot text:think/, "and a matched one gets its own");
 }
 console.log("ok reset reports the record");
 
@@ -2183,17 +2332,17 @@ console.log("ok reset reports the record");
 	await command.handler("forge default", ctx);
 	assert.equal(u.notes.at(-1)[1], "forge default (config)");
 
-	// cotTag: the fence both writers use, per model.
+	// cot: the fence both writers use, per model.
 	// The session names a file whose cot is fenced in the tag this session sets.
 	const tagFile = join(tempDir, "tag-turn0.yml");
 	writeFileSync(tagFile, "- user: q\n- assistant:\n    cot: think\n    text: ok\n");
 	await command.handler(`turns ${tagFile}`, ctx);
-	await command.handler("cotTag analysis", ctx);
-	assert.equal(u.notes.at(-1)[1], "cotTag analysis");
+	await command.handler("cot text:analysis", ctx);
+	assert.equal(u.notes.at(-1)[1], "cot text:analysis");
 	await run(LEVIATHAN);
 	assert.equal(guardRun([head(""), turn]).messages[2].content[0].text, fenced("analysis", "think", "ok"), "the session tag fences the cot");
-	await command.handler("cotTag default", ctx);
-	assert.equal(u.notes.at(-1)[1], "cotTag default (config)");
+	await command.handler("cot default", ctx);
+	assert.equal(u.notes.at(-1)[1], "cot default (config)");
 
 	// inherit: tree covers every model in this process, a slot verb keeps it, keyed narrows, none
 	// publishes nothing.
@@ -2216,14 +2365,14 @@ console.log("ok reset reports the record");
 	writeConfig(jail);
 	await command.handler("reset", ctx);
 	await command.handler(`persona ${altPrompt}`, ctx);
-	await command.handler("cotTag analysis", ctx);
+	await command.handler("cot text:analysis", ctx);
 	await command.handler("turns off", ctx);
 	await command.handler("gate off", ctx);
 	await command.handler("inherit keyed", ctx);
 	await command.handler("remember", ctx);
 	let data = JSON.parse(readFileSync(configFile, "utf8"));
 	assert.equal(data.rules[0].persona, altPrompt, "the written rule carries the session persona");
-	assert.equal(data.rules[0].cotTag, "analysis");
+	assert.equal(data.rules[0].cot, "text:analysis");
 	assert.equal(data.rules[0].turns, false, "the slot is written out, false included");
 	assert.equal(data.rules[0].gate, false);
 	assert.equal(data.inherit, "keyed");
@@ -2242,16 +2391,16 @@ console.log("ok reset reports the record");
 
 	// A slot the session set wins over a value the rule already pins.
 	writeConfig([
-		{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true, cotTag: "reasoning", turns: "x.yml" },
-		{ provider: "CLIProxy-Chat", model: "deepseek-flash", persona: true, gate: true, forge: true, cotTag: "reasoning", turns: "x.yml" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true, cot: "text:reasoning", turns: "x.yml" },
+		{ provider: "CLIProxy-Chat", model: "deepseek-flash", persona: true, gate: true, forge: true, cot: "text:reasoning", turns: "x.yml" },
 	]);
 	await command.handler("reset", ctx);
-	await command.handler("cotTag analysis", ctx);
+	await command.handler("cot text:analysis", ctx);
 	await command.handler("turns off", ctx);
 	await command.handler("remember", ctx);
 	data = JSON.parse(readFileSync(configFile, "utf8"));
 	assert.equal(data.rules.length, 2, "the exact rule is updated, not duplicated");
-	assert.equal(data.rules[0].cotTag, "analysis", "a session slot is written over the rule's own value");
+	assert.equal(data.rules[0].cot, "text:analysis", "a session slot is written over the rule's own value");
 	assert.equal(data.rules[0].turns, false);
 
 	// A refused write changes nothing.
@@ -2279,7 +2428,7 @@ console.log("ok reset reports the record");
 	await command.handler("reset", ctx);
 	await command.handler(`persona ${altPrompt}`, ctx);
 	for (const [args, pattern] of [
-		["cotTag 1bad", /cotTag must be/],
+		["cot 1bad", /cot must be/],
 		["inherit nope", /inherit must be/],
 		["persona", /persona needs a value/],
 		["turns", /turns needs a value/],
@@ -2296,7 +2445,7 @@ console.log("ok reset reports the record");
 	assert.equal(/\bmode\b/.test(u.notes.at(-1)[1]), false, "the usage names no removed verb");
 	const row = await panel();
 	assert.ok(row.includes(altPrompt), "a rejected verb leaves the settings alone");
-	await command.handler("cotTag analysis", { ui: u });
+	await command.handler("cot text:analysis", { ui: u });
 	assert.equal(u.notes.at(-1)[1], "no model selected");
 
 	// reset drops the slots with the answer, and publishes nothing.
@@ -2320,9 +2469,9 @@ console.log("ok reset reports the record");
 	// A slot verb never turns anything else on.
 	writeConfig([{ provider: "openai", model: "gpt-*", persona: false, gate: false, turns: false, forge: false }]);
 	await command.handler("reset", { model: NORMAL, ui: u });
-	await command.handler("cotTag analysis", { model: NORMAL, ui: u });
+	await command.handler("cot text:analysis", { model: NORMAL, ui: u });
 	assert.equal(guardRun([head(""), turn], NORMAL), undefined, "a slot verb changes nothing on the wire but its own slot");
-	assert.equal(JSON.parse(process.env[ENV_NAME]).s.cotTag, "analysis", "the payload carries the setting");
+	assert.equal(JSON.parse(process.env[ENV_NAME]).s.cot, "text:analysis", "the payload carries the setting");
 
 	// A slot verb re-keys the answer to the model in front of the user.
 	writeConfig([
@@ -2546,7 +2695,7 @@ console.log("ok an inherited tree answer narrows");
 // No model, no publish, and the command says why it did nothing.
 {
 	const command = commands.get("leviathan");
-	await command.handler("reset", { model: LEVIATHAN, ui: ui() });
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
 	const before_ = process.env[ENV_NAME];
 	const u = ui();
 	await command.handler("gate on", { ui: u });
@@ -2592,6 +2741,66 @@ console.log("ok blocked gate");
 	assert.equal(activeTools.includes(GATE_TOOL), true, "a model switch tries again");
 }
 console.log("ok a refused tool-set write is reported");
+
+// The toolcall cot names a tool, so that tool has to be registered and declared while the record
+// needs it. A provider that validates a historical function name against the declared tools rejects
+// the request otherwise.
+{
+	const u = ui();
+	activeTools = ["read", "bash"];
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, forge: true, cot: "toolcall:think" }]);
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
+	assert.ok(tools.has("think"), "the cot tool is registered under the cot's own name");
+	assert.equal(activeTools.includes("think"), true, "and declared while forge can write a call");
+	assert.equal(activeTools.includes(GATE_TOOL), false, "nothing else is declared");
+	const definition = tools.get("think");
+	assert.deepEqual(definition.parameters.required, ["thought"], "the argument the fabricated call carries is the one declared");
+	assert.deepEqual((await definition.execute("id", { thought: "x" })).content, [{ type: "text", text: COT_ACK }], "a live call answers the same short ack");
+
+	// A steady run writes nothing: the set is already what the record asks for.
+	const writes = toolSetWrites;
+	for (let i = 0; i < 3; i++) await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
+	assert.equal(toolSetWrites, writes, "a steady run writes the tool set zero times");
+
+	// The text form needs no tool, so the declaration is withdrawn with the form.
+	await commands.get("leviathan").handler("cot text:think", { model: LEVIATHAN, ui: ui() });
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
+	assert.equal(activeTools.includes("think"), false, "a text cot withdraws the tool");
+	assert.equal(activeTools.includes("read"), true, "and touches no other tool");
+
+	// A second form registers its own name, and the first one stays withdrawn.
+	await commands.get("leviathan").handler("cot toolcall:note", { model: LEVIATHAN, ui: ui() });
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
+	assert.ok(tools.has("note"), "the new name is registered");
+	assert.equal(activeTools.includes("note"), true);
+	assert.equal(activeTools.includes("think"), false);
+
+	// forge off and turns off: nothing can write a call, so nothing is declared.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, forge: false, cot: "toolcall:think" }]);
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
+	assert.equal(activeTools.some((name) => name === "think" || name === "note"), false, "a slot that cannot write a cot declares no cot tool");
+
+	// A refused declaration is reported once, and a model switch tries again.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: true, forge: false, cot: "toolcall:think" }]);
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
+	activeTools = ["read", "bash"];
+	toolFilter = (name) => name === "think";
+	const filtered = ui();
+	const beforeWrite = toolSetWrites;
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: filtered });
+	assert.equal(activeTools.includes("think"), false, "a filtered tool never becomes active");
+	assert.equal(toolSetWrites, beforeWrite + 1, "the attempt writes the set once");
+	assert.ok(filtered.notes.some(([type, message]) => type === "warning" && /think cannot be activated/.test(message)), "and the loss is reported");
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: filtered });
+	assert.equal(toolSetWrites, beforeWrite + 1, "a locked activation is not retried on the next run");
+	toolFilter = null;
+	await select({ type: "model_select", model: LEVIATHAN }, { model: LEVIATHAN, ui: filtered });
+	assert.equal(activeTools.includes("think"), true, "a model switch retries once");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
+	activeTools = ["read", "bash"];
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
+}
+console.log("ok cot tool");
 
 // model_select rebuilds the decision and the tool set in the same call.
 {

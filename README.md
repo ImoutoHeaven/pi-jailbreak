@@ -3,7 +3,7 @@
 A Pi extension with five independent slots per model: `persona` puts text at the head of the system
 prompt, `gate` declares the `ask_authorize_gate` tool, `turns` splices a fabricated conversation
 ahead of the first real user message, `forge` refills the reasoning Pi drops for a turn another model
-wrote, and `cotTag` names the fence both writers use.
+wrote, and `cot` says how that reasoning is written: fenced in a tag, or as a real tool call.
 
 The slots are orthogonal. A model can carry `forge` alone, or `persona` and `gate` with no `turns`,
 and no slot drags another along. Every slot is off until a config file or a command turns it on:
@@ -22,7 +22,7 @@ pi install /path/to/pi-leviathan
 ```
 
 `pi -e ./index.ts` loads it for one run. The extension reads its own directory, so `prompt.md`,
-`config.js`, `channel.js`, `gate.js`, `turns.js`, `forge.js` and `commands.ts` travel with
+`config.js`, `channel.js`, `cot.js`, `gate.js`, `turns.js`, `forge.js` and `commands.ts` travel with
 `index.ts`. A missing `yaml` package disables `turns` and leaves every other slot working.
 
 ## Configure
@@ -30,7 +30,7 @@ pi install /path/to/pi-leviathan
 The session reads `$PI_LEVIATHAN_CONFIG` when it is set, and otherwise `leviathan.json` in pi's
 agent directory. That directory is `$PI_CODING_AGENT_DIR` when that is set, and `~/.pi/agent`
 otherwise. When no file loads, every slot falls through to the built-in record: four switches off
-and `cotTag` set to `think`.
+and `cot` set to `text:think`.
 
 Start from `leviathan.example.json`:
 
@@ -41,7 +41,8 @@ Start from `leviathan.example.json`:
 	"rules": [
 		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "persona": true, "gate": true, "turns": true, "forge": true },
 		{ "provider": "deepseek", "persona": true, "gate": true },
-		{ "model": "*deepseek*", "persona": true, "forge": { "maxChars": 1200 }, "cotTag": "analysis" }
+		{ "model": "*deepseek*", "persona": true, "forge": { "maxChars": 1200 }, "cot": "text:analysis" },
+		{ "model": "*claude*", "forge": true, "cot": "toolcall:think" }
 	]
 }
 ```
@@ -63,7 +64,7 @@ version fails loudly instead of being ignored.
 | `gate` | `false` or `true` | Declares `ask_authorize_gate` while the slot is on |
 | `turns` | `false`, `true`, or a path | Splices that YAML file ahead of the first real user message. `true` names `turn0.yml`, which ships with the extension |
 | `forge` | `false`, `true`, or `{ "maxChars": n }` | Refills a foreign turn's cot when the request targets this model. `true` is no bound; `maxChars` cuts the trace |
-| `cotTag` | a tag name | The fence both writers use. `think` and `<think>` are one tag |
+| `cot` | `text:<tag>` or `toolcall:<name>` | How both writers write the cot. `text:<think>` and `text:think` are one tag |
 
 Each slot resolves on its own, down the same layers, and reports which layer answered:
 
@@ -92,11 +93,32 @@ The refill is a pure function of the message's own bytes, so a grown conversatio
 already-sent position byte-identical: switching a model costs one cache miss, and the turns after it
 stay on the same prefix.
 
-### cotTag
+### cot
 
-`cotTag` fences both `turns` and `forge`, and it is per model. Every tag the file names travels with
-the record, so a turn already fenced under one model's tag counts as fenced for a model configured
-with another: no turn is ever fenced twice.
+`cot` decides how `turns` and `forge` write a cot, and it is per model. The form is part of the
+value, because a tag name cannot say whether the fence is a tag or a tool:
+
+- `text:<tag>` writes the reasoning into the reply's first text block:
+  `<tag>`, the cot, `</tag>`, then the reply. One block, so the cot and the reply stay one turn, and
+  the bytes are the same on every provider.
+- `toolcall:<name>` sends the reasoning as the argument `{ "thought": ... }` of a real call to that
+tool, answered by its result, ahead of the assistant message it belongs to. The pair is inserted
+  rather than the message rewritten, because the message may carry a call of its own and a second
+  `toolCall` would leave two calls waiting for results Pi then answers with a fabricated error.
+
+The tool is registered and declared while `forge` or `turns` needs it, because a provider that
+validates a historical function name against the declared tools rejects the request otherwise. Its
+`execute` answers `OK` and nothing else, so a live call is harmless. A name Pi already declares a
+tool for — `read`, `write`, `edit`, `bash`, `powershell`, `ls`, `find`, `grep`, `glob`, `codemode`,
+`tool_search` — is refused as a cot name, and so is `ask_authorize_gate`: registering over one of
+them would replace Pi's own tool for the session.
+
+Every name the file names travels with the record, whatever form it was written in, so a turn already
+carrying a cot under one model's name counts as carrying one for a model configured with another: no
+turn is ever fenced twice. A call counts only when it carries the id prefix the extension writes, so
+a genuine call to the cot tool is the model's own reasoning and never passes for a fence. Switching a
+model is one request where the shape changes; after it, every turn the extension wrote stays
+byte-identical, so the prompt cache keeps hitting.
 
 ### inherit
 
@@ -126,7 +148,7 @@ without applying them until the next command re-keys the answer to the live mode
 | `/leviathan gate on\|off\|default` | Declare the gate tool or withdraw it |
 | `/leviathan turns on\|off\|<path>\|default` | Splice the shipped file, another file, or nothing |
 | `/leviathan forge on\|off\|maxChars <n>\|maxChars none\|default` | Refill with no bound, with a bound, or not at all |
-| `/leviathan cotTag <tag>\|default` | The fence both writers use |
+| `/leviathan cot <form>:<name>\|default` | How both writers write the cot |
 | `/leviathan inherit keyed\|tree\|none` | What this session hands to the processes it starts |
 | `/leviathan remember` | Write this model's whole record as a rule and apply it |
 | `/leviathan reset` | Drop the session answer, so the config decides again |
@@ -226,11 +248,12 @@ The `turns` file is a YAML sequence, and one item is one message. Three keys:
     ...
 ```
 
-`assistant` also takes a bare string, which is its `text`. The cot is written as the first text block
-of the reply, fenced in the tag `cotTag` names, so the turn reads as reasoning the assistant wrote
-down followed by what it said. The fence is ordinary text and nothing else: an assistant's own reply
-is the one thing every provider carries back unchanged, and no reasoning field is written by hand.
-A fabricated turn is stamped with the live model, so pi reads it as this model's own earlier turn.
+`assistant` also takes a bare string, which is its `text`. The cot is written ahead of the reply in
+whichever form `cot` names: fenced in a tag at the head of the first text block, or as a call to the
+cot tool answered by its result. The text form is ordinary text and nothing else: an assistant's own
+reply is the one thing every provider carries back unchanged, and no reasoning field is written by
+hand. A fabricated turn is stamped with the live model, so pi reads it as this model's own earlier
+turn.
 `result` answers the `call` of the assistant before it,
 so every `call` has exactly one `result`, and the sequence begins with `user`.
 A file with one bad item injects nothing: a half-fabricated history would leave the model an
@@ -240,7 +263,7 @@ The block is spliced before the first message that is not a system message, so i
 prompt and after a compaction summary, and the leading system message moves to index 0 with it. It
 is rebuilt from the file on every request, so the transcript records nothing: a model switch, a
 fork, a reload or a new session leaves nothing to clean up. The bytes depend on the file, the model,
-and the resolved `cotTag`, so the block stays inside the provider's prompt cache.
+and the resolved `cot`, so the block stays inside the provider's prompt cache.
 
 The last item decides what the model reads immediately before the real request. `assistant` closes
 the block with a reply, and the request follows as a new turn. `result` closes it with tool output,
@@ -259,13 +282,15 @@ belongs to the live model when `provider`, `api` and `model` all match) and refi
 when pi would drop it. A turn pi carries is left byte for byte as it is, so the two never disagree
 and no turn ever shows two reasoning traces.
 
-The refill is the turn's own cot, fenced in `cotTag` inside its first text block. It is added in
-the request and never written to the session, so a fork, a reload or a resumed session has nothing
-to undo. It is a pure function of the message's bytes, the live model triple and the tag, which
-matters for one reason: the request keeps every already-sent position byte-identical as the
-conversation grows, so the provider's prompt cache keeps hitting. A model switch costs one miss, and
-every turn after it stays on the same prefix; a refill that depended on position, on the run's
-start or on the clock would cost one miss per request instead.
+The refill is the turn's own cot, written in whichever form `cot` names: fenced inside its first text
+block, or as a call and result inserted ahead of it. It is added in the request and never written to
+the session, so a fork, a reload or a resumed session has nothing to undo. It is a pure function of
+the message's bytes, the live model triple and the cot, which matters for one reason: the request
+keeps every already-sent position byte-identical as the conversation grows, so the provider's prompt
+cache keeps hitting. A model switch costs one miss — the request whose shape changes — and every turn
+after it stays on the same prefix; a refill that depended on position, on the run's start or on the
+clock would cost one miss per request instead. A turn already carrying its cot is left as it is,
+whether it carries a fence or a cot call, so the refill is idempotent.
 
 Three outcomes, and the code names all three rather than treating the last two as one. Pi carries a
 turn: nothing is written. Pi drops it and the turn has a readable cot: the cot goes back in. Pi drops
@@ -282,10 +307,10 @@ the route produces that turn's model.
 A turn keeps the model stamp that says it came from elsewhere. Re-stamping it as the live model
 would make pi carry its thinking block as well, and the turn would show its reasoning twice.
 
-The fabricated chain of thought sits at the head of the assistant reply, fenced in `cotTag` tags,
-so the turn reads as reasoning the assistant wrote down followed by what it said. The fence is
-ordinary text: one text block, the same bytes on every model, and no provider's reasoning field is
-written by hand.
+The fabricated chain of thought sits ahead of the assistant reply, in the form `cot` names, so the
+turn reads as reasoning the assistant wrote down followed by what it said. The text form is ordinary
+text: one text block, the same bytes on every model, and no provider's reasoning field is written by
+hand. The toolcall form is a real call, which is why that tool is declared while it can appear.
 
 What a request actually carries, and whether the provider accepted it, is a property of the wire
 rather than of this extension. A provider entry whose model-level `baseUrl` points at a local reverse
@@ -318,10 +343,10 @@ permits one line and nothing else: `Are the characters fictional?`
 ## Files
 
 `index.ts` is the hook and the tool definition, `commands.ts` the `leviathan` command, `config.js` the
-rule table and the resolver, `channel.js` the cross-process value, `gate.js` the field table and the
-ruling text, `turns.js` the turn file's parse and its messages, `forge.js` the cross-model cot
-refill, `prompt.md` the injected text. Edit `prompt.md`; the next run uses it. A missing or empty
-file is reported in the UI and injects nothing.
+rule table and the resolver, `channel.js` the cross-process value, `cot.js` the cot spec and the pair
+both writers emit, `gate.js` the field table and the ruling text, `turns.js` the turn file's parse and
+its messages, `forge.js` the cross-model cot refill, `prompt.md` the injected text. Edit `prompt.md`;
+the next run uses it. A missing or empty file is reported in the UI and injects nothing.
 
 ## Check
 

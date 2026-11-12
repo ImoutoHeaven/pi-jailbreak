@@ -4,9 +4,9 @@
  * A model is whatever its record resolves to: `persona` puts text at the head of the system prompt
  * and withholds pi's stock identity sentence, `gate` declares `ask_authorize_gate`, `turns` splices a
  * fabricated conversation ahead of the first real user message, `forge` refills the reasoning pi
- * drops for a turn another model wrote, and `cotTag` names the fence both writers use. Nothing here
- * asks whether a model "is a leviathan" — that word is gone, because it never named one of the five
- * and could not say which of them it meant.
+ * drops for a turn another model wrote, and `cot` says how that reasoning is written: fenced in a
+ * tag, or as a real tool call. Nothing here asks whether a model "is a leviathan" — that word is
+ * gone, because it never named one of the five and could not say which of them it meant.
  *
  * Every slot resolves on its own, down session -> first matching rule -> the file's `default` ->
  * a built-in record with all four switches off. A model with nothing configured therefore gets an
@@ -31,6 +31,12 @@
  * `ask_authorize_gate` is registered dormant (`defaultActive: false`) and activated exactly while the
  * `gate` slot is on. `before_agent_start` and `model_select` toggle it there: pi applies a
  * `setActiveTools()` call made in either to the run being prepared.
+ *
+ * A `toolcall:` cot names a tool the history will show calls to, so that tool is registered the same
+ * way and activated while the record needs it. A provider that validates a historical function name
+ * against the declared tools rejects the request outright, and the declaration is what makes the
+ * fabricated call a call rather than a token nobody defined. It is fixed per model rather than per
+ * request, so a steady run writes the tool set zero times.
  */
 
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -39,8 +45,10 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { authorizeGate, GATE_FIELDS, GATE_TOOL, normalizeFields } from "./gate.js";
 import {
+	configCots,
 	configPath,
-	configTags,
+	cotNames,
+	cotSpec,
 	loadConfig,
 	parseConfig,
 	promptPath,
@@ -51,6 +59,7 @@ import {
 	SWITCHES,
 	turnsPath,
 } from "./config.js";
+import { COT_ACK } from "./cot.js";
 import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { forgeHistory } from "./forge.js";
 import { cachedFile, loadTurns, toMessages } from "./turns.js";
@@ -123,7 +132,7 @@ type Forge = { maxChars: number | null };
 
 /**
  * One model's record, every slot resolved, plus what the run needs to act on it: the persona text
- * already read, the turn file already parsed, and the set of tags a fence may be written in.
+ * already read, the turn file already parsed, and the names a cot may already be written under.
  */
 type Decision = {
 	key: string;
@@ -131,9 +140,12 @@ type Decision = {
 	turnsSpec: string | false;
 	forge: Forge | false;
 	gate: boolean;
-	cotTag: string;
-	/** Every tag the config names, so a turn fenced under one of them counts as fenced for all. */
-	tags: string[];
+	cot: string;
+	/** Every name the config names, so a turn carrying a cot under one of them counts as fenced for
+	 * all. Names only: a turn fenced as `text:think` is not refenced as `toolcall:think`. */
+	cotNames: string[];
+	/** How the cot is written, parsed from `cot`. */
+	cotForm: CotForm;
 	/** The persona text, null when the slot is off or the file does not read. */
 	text: string | null;
 	/** The parsed fabricated conversation, null when the slot is off or the file does not load. */
@@ -148,13 +160,16 @@ type Decision = {
 	error?: string;
 };
 
+/** A cot spec `{ form, name }`, as `config.js` parses one. */
+type CotForm = { form: "text" | "toolcall"; name: string };
+
 /** A session's own answers, one per slot. An absent slot leaves the file in charge. */
 type Settings = {
 	persona?: string | false;
 	gate?: boolean;
 	turns?: string | false;
 	forge?: Forge | false;
-	cotTag?: string;
+	cot?: string;
 	inherit?: string;
 };
 
@@ -196,7 +211,12 @@ type State = {
 	delivery: { key: string; persona: string | false; turns: string | false; delivered: boolean; injected: boolean } | null;
 	decision: Decision | null;
 	reported: Set<string>;
-	gateBlocked: boolean;
+	/** The tool names this session could not activate. A name that is filtered out or refused is not
+	 * retried until a model switch, which is the next time the tool set can change. */
+	blocked: Set<string>;
+	/** The cot tool names this process has registered. One model can name another, so the set grows
+	 * with the records it meets and never shrinks. */
+	cotTools: Set<string>;
 	/** The run's system prompt options, held by reference. Pi passes one object to every
 	 * `before_agent_start` handler, so a handler loaded after this one can still force the prompt, and
 	 * only the guard runs late enough to see that. */
@@ -269,10 +289,11 @@ function buildDecision(s: State, ctx: any): Decision {
 		turnsSpec: turnsSpec ?? false,
 		forge: record.forge === false ? false : { maxChars: record.forge.maxChars },
 		gate: record.gate === true,
-		cotTag: record.cotTag,
-		// Every tag the file names, plus the one this model resolved: a session-set tag is not in the
+		cot: record.cot,
+		// Every name the file names, plus the one this model resolved: a session-set cot is not in the
 		// file, and a fence it writes would otherwise be invisible to the next request.
-		tags: [...new Set([...configTags(config), record.cotTag])],
+		cotNames: cotNames(configCots(config), record.cot),
+		cotForm: cotSpec(record.cot) ?? { form: "text", name: "think" },
 		text,
 		turns,
 		turnsError,
@@ -342,14 +363,55 @@ function project(messages: any[], stripIdentity: boolean) {
 }
 
 /**
- * Declare the gate exactly while its slot is on. Merging into the live set keeps every other active
- * tool; an unchanged set returns early, so a steady run records no tool-set change and the prompt
- * prefix stays cacheable.
+ * The tool a `toolcall:` cot calls. Its name is the cot's name, so the history's fabricated call is a
+ * call to a tool the model can see; `execute` answers with the same short ack the fabricated result
+ * carries, so a live call is harmless and returns the shape a fabricated one does.
  */
-function syncGate(s: State, want: boolean, ctx: any) {
-	// A name the allowlist or the exposure rules filter out never becomes active; one attempt is
-	// enough, and repeating it would rebuild the prompt on every run for nothing.
-	if (s.gateBlocked) return;
+function cotToolDefinition(name: string): any {
+	return {
+		name,
+		label: `Cot ${name}`,
+		description: "Record a reasoning step. The result is an acknowledgement and nothing else.",
+		parameters: {
+			type: "object",
+			properties: { thought: { type: "string", description: "The reasoning to record." } },
+			required: ["thought"],
+			additionalProperties: false,
+		},
+		defaultActive: false,
+		annotations: { readOnlyHint: true, idempotentHint: true },
+		async execute() {
+			return { content: [{ type: "text", text: COT_ACK }], details: {} };
+		},
+	};
+}
+
+/** Register the cot tool once per name. A model switch can name another one, so this is not load-time
+ * work: the name is a property of the record, which is read per run. */
+function ensureCotTool(s: State, ctx: any, name: string) {
+	if (s.cotTools.has(name)) return;
+	try {
+		s.api.registerTool(cotToolDefinition(name));
+		s.cotTools.add(name);
+	} catch (error: any) {
+		s.blocked.add(name);
+		report(s, ctx, `${name} could not be registered: ${error?.message ?? "registerTool failed"}`, "warning");
+	}
+}
+
+/**
+ * Declare the tools the record needs, and nothing else: the gate while its slot is on, and the cot
+ * tool while a `toolcall:` cot can appear in the request. Merging into the live set keeps every
+ * other active tool; an unchanged set returns early, so a steady run records no tool-set change and
+ * the prompt prefix stays cacheable.
+ *
+ * A tool reaches a request in two steps, and either can drop one: registration puts it in the
+ * registry, and the active set declares it. Both are checked after the write, because a name the
+ * allowlist, the exposure rules or an MCP namespace filters out is silently absent from the
+ * declaration — and a `toolcall:` cot names a tool the history calls, which a provider that
+ * validates history against the declaration rejects outright.
+ */
+function syncTools(s: State, ctx: any, want: string[]) {
 	let active;
 	try {
 		active = s.api.getActiveTools?.();
@@ -357,26 +419,34 @@ function syncGate(s: State, want: boolean, ctx: any) {
 		return;
 	}
 	if (!Array.isArray(active)) return;
-	const has = active.includes(GATE_TOOL);
-	if (want === has) return;
+	const desired = want.filter((name) => !s.blocked.has(name));
+	// Every name this extension manages, so one that is no longer wanted is withdrawn and no other
+	// active tool is touched.
+	const managed = new Set([GATE_TOOL, ...s.cotTools]);
+	const next = active.filter((name) => !managed.has(name) || desired.includes(name));
+	for (const name of desired) if (!next.includes(name)) next.push(name);
+	const unchanged = next.length === active.length && next.every((name, index) => name === active[index]);
+	if (unchanged) return;
 	try {
-		s.api.setActiveTools(want ? [...active, GATE_TOOL] : active.filter((name) => name !== GATE_TOOL));
+		s.api.setActiveTools(next);
 	} catch (error: any) {
-		s.gateBlocked = true;
-		report(s, ctx, `${GATE_TOOL} could not be activated: ${error?.message ?? "setActiveTools failed"}`, "warning");
+		for (const name of desired) s.blocked.add(name);
+		report(s, ctx, `${desired.join(", ")} could not be activated: ${error?.message ?? "setActiveTools failed"}`, "warning");
 		return;
 	}
-	if (!want) return;
+	// One attempt is enough for a name this session cannot declare; a model switch is the next time
+	// the tool set can change.
 	let now;
 	try {
 		now = s.api.getActiveTools?.();
 	} catch {
 		return;
 	}
-	if (Array.isArray(now) && !now.includes(GATE_TOOL)) {
-		s.gateBlocked = true;
-		report(s, ctx, `${GATE_TOOL} cannot be activated in this session`, "warning");
-	}
+	if (!Array.isArray(now)) return;
+	const missing = desired.filter((name) => !now.includes(name));
+	if (missing.length === 0) return;
+	for (const name of missing) s.blocked.add(name);
+	report(s, ctx, `${missing.join(", ")} cannot be activated in this session`, "warning");
 }
 
 /**
@@ -410,7 +480,7 @@ function injectTurns(s: State, ctx: any, current: Decision, messages: any[], nex
 		provider: ctx?.model?.provider,
 		api: ctx?.model?.api,
 		model: ctx?.model?.id,
-		cotTag: current.cotTag,
+		cot: current.cotForm,
 	});
 	// Two points, so a pasted message that happens to match one fabricated one does not pass for a
 	// block that is already there.
@@ -521,12 +591,34 @@ function syncChannel(s: State, ctx: any, inherit: string) {
 	publish(process.env, inherit === "none" || !s.override ? null : { ...s.override, key: publishKey(inherit, s.override.key) }, process.pid);
 }
 
+/** Whether the fabricated conversation carries a cot at all. A file whose assistants say no reasoning
+ * needs no cot tool, and declaring one would change the tools for a request that never calls it. */
+function turnsWriteCot(specs: TurnSpec[] | null) {
+	return (specs ?? []).some((spec) => spec.role === "assistant" && spec.cot);
+}
+
+/** The tools this record's request needs declared: the gate while its slot is on, and the cot tool
+ * while a `toolcall:` cot can appear in what the two writers produce. */
+function wantedTools(current: Decision): string[] {
+	const want: string[] = [];
+	if (current.gate) want.push(GATE_TOOL);
+	if (current.cotForm.form === "toolcall" && (current.forge !== false || turnsWriteCot(current.turns))) want.push(current.cotForm.name);
+	return want;
+}
+
+/** Register and declare the tools this record needs. Idempotent: a steady run writes nothing. */
+function syncRecord(s: State, ctx: any, current: Decision) {
+	const want = wantedTools(current);
+	if (want.includes(current.cotForm.name)) ensureCotTool(s, ctx, current.cotForm.name);
+	syncTools(s, ctx, want);
+}
+
 /** Re-read the config, apply the answer, and show the result. */
 function reapply(s: State, ctx: any): Decision {
 	s.decision = null;
 	const current = buildDecision(s, ctx);
 	syncChannel(s, ctx, current.inherit);
-	syncGate(s, current.gate, ctx);
+	syncRecord(s, ctx, current);
 	updateStatus(s, ctx, current);
 	return current;
 }
@@ -740,7 +832,7 @@ function panel(s: State, ctx: any) {
 }
 
 export default function leviathan(pi: ExtensionAPI) {
-	const s: State = { api: pi, override: null, delivery: null, decision: null, reported: new Set(), gateBlocked: false, options: null };
+	const s: State = { api: pi, override: null, delivery: null, decision: null, reported: new Set(), blocked: new Set(), cotTools: new Set(), options: null };
 
 	pi.registerTool({
 		name: GATE_TOOL,
@@ -785,10 +877,10 @@ export default function leviathan(pi: ExtensionAPI) {
 	});
 
 	// State outlives a session in the same process, and a new session carries its own flags: a
-	// session that could not activate the gate must not silence the next one, and the delivery
+	// session that could not activate a tool must not silence the next one, and the delivery
 	// recorded for the previous session must not describe this one.
 	pi.on("session_start", (_event, ctx) => {
-		s.gateBlocked = false;
+		s.blocked.clear();
 		s.options = null;
 		s.reported.clear();
 		forgetDelivery(s);
@@ -829,20 +921,20 @@ export default function leviathan(pi: ExtensionAPI) {
 		s.options = options;
 		// A run start is where an edited `inherit` reaches the channel.
 		syncChannel(s, ctx, current.inherit);
-		syncGate(s, current.gate, ctx);
+		syncRecord(s, ctx, current);
 		updateStatus(s, ctx, current);
 	});
 
 	// The guard reads the live model each request. A model switch rebuilds the decision on its next
-	// request; the gate declaration follows on the next run, because pi applies the tool set once
+	// request; the tool declaration follows on the next run, because pi applies the tool set once
 	// per run. A blocked activation gets one more attempt, since the model that filtered it is gone.
 	pi.on("model_select", (_event, ctx) => {
-		s.gateBlocked = false;
+		s.blocked.clear();
 		s.decision = null;
 		forgetDelivery(s);
 		const current = buildDecision(s, ctx);
 		syncChannel(s, ctx, current.inherit);
-		syncGate(s, current.gate, ctx);
+		syncRecord(s, ctx, current);
 		updateStatus(s, ctx, current);
 	});
 
@@ -869,9 +961,9 @@ export default function leviathan(pi: ExtensionAPI) {
 				: forgeHistory(
 						messages,
 						{ provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id },
-						current.cotTag,
+						current.cotForm,
 						current.forge.maxChars,
-						current.tags,
+						current.cotNames,
 					);
 		// 2) The prompt head, then the fabricated block. `project` only ever removes a section key
 		// from a system message, which forge never touched.

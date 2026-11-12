@@ -14,6 +14,7 @@
  */
 
 import { createRequire } from "node:module";
+import { cotPair, cotText, pairId, zeroUsage } from "./cot.js";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 
@@ -194,25 +195,24 @@ export function parseTurns(text) {
 	return { specs };
 }
 
-/** The zero usage record every fabricated message carries: the request pays for none of it. */
-function zeroUsage() {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-}
-
 /**
  * The specs as pi messages. Pure object construction: nothing here reads the clock, the transcript
- * or the file, so two calls with the same specs, model and tag produce identical bytes.
+ * or the file, so two calls with the same specs, model and cot produce identical bytes.
  *
- * The fabricated cot is written at the head of the reply, fenced in the tag `cotTag` names, so the
- * turn reads as reasoning the assistant wrote down followed by what it said. The fence is text and
- * nothing else: an assistant's text block is the one block every provider carries back unchanged, so
- * the same bytes reach every model and no provider's reasoning field is written by hand.
+ * The fabricated cot is written ahead of the reply in whichever form the cot slot names:
+ *
+ *  - `text:<tag>` fences it at the head of the reply's one text block, so the turn reads as reasoning
+ *    the assistant wrote down followed by what it said.
+ *  - `toolcall:<name>` sends the reasoning as that tool's call, answered by its result, ahead of the
+ *    assistant message. The pair is the same one `forge` writes, so a fabricated conversation and a
+ *    refilled history are indistinguishable to a model that reads them.
  *
  * A fabricated block is stamped with the live model, so it survives `transformMessages` and pi reads
  * it as this model's own earlier turn rather than as history carried over from somewhere else.
  */
-export function toMessages(specs, { provider, api, model, cotTag }) {
+export function toMessages(specs, { provider, api, model, cot }) {
 	const messages = [];
+	const stamp = { provider, api, model };
 	// The id of the last call, which the result after it answers.
 	let lastCall = null;
 	for (let index = 0; index < specs.length; index++) {
@@ -233,11 +233,14 @@ export function toMessages(specs, { provider, api, model, cotTag }) {
 			});
 			continue;
 		}
+		// A reasoning turn of its own: call, result, then the reply it belongs to.
+		if (spec.cot && cot?.form === "toolcall") {
+			messages.push(...cotPair(spec.cot, cot.name, pairId(`${index}\u0000${spec.cot}`, stamp), stamp));
+		}
 		const content = [];
-		// The cot leads the reply, fenced so it reads as reasoning the assistant wrote down rather
-		// than as a second thing it said. One block, so the fence and the reply stay one turn.
-		const tag = cotTag || "think";
-		const fence = spec.cot ? `<${tag}>\n${spec.cot}\n</${tag}>` : "";
+		// The cot leads the reply, so it reads as reasoning the assistant wrote down rather than as a
+		// second thing it said. One block, so the fence and the reply stay one turn.
+		const fence = spec.cot && cot?.form !== "toolcall" ? cotText(spec.cot, cot.name) : "";
 		const visible = [fence, spec.text].filter(Boolean).join("\n\n");
 		if (visible) content.push({ type: "text", text: visible });
 		if (spec.call) {
