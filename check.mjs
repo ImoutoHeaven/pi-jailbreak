@@ -10,7 +10,7 @@ import { configCots, configPath, cotNames, cotSpec, DEFAULT_COT, DEFAULT_PROMPT,
 import { applies, decode, encode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { loadTurns, parseTurns, toMessages } from "./turns.js";
 import { forgeHistory, forgeOne, isSameModel, ownCot, prefixStable } from "./forge.js";
-import { COT_ACK, fenced as carriesCot } from "./cot.js";
+import { COT_ACK, beatHistory, beatText, fenced as carriesCot, opensWith, transcribeHistory, transcribeOne } from "./cot.js";
 
 /** A cot spec, as the config parses one. */
 const TEXT_THINK = { form: "text", name: "think" };
@@ -204,7 +204,7 @@ assert.equal(payloadSegments(prose), 22, "the number of Chinese payload segments
 console.log("ok prompt.md");
 
 // ---------------------------------------------------------------------------
-// The record: five slots, five resolutions
+// The record: seven slots, seven resolutions
 // ---------------------------------------------------------------------------
 assert.equal(globMatch("deepseek-*", "deepseek-flash"), true);
 assert.equal(globMatch("*deepseek*", "@cf/deepseek-ai/deepseek-v4.1-flash"), true);
@@ -214,7 +214,7 @@ assert.equal(globMatch("glm-5.3", "glm-5.3-turbo"), false, "a pattern without * 
 assert.equal(globMatch("*gpt-5.1*", "gpt-5x1"), false, "a dot matches only a dot");
 assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 
-// The record with nothing configured changes no request: all four switches off, and the shipped tag.
+// The record with nothing configured changes no request: every switch off, and the shipped cot.
 {
 	const bare = parseConfig("{}", "/cfg");
 	assert.equal(bare.error, undefined);
@@ -222,19 +222,19 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 	assert.equal(bare.config.inherit, "keyed");
 	assert.equal(bare.config.dir, "/cfg");
 	assert.deepEqual(emptyConfig("/cfg").default, {}, "and neither does the empty config");
-	assert.deepEqual(emptyRecord(), { persona: false, gate: false, turns: false, forge: false, cot: "text:think" });
+	assert.deepEqual(emptyRecord(), { persona: false, gate: false, turns: false, forge: false, cot: "text:think", transcribe: false, beat: false });
 	const resolved = resolveMode(bare.config, { provider: "any", id: "model" });
 	assert.deepEqual(
-		{ persona: resolved.persona, gate: resolved.gate, turns: resolved.turns, forge: resolved.forge, cot: resolved.cot },
+		{ persona: resolved.persona, gate: resolved.gate, turns: resolved.turns, forge: resolved.forge, cot: resolved.cot, transcribe: resolved.transcribe, beat: resolved.beat },
 		emptyRecord(),
 		"every slot falls through to the built-in record",
 	);
-	assert.deepEqual(resolved.sources, { persona: "builtin", gate: "builtin", turns: "builtin", forge: "builtin", cot: "builtin" });
+	assert.deepEqual(resolved.sources, { persona: "builtin", gate: "builtin", turns: "builtin", forge: "builtin", cot: "builtin", transcribe: "builtin", beat: "builtin" });
 	assert.equal(resolved.ruleIndex, -1);
 }
 
 // A file, a rule and a session each set slots on their own, and every slot reports which layer
-// answered. This table is the whole design in one place: four switches that never drag each other.
+// answered. This table is the whole design in one place: switches that never drag each other.
 {
 	const config = parseConfig(
 		JSON.stringify({
@@ -251,11 +251,11 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 	assert.equal(config.error, undefined);
 	const one = resolveMode(config, { provider: "a", id: "one" });
 	assert.deepEqual(
-		{ persona: one.persona, gate: one.gate, turns: one.turns, forge: one.forge, cot: one.cot },
-		{ persona: DEFAULT_PROMPT, gate: true, turns: false, forge: false, cot: "text:think" },
-		"a rule that names gate leaves the other four to the layers below it",
+		{ persona: one.persona, gate: one.gate, turns: one.turns, forge: one.forge, cot: one.cot, transcribe: one.transcribe, beat: one.beat },
+		{ persona: DEFAULT_PROMPT, gate: true, turns: false, forge: false, cot: "text:think", transcribe: false, beat: false },
+		"a rule that names gate leaves the other six to the layers below it",
 	);
-	assert.deepEqual(one.sources, { persona: "default", gate: "rule", turns: "builtin", forge: "builtin", cot: "default" });
+	assert.deepEqual(one.sources, { persona: "default", gate: "rule", turns: "builtin", forge: "builtin", cot: "default", transcribe: "builtin", beat: "builtin" });
 
 	const two = resolveMode(config, { provider: "a", id: "two" });
 	assert.deepEqual(
@@ -263,7 +263,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		{ persona: DEFAULT_PROMPT, gate: false, turns: DEFAULT_TURNS, forge: { maxChars: 800 } },
 		"a rule that names turns and forge leaves persona and gate alone",
 	);
-	assert.deepEqual(two.sources, { persona: "default", gate: "builtin", turns: "rule", forge: "rule", cot: "default" });
+	assert.deepEqual(two.sources, { persona: "default", gate: "builtin", turns: "rule", forge: "rule", cot: "default", transcribe: "builtin", beat: "builtin" });
 
 	const three = resolveMode(config, { provider: "a", id: "three" });
 	assert.equal(three.persona, false, "a rule turns a slot off that the file turned on");
@@ -285,7 +285,7 @@ assert.equal(globMatch("glm-5.3", "glm-5x3"), false);
 		"/cfg",
 	).config;
 	const x = resolveMode(moved, { provider: "a", id: "x" });
-	assert.deepEqual({ ...x.sources }, { persona: "default", gate: "rule", turns: "default", forge: "default", cot: "builtin" });
+	assert.deepEqual({ ...x.sources }, { persona: "default", gate: "rule", turns: "default", forge: "default", cot: "builtin", transcribe: "builtin", beat: "builtin" });
 	assert.equal(x.gate, false);
 }
 console.log("ok record resolution");
@@ -878,6 +878,233 @@ console.log("ok turns messages");
 		assert.deepEqual(forgeHistory(once, LIVE, TOOL_THINK), once, "and a forged history is already done");
 	}
 	console.log("ok forge toolcall");
+
+// ---------------------------------------------------------------------------
+// The promotion: a turn's own reasoning written as text, and the turn marker
+// ---------------------------------------------------------------------------
+{
+	const SPEC_TEXT = { form: "text", name: "think" };
+	const SPEC_TOOL = { form: "toolcall", name: "think" };
+	const NAMES = ["think"];
+	const live = (content, stopReason = "toolUse") => ({
+		role: "assistant",
+		content,
+		provider: "CLIProxy",
+		api: "openai-responses",
+		model: "gemini-4-carbon",
+		usage: zero,
+		stopReason,
+		timestamp: 0,
+	});
+	const thinkBlock = (cot) => ({ type: "thinking", thinking: cot, thinkingSignature: "sig-" + cot });
+	const callBlock = (id, name) => ({ type: "toolCall", id, name, arguments: {} });
+	const bare = (cot) => "<" + "think" + ">\n" + cot + "\n</" + "think" + ">";
+
+	// The text form replaces the reasoning with a fence, in the same message, ahead of the call: no
+	// message is added, and no block but the thinking block is dropped.
+	{
+		const message = live([thinkBlock("my cot"), callBlock("t1", "exec")]);
+		const done = transcribeOne(message, SPEC_TEXT, NAMES);
+		assert.equal(done.length, 1, "the message is replaced, not joined");
+		assert.deepEqual(done[0].content.map((b) => b.type), ["text", "toolCall"], "the fence leads the call");
+		assert.equal(done[0].content[0].text, bare("my cot"), "the fence alone, with no reply");
+		assert.equal(done[0].content.some((b) => b.type === "thinking"), false, "the block is gone, not kept beside it");
+		assert.equal(done[0].provider, message.provider, "the stamp is untouched");
+		assert.equal(done[0].model, "gemini-4-carbon");
+		assert.equal(message.content[0].type, "thinking", "the input message is not mutated");
+	}
+
+	// A turn with visible text keeps it, after the fence.
+	{
+		const message = live([thinkBlock("cot"), { type: "text", text: "the reply" }], "stop");
+		const [done] = transcribeOne(message, SPEC_TEXT, NAMES);
+		assert.deepEqual(done.content, [{ type: "text", text: bare("cot") + "\n\nthe reply" }], "one block, fence then reply");
+	}
+
+	// Three turns are left exactly as they are, for three different reasons.
+	{
+		const own = live([{ type: "text", text: bare("mine") }, callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(own, SPEC_TEXT, NAMES), own, "a turn the model fenced itself is the loop closing");
+		const none = live([callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(none, SPEC_TEXT, NAMES), none, "a turn with no reasoning has nothing to promote");
+		const opaque = live([{ type: "thinking", thinking: "[Reasoning redacted]", redacted: true }, callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(opaque, SPEC_TEXT, NAMES), opaque, "an unreadable block is not promoted");
+		assert.equal(transcribeOne({ role: "user", content: [], timestamp: 0 }, SPEC_TEXT, NAMES).role, "user", "only assistant turns are read");
+	}
+
+	// The toolcall form inserts the pair and keeps the turn, which is the shape forge writes for a
+	// foreign one, so the two forms differ only in where the reasoning lands.
+	{
+		const message = live([thinkBlock("my cot"), callBlock("t1", "exec")]);
+		const done = transcribeOne(message, SPEC_TOOL, NAMES);
+		assert.equal(done.length, 3, "the call, its ack, then the turn it belongs to");
+		assert.equal(done[0].content[0].arguments.thought, "my cot", "the reasoning is the call's argument");
+		assert.deepEqual(done[2].content.map((b) => b.type), ["toolCall"], "and it is no longer a block");
+
+		// The id is salted with the position, so two turns carrying identical reasoning under one stamp
+		// are still two calls. A transcript may not hold two calls with one id.
+		const twin = live([thinkBlock("my cot"), callBlock("t2", "read")]);
+		const ids = transcribeHistory([message, twin], SPEC_TOOL, NAMES)
+			.filter((m) => m.role === "assistant")
+			.map((m) => (m.content || []).find((b) => b.type === "toolCall" && b.name === "think")?.id)
+			.filter(Boolean);
+		assert.equal(ids.length, 2, "both turns get a pair");
+		assert.notEqual(ids[0], ids[1], "and identical reasoning under one stamp is still two ids");
+	}
+
+	// The whole list: identity when nothing changed, byte-stable on a second pass, never longer.
+	{
+		const history = [
+			{ role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 },
+			live([thinkBlock("cot1"), callBlock("t1", "exec")]),
+			{ role: "toolResult", toolCallId: "t1", toolName: "exec", content: [{ type: "text", text: "o" }], isError: false, timestamp: 0 },
+		];
+		const once = transcribeHistory(history, SPEC_TEXT, NAMES);
+		assert.notEqual(once, history, "a promotion is a new list");
+		assert.equal(once.length, history.length, "and never a longer one");
+		assert.deepEqual(transcribeHistory(once, SPEC_TEXT, NAMES), once, "a second pass changes nothing");
+		const done = history.map((m, i) => (i === 1 ? { ...m, content: [{ type: "text", text: bare("x") }] } : m));
+		assert.equal(transcribeHistory(done, SPEC_TEXT, NAMES), done, "a list with nothing to promote keeps its identity");
+		assert.equal(transcribeHistory(null, SPEC_TEXT, NAMES), null);
+	}
+
+	// The promotion reads the message and nothing else, in particular not the live model. That is what
+	// makes a model switch free: the same history yields the same bytes whoever asks.
+	{
+		const history = [
+			{ role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 },
+			live([thinkBlock("cot1"), callBlock("t1", "exec")]),
+		];
+		assert.deepEqual(transcribeHistory(history, SPEC_TEXT, NAMES), transcribeHistory(history, SPEC_TEXT, NAMES), "pure");
+	}
+
+	console.log("ok transcribe");
+}
+
+// The turn marker: a position anchor inside the turn it counts, and never a message of its own.
+{
+	const bare = (cot) => "<" + "think" + ">\n" + cot + "\n</" + "think" + ">";
+	const turn = (cot, id) => ({
+		role: "assistant",
+		content: [{ type: "text", text: bare(cot) }, { type: "toolCall", id, name: "exec", arguments: {} }],
+		provider: "P",
+		api: "a",
+		model: "m",
+		usage: zero,
+		stopReason: "toolUse",
+		timestamp: 0,
+	});
+
+	// The marker is appended inside the existing text block: no message is added and no system message
+	// is written, which is the whole point. Providers disagree about a mid-conversation system message
+	// and several fold it into the head, which would invalidate the whole prefix.
+	{
+		const [done] = beatHistory([turn("cot", "t1")]).map((m) => m);
+		assert.equal(done.content.length, 2, "no block is added to a turn that already speaks");
+		assert.equal(done.content[0].text, bare("cot") + "\n[turn 0]", "the marker goes at the end of the text");
+		assert.equal(done.content[1].type, "toolCall", "and nothing moves");
+	}
+
+	// A turn that says nothing at all still takes a marker, in a block of its own ahead of its call.
+	{
+		const silent = { role: "assistant", content: [{ type: "thinking", thinking: "cot", thinkingSignature: "s" }, { type: "toolCall", id: "t1", name: "exec", arguments: {} }], provider: "P", api: "a", model: "m", timestamp: 0 };
+		const [done] = beatHistory([silent]);
+		assert.deepEqual(done.content.map((b) => b.type), ["thinking", "text", "toolCall"], "the marker sits after the reasoning and ahead of the call");
+		assert.equal(done.content[1].text, "[turn 0]");
+		assert.equal(done.content[0], silent.content[0], "the reasoning block is not moved");
+		assert.equal(done.content[2], silent.content[1], "and the call itself is untouched");
+	}
+
+	// Idempotent: the previous marker is removed before the current one is written.
+	{
+		const once = beatHistory([turn("cot", "t1")]);
+		assert.deepEqual(beatHistory(once), once, "a second pass writes the same bytes");
+		assert.equal(beatText("[turn 3]", 5), "[turn 5]", "a rewritten marker replaces the old one");
+		assert.equal(beatText("plain", 2), "plain\n[turn 2]");
+	}
+
+	// Position, not a counter: appending a turn renumbers nothing already sent.
+	{
+		const base = [turn("a", "t1"), turn("b", "t2")];
+		const first = beatHistory(base);
+		const grown = beatHistory([...base, turn("c", "t3")]);
+		assert.equal(prefixStable(first, grown), null, "an append changes no earlier position");
+		assert.equal(grown[0].content[0].text, first[0].content[0].text, "turn 0 is still turn 0");
+	}
+
+	// Identity when there is nothing to mark, and a user turn is never touched.
+	{
+		const user = { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 };
+		const untouched = [user];
+		assert.equal(beatHistory(untouched), untouched, "an unchanged list keeps its identity");
+		assert.deepEqual(beatHistory([user])[0].content, user.content, "a user turn carries no marker");
+		assert.equal(beatHistory(null), null);
+	}
+
+	console.log("ok beat");
+
+	// The two slots together, twice. The marker must not make an already written pair look like a
+	// fresh turn: without that, the marker plus the toolcall form would add one pair per request.
+	{
+		const A = { provider: "CLIProxy-Chat", api: "openai-completions", id: "deepseek-flash" };
+		const B = { provider: "CLIProxy", api: "openai-responses", id: "gemini-4-carbon" };
+		const tool = { form: "toolcall", name: "think" };
+		const foreign = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "cot", thinkingSignature: "s" }, { type: "toolCall", id: "t1", name: "exec", arguments: {} }],
+			provider: A.provider,
+			api: A.api,
+			model: A.id,
+			usage: zero,
+			stopReason: "toolUse",
+			timestamp: 0,
+		};
+		const history = [
+			{ role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 },
+			foreign,
+			{ role: "toolResult", toolCallId: "t1", toolName: "exec", content: [{ type: "text", text: "o" }], isError: false, timestamp: 0 },
+		];
+		const round = (list) => beatHistory(forgeHistory(list, B, tool, null, ["think"]));
+		const once = round(history);
+		const twice = round(once);
+		assert.equal(twice.length, once.length, "a marker on the pair does not add a second pair");
+		assert.deepEqual(twice, once, "and the second request is byte-identical");
+		assert.equal(once.filter((m) => m.role === "assistant" && (m.content || []).some((b) => b.name === "think")).length, 1, "one pair, not two");
+
+		// The same with the text form: the fence carries the marker, and the second pass leaves it.
+		const text = { form: "text", name: "think" };
+		const t1 = beatHistory(forgeHistory(history, B, text, null, ["think"]));
+		const t2 = beatHistory(forgeHistory(t1, B, text, null, ["think"]));
+		assert.deepEqual(t2, t1, "the text form is stable with the marker too");
+		assert.equal(prefixStable(t1, t2), null, "and renumbers nothing");
+
+		// The writer order, pinned by what it produces rather than by reading the call site: with the
+		// promotion running second, a foreign turn is fenced by `forge` and then promoted on top of it,
+		// which is two reasoning traces on one turn. It has to run first.
+		const foreign2 = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "cot", thinkingSignature: "s" }, { type: "toolCall", id: "t2", name: "exec", arguments: {} }],
+			provider: A.provider,
+			api: A.api,
+			model: A.id,
+			usage: zero,
+			stopReason: "toolUse",
+			timestamp: 0,
+		};
+		const textSpec = { form: "text", name: "think" };
+		const promotedFirst = transcribeHistory([foreign2], textSpec, ["think"]);
+		const forgedAfter = forgeHistory(promotedFirst, B, textSpec, null, ["think"]);
+		assert.equal(forgedAfter.filter((m) => m.role === "assistant" && carriesCot(m.content || [], ["think"])).length, 1, "one cot on the turn");
+		assert.equal(forgedAfter.filter((m) => m.role === "assistant" && (m.content || []).some((b) => b.type === "text" && opensWith(b.text, "think"))).length, 1, "and not two fences");
+		// The other order leaves the native block where it was, so the turn would carry a fence and a
+		// signed reasoning trace at once. That is the double trace the order exists to prevent.
+		const forgedFirst = forgeHistory([foreign2], B, textSpec, null, ["think"]);
+		const promotedAfter = transcribeHistory(forgedFirst, textSpec, ["think"]);
+		assert.equal(promotedAfter[0].content.some((b) => b.type === "thinking"), true, "promotion after the refill cannot remove the block: the fence is already there");
+		assert.equal(forgedAfter[0].content.some((b) => b.type === "thinking"), false, "so the promotion has to run first");
+	}
+}
+
 
 	// Idempotence: a message already carrying the fence is left alone, and no other tag counts.
 	{
@@ -2096,7 +2323,7 @@ console.log("ok remember refuses without a model");
 }
 console.log("ok remember refuses a file it cannot read whole");
 
-// `remember` writes the live model's whole record: all five slots, `false` included, spelled the way
+// `remember` writes the live model's whole record: all seven slots, `false` included, spelled the way
 // the layer that answered spelled them, mounted in front of whatever shadowed it, and stable on a
 // second run.
 {
@@ -2105,7 +2332,7 @@ console.log("ok remember refuses a file it cannot read whole");
 	const write = (data) => writeFileSync(configFile, JSON.stringify(data, null, "\t"));
 	const read = () => JSON.parse(readFileSync(configFile, "utf8"));
 	const resolved = () => resolveMode(parseConfig(readFileSync(configFile, "utf8"), tempDir).config, LEVIATHAN);
-	const slots = (rule) => ({ persona: rule.persona, gate: rule.gate, turns: rule.turns, forge: rule.forge, cot: rule.cot });
+	const slots = (rule) => ({ persona: rule.persona, gate: rule.gate, turns: rule.turns, forge: rule.forge, cot: rule.cot, transcribe: rule.transcribe, beat: rule.beat });
 
 	// A wildcard in force: the exact rule takes its values and moves in front of it.
 	const custom = join(tempDir, "custom.md");
@@ -2121,7 +2348,7 @@ console.log("ok remember refuses a file it cannot read whole");
 	assert.equal(data.rules.length, 2, "the exact rule mounts in front of the wildcard, which is kept");
 	assert.equal(data.rules[0].provider, "CLIProxy-Chat", "the rule is written for the live model, literally");
 	assert.equal(data.rules[0].model, "deepseek-flash", "and never with a pattern");
-	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cot: "text:reasoning" });
+	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: { maxChars: 800 }, cot: "text:reasoning", transcribe: false, beat: false });
 	assert.equal(data.default.persona, false, "the file's default is left alone");
 	assert.equal(resolved().ruleIndex, 0, "and the model now resolves through the new rule");
 
@@ -2151,7 +2378,7 @@ console.log("ok remember refuses a file it cannot read whole");
 	await command.handler("remember", ctx);
 	data = read();
 	assert.equal(data.rules[0].forge, true, "no bound is written as the short spelling");
-	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: true, cot: "text:reasoning" });
+	assert.deepEqual(slots(data.rules[0]), { persona: custom, gate: true, turns: false, forge: true, cot: "text:reasoning", transcribe: false, beat: false });
 	await command.handler("forge maxChars 1200", ctx);
 	await command.handler("remember", ctx);
 	assert.deepEqual(read().rules[0].forge, { maxChars: 1200 }, "a bound is written as a bound");
@@ -2170,7 +2397,7 @@ console.log("ok remember refuses a file it cannot read whole");
 	await command.handler("remember", ctx);
 	data = read();
 	assert.equal(data.rules.length, 2, "a rule is added in front of the one that did not match");
-	assert.deepEqual(slots(data.rules[0]), { persona: false, gate: false, turns: false, forge: false, cot: "text:think" });
+	assert.deepEqual(slots(data.rules[0]), { persona: false, gate: false, turns: false, forge: false, cot: "text:think", transcribe: false, beat: false });
 	assert.equal(data.rules[1].persona, true, "and the rule that did not match is untouched");
 
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
@@ -2187,7 +2414,7 @@ console.log("ok remember writes the whole record");
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: false, forge: false }]);
 	await command.handler("", ctx);
 	const text = u.notes.at(-1)[1];
-	for (const slot of ["persona", "gate", "turns", "forge", "cot"]) {
+	for (const slot of ["persona", "gate", "turns", "forge", "cot", "transcribe", "beat"]) {
 		assert.match(text, new RegExp(`${slot}\\s+\\S`), `the panel has a row for ${slot}`);
 	}
 	assert.match(text, /rules\s*\n\s*1\s+CLIProxy-Chat\/deepseek-\*/, "and a table of the file's rules");
@@ -2222,7 +2449,7 @@ console.log("ok remember refuses a broken file");
 	await command.handler("reset", { model: LEVIATHAN, ui: u });
 	assert.equal(
 		u.notes.at(-1)[1],
-		"leviathan reset (config: persona off, gate off, turns off, forge off, cot text:think)",
+		"leviathan reset (config: persona off, gate off, turns off, forge off, cot text:think, transcribe off, beat off)",
 		"a model no rule names gets the built-in record",
 	);
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
@@ -2343,6 +2570,17 @@ console.log("ok reset reports the record");
 	assert.equal(guardRun([head(""), turn]).messages[2].content[0].text, fenced("analysis", "think", "ok"), "the session tag fences the cot");
 	await command.handler("cot default", ctx);
 	assert.equal(u.notes.at(-1)[1], "cot default (config)");
+
+	// transcribe and beat: two independent switches, each its own verb, each reported by the panel.
+	for (const slot of ["transcribe", "beat"]) {
+		await command.handler(`${slot} on`, ctx);
+		assert.equal(u.notes.at(-1)[1], `${slot} on`);
+		assert.match(await panel(), new RegExp(`${slot} +on`));
+		await command.handler(`${slot} off`, ctx);
+		assert.equal(u.notes.at(-1)[1], `${slot} off`);
+		await command.handler(`${slot} default`, ctx);
+		assert.equal(u.notes.at(-1)[1], `${slot} default (config)`);
+	}
 
 	// inherit: tree covers every model in this process, a slot verb keeps it, keyed narrows, none
 	// publishes nothing.
@@ -2780,6 +3018,17 @@ console.log("ok a refused tool-set write is reported");
 	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
 	assert.equal(activeTools.some((name) => name === "think" || name === "note"), false, "a slot that cannot write a cot declares no cot tool");
 
+	// It is `transcribe`, not `forge`, that needs the tool here: a promoted turn emits a call either way,
+	// and a provider that validates a history function name against the declaration rejects the request.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: false, forge: false, transcribe: true, cot: "toolcall:think" }]);
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
+	activeTools = ["read", "bash"];
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
+	assert.equal(activeTools.includes("think"), true, "a transcribe-only record declares the cot tool");
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
+	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
+	activeTools = ["read", "bash"];
+
 	// A refused declaration is reported once, and a model switch tries again.
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: true, forge: false, cot: "toolcall:think" }]);
 	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
@@ -2801,6 +3050,78 @@ console.log("ok a refused tool-set write is reported");
 	await commands.get("leviathan").handler("reset", { model: LEVIATHAN, ui: ui() });
 }
 console.log("ok cot tool");
+
+// The guard reads the new slots: the promotion and the marker are wired into one request, in the
+// order that keeps forge from fencing a turn the promotion already rewrote.
+{
+	const command = commands.get("leviathan");
+	const u = ui();
+	const ctx = { model: LEVIATHAN, ui: u };
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: false, forge: true, transcribe: true, cot: "text:think", beat: true }]);
+	await start({ type: "session_start", reason: "startup" }, ctx);
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
+
+	const own = {
+		role: "assistant",
+		content: [
+			{ type: "thinking", thinking: "my own cot", thinkingSignature: "sig" },
+			{ type: "toolCall", id: "t1", name: "exec", arguments: {} },
+		],
+		provider: LEVIATHAN.provider,
+		api: LEVIATHAN.api,
+		model: LEVIATHAN.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: {} },
+		stopReason: "toolUse",
+		timestamp: 0,
+	};
+	const messages = [head(""), { role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 }, own];
+	const out = guard({ type: "context_with_system", messages }, { model: LEVIATHAN, ui: u }).messages;
+	const asst = out.filter((m) => m.role === "assistant");
+	assert.equal(asst.length, 1, "no message is added for either writer");
+	assert.deepEqual(asst[0].content.map((b) => b.type), ["text", "toolCall"], "the live model's own reasoning is text now");
+	assert.equal(asst[0].content[0].text, "<" + "think" + ">\nmy own cot\n</" + "think" + ">\n[turn 2]", "the fence carries the marker");
+	assert.equal(asst[0].content.some((b) => b.type === "thinking"), false, "and the native block is gone");
+	assert.equal(own.content[0].type, "thinking", "the transcript pi handed in is untouched");
+
+	// The writer order through the real extension: with both slots on and a foreign turn whose readable
+	// reasoning is there, promotion runs first and the refill finds nothing to add. Running it the other
+	// way leaves the native block beside a fence, which is two reasoning traces on one turn.
+	{
+		const foreignOwn = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "their cot", thinkingSignature: "sig" },
+				{ type: "toolCall", id: "t9", name: "exec", arguments: {} },
+			],
+			provider: "other",
+			api: "other",
+			model: "another",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: {} },
+			stopReason: "toolUse",
+			timestamp: 0,
+		};
+		const out2 = guard({ type: "context_with_system", messages: [head(""), { role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 }, foreignOwn] }, { model: LEVIATHAN, ui: u }).messages;
+		const assistants = out2.filter((m) => m.role === "assistant");
+		assert.equal(assistants.length, 1, "one turn, not a pair plus a turn");
+		assert.equal(assistants[0].content.some((b) => b.type === "thinking"), false, "the promoted turn carries no native block");
+		assert.equal(assistants[0].content.filter((b) => b.type === "text" && opensWith(b.text, "think")).length, 1, "and exactly one fence");
+	}
+
+	// Off again: the same turn keeps its native reasoning, which is the reversibility the mode rests on.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: false, gate: false, turns: false, forge: false, transcribe: false, cot: "text:think", beat: false }]);
+	await command.handler("reset", ctx);
+	await before({ systemPromptOptions: { sections: {} } }, { model: LEVIATHAN, ui: u });
+	const back = guard({ type: "context_with_system", messages }, { model: LEVIATHAN, ui: u });
+	assert.equal(back, undefined, "with both slots off the request is the transcript as it arrived");
+
+	// Back to the fixture, so the blocks below see the record they were written against.
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
+	await command.handler("reset", ctx);
+	activeTools = ["read", "bash"];
+	await start({ type: "session_start", reason: "startup" }, ctx);
+
+	console.log("ok transcribe through the guard");
+}
 
 // model_select rebuilds the decision and the tool set in the same call.
 {

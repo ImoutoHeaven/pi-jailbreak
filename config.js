@@ -1,17 +1,17 @@
 /**
  * The rule table and the resolver.
  *
- * The record has five slots and they are independent: `persona`, `gate`, `turns`, `forge` and
- * `cot`. Nothing here says "this model is a leviathan" — a model is whatever its five slots
- * resolve to. That is the whole point: a model can carry forge alone, or persona and gate with no
- * turns, and no slot drags another along.
+ * The record has seven slots and they are independent: `persona`, `gate`, `turns`, `forge`, `cot`,
+ * `transcribe` and `beat`. Nothing here says "this model is a leviathan" — a model is whatever its
+ * slots resolve to. That is the whole point: a model can carry forge alone, or persona and gate with
+ * no turns, and no slot drags another along.
  *
  * Every slot resolves on its own, down the same three layers, and reports which layer answered:
  *
  *     session  ->  the first matching rule  ->  the file's `default`  ->  the built-in record
  *
- * The built-in record is false for all four switches, so an extension with nothing configured
- * changes nothing. `cot` falls back to `text:think`.
+ * The built-in record turns every switch off, so an extension with nothing configured changes
+ * nothing. `cot` falls back to `text:think`, and the two writers below are off.
  *
  * A rule matches by provider and model: both optional, a missing field matches anything, a pattern
  * without `*` is exact, and `*` is the only wildcard. Every other regex metacharacter is escaped
@@ -63,9 +63,9 @@ export const RESERVED_COT_NAMES = Object.freeze([
 ]);
 
 /** The slots, in the order the footer renders them. */
-export const SLOTS = Object.freeze(["persona", "gate", "turns", "forge", "cot"]);
-/** The four switches, which are what a footer glyph and a panel row report as on or off. */
-export const SWITCHES = Object.freeze(["persona", "gate", "turns", "forge"]);
+export const SLOTS = Object.freeze(["persona", "gate", "turns", "forge", "cot", "transcribe", "beat"]);
+/** The switches, which are what a footer glyph and a panel row report as on or off. */
+export const SWITCHES = Object.freeze(["persona", "gate", "turns", "forge", "transcribe", "beat"]);
 /** The slots a session answer may carry. `inherit` is the scope, not a slot. */
 export const SETTINGS_KEYS = Object.freeze([...SLOTS, "inherit"]);
 
@@ -77,11 +77,11 @@ const FORGE_ERROR = "forge must be false, true, or { maxChars: <positive whole n
 const MAX_CHARS_ERROR = "maxChars must be a positive whole number, or null for no bound";
 
 /**
- * The record a session uses when nothing is configured, and the tail of every resolution. All four
- * switches are off: installing the extension and writing no config changes no request.
+ * The record a session uses when nothing is configured, and the tail of every resolution. Every switch
+ * is off: installing the extension and writing no config changes no request.
  */
 export function emptyRecord() {
-	return { persona: false, gate: false, turns: false, forge: false, cot: DEFAULT_COT };
+	return { persona: false, gate: false, turns: false, forge: false, cot: DEFAULT_COT, transcribe: false, beat: false };
 }
 
 /**
@@ -160,7 +160,7 @@ function forgeSlot(value) {
 function slotSpec(slot, value) {
 	if (slot === "persona") return pathSlot(value, DEFAULT_PROMPT);
 	if (slot === "turns") return pathSlot(value, DEFAULT_TURNS);
-	if (slot === "gate") return plainSlot(value);
+	if (slot === "gate" || slot === "transcribe" || slot === "beat") return plainSlot(value);
 	if (slot === "forge") return forgeSlot(value);
 	const cot = cotSpec(value);
 	return cot ? { spec: cotLabel(cot) } : null;
@@ -240,13 +240,13 @@ export function parseConfig(text, dir) {
 	if (!data || typeof data !== "object" || Array.isArray(data)) return { error: "not an object" };
 	for (const key of Object.keys(data)) {
 		if (!CONFIG_KEYS.includes(key)) {
-			const hint = key === "mode" || key === "prompt" || key === "forgeMaxChars" || key === "cotTag" ? " (the record has persona, gate, turns, forge and cot)" : "";
+			const hint = key === "mode" || key === "prompt" || key === "forgeMaxChars" || key === "cotTag" ? " (the record has persona, gate, turns, forge, cot, transcribe and beat)" : "";
 			return { error: `${key} is not a config key (${CONFIG_KEYS.join(", ")})${hint}` };
 		}
 	}
 	const inherit = data.inherit ?? "keyed";
 	if (!INHERITS.includes(inherit)) return { error: `inherit must be ${INHERITS.join(", ")}` };
-	const fallback = readRecord(data.default ?? {}, ["persona", "gate", "turns", "forge", "cot"], "default");
+	const fallback = readRecord(data.default ?? {}, [...SLOTS], "default");
 	if (fallback.error) return { error: fallback.error };
 	const rules = data.rules ?? [];
 	if (!Array.isArray(rules)) return { error: "rules must be an array" };

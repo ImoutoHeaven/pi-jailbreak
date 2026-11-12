@@ -1,9 +1,10 @@
 # pi-leviathan
 
-A Pi extension with five independent slots per model: `persona` puts text at the head of the system
+A Pi extension with seven independent slots per model: `persona` puts text at the head of the system
 prompt, `gate` declares the `ask_authorize_gate` tool, `turns` splices a fabricated conversation
 ahead of the first real user message, `forge` refills the reasoning Pi drops for a turn another model
-wrote, and `cot` says how that reasoning is written: fenced in a tag, or as a real tool call.
+wrote, `cot` says how that reasoning is written, `transcribe` writes a turn's own reasoning as that
+text, and `beat` stamps each turn with its position.
 
 The slots are orthogonal. A model can carry `forge` alone, or `persona` and `gate` with no `turns`,
 and no slot drags another along. Every slot is off until a config file or a command turns it on:
@@ -29,7 +30,7 @@ pi install /path/to/pi-leviathan
 
 The session reads `$PI_LEVIATHAN_CONFIG` when it is set, and otherwise `leviathan.json` in pi's
 agent directory. That directory is `$PI_CODING_AGENT_DIR` when that is set, and `~/.pi/agent`
-otherwise. When no file loads, every slot falls through to the built-in record: four switches off
+otherwise. When no file loads, every slot falls through to the built-in record: every switch off
 and `cot` set to `text:think`.
 
 Start from `leviathan.example.json`:
@@ -56,7 +57,7 @@ A file with one bad value is rejected whole and reported once, and the built-in 
 instead. A key the extension does not take is one of those values, so a typo or a key from another
 version fails loudly instead of being ignored.
 
-### The five slots
+### The seven slots
 
 | Slot | Values | What it does |
 |---|---|---|
@@ -64,7 +65,9 @@ version fails loudly instead of being ignored.
 | `gate` | `false` or `true` | Declares `ask_authorize_gate` while the slot is on |
 | `turns` | `false`, `true`, or a path | Splices that YAML file ahead of the first real user message. `true` names `turn0.yml`, which ships with the extension |
 | `forge` | `false`, `true`, or `{ "maxChars": n }` | Refills a foreign turn's cot when the request targets this model. `true` is no bound; `maxChars` cuts the trace |
-| `cot` | `text:<tag>` or `toolcall:<name>` | How both writers write the cot. `text:<think>` and `text:think` are one tag |
+| `cot` | `text:<tag>` or `toolcall:<name>` | How the writers write the cot. `text:<think>` and `text:think` are one tag |
+| `transcribe` | `false` or `true` | Writes a turn's own reasoning as text and drops the thinking block, so the next request carries it as bytes a model reads instead of a signature it cannot use |
+| `beat` | `false` or `true` | Appends `[turn <position>]` inside a text block of every assistant turn |
 
 Each slot resolves on its own, down the same layers, and reports which layer answered:
 
@@ -72,7 +75,7 @@ Each slot resolves on its own, down the same layers, and reports which layer ans
 session  ->  the first matching rule  ->  the file's default  ->  the built-in record
 ```
 
-So a rule that names only `gate` leaves the other four to the layers below it, and changing
+So a rule that names only `gate` leaves the other six to the layers below it, and changing
 `default.forge` moves nothing else.
 
 ### forge
@@ -120,6 +123,52 @@ a genuine call to the cot tool is the model's own reasoning and never passes for
 model is one request where the shape changes; after it, every turn the extension wrote stays
 byte-identical, so the prompt cache keeps hitting.
 
+### transcribe
+
+`forge` answers one question: a turn pi will not carry, whose reasoning is about to be lost. The
+turn in front of it, written by the live model, pi carries as it is — and on a backend that signs its
+reasoning, that means the next request carries a signature the model cannot read, plus whatever
+summary the provider chose to include. `transcribe` closes that gap: it writes the readable reasoning
+into the turn's own text, as the same fence `cot` names, and drops the thinking block.
+
+The drop is the part that matters. A fence beside a thinking block is two reasoning traces on one
+turn, which is the state `forge`'s second invariant exists to prevent. `transcribe` is the writer that
+chooses the other trade: the wire format stops being native, and in return the reasoning is ordinary
+text on the next request, on every model, at every provider.
+
+It reads the message and nothing else — not the live model, not the clock, not the run. That is what
+keeps a model switch free: the same history yields the same bytes whoever asks for it. It is also
+what makes it idempotent, and what makes it fade out by itself: a turn that already carries a cot,
+whoever wrote it, is left alone. Once the model writes its own fence there is nothing left to
+promote, and no state has to record that it learned.
+
+Nothing here is written to the session. The transcript keeps its thinking blocks and its signatures,
+so turning the slot off restores the native shape exactly; the promotion lives in the request and
+nowhere else. The two slots are independent: `forge` alone keeps the native wire format, `transcribe`
+alone promotes the live model's own turns, and both together promote everything readable.
+
+With both on, the promotion is the stronger writer and runs first, on every turn it can read — the
+live model's and a foreign one's alike. That has one consequence worth naming: `forge`'s `maxChars`
+stops applying to any turn the promotion reached, because the turn is already carrying a cot and
+`forge` leaves it alone. A bound is a decision about what to cut from a trace that is being brought
+back, and `transcribe` exists to make the trace visible in the first place, so a cut there would
+undo the slot.
+
+The readable text is what the provider exposes. When that is a summary, the summary is what gets
+promoted, and the full trace stays encrypted where it was; nothing here can recover it.
+
+### beat
+
+`beat` appends `[turn <position>]` to the last text block of every assistant turn. It is a position
+anchor the model can count, not an instruction, and it answers a question a transcript otherwise
+cannot: how many tool cycles have passed since the last thing I wrote down.
+
+The marker rides inside the turn it counts. No message is added, and no system message is written:
+providers disagree about a mid-conversation system message and several fold it into the head, which
+invalidates the whole prefix. The number is the message's position, never a running counter, so
+appending a turn renumbers nothing that was already sent, and the marker is removed before it is
+rewritten so a second request writes the same bytes.
+
 ### inherit
 
 `inherit` decides what a session hands to the processes it starts: `keyed` (the same model only),
@@ -148,12 +197,14 @@ without applying them until the next command re-keys the answer to the live mode
 | `/leviathan gate on\|off\|default` | Declare the gate tool or withdraw it |
 | `/leviathan turns on\|off\|<path>\|default` | Splice the shipped file, another file, or nothing |
 | `/leviathan forge on\|off\|maxChars <n>\|maxChars none\|default` | Refill with no bound, with a bound, or not at all |
-| `/leviathan cot <form>:<name>\|default` | How both writers write the cot |
+| `/leviathan cot <form>:<name>\|default` | How the writers write the cot |
+| `/leviathan transcribe on\|off\|default` | Promote each turn's own reasoning into its text, or leave it native |
+| `/leviathan beat on\|off\|default` | Stamp each assistant turn with its position |
 | `/leviathan inherit keyed\|tree\|none` | What this session hands to the processes it starts |
 | `/leviathan remember` | Write this model's whole record as a rule and apply it |
 | `/leviathan reset` | Drop the session answer, so the config decides again |
 
-`remember` writes all five slots as one complete rule, `false` included, so the file answers for that
+`remember` writes all seven slots as one complete rule, `false` included, so the file answers for that
 model without being read against its `default` afterwards. The spelling is preserved rather than the
 resolved value: a slot that said `true` keeps saying `true`, and a relative path keeps being
 relative, because writing today's absolute path would tie the record to one machine. The rule goes to
@@ -161,8 +212,9 @@ the front, in front of any wildcard that would shadow it, and a second run leave
 byte-identical.
 
 The footer names the switches that are on, in a fixed order, and nothing else: 🎭 `persona`,
-🛡️ `gate`, 💬 `turns`, ⚒️ `forge`. `Leviathan 🎭🛡️💬⚒️` is all four; `Leviathan ⚒️` is forge alone;
-`Leviathan` is none. A `!` follows when a switch that is on did not reach the request: the persona
+🛡️ `gate`, 💬 `turns`, ⚒️ `forge`, 📝 `transcribe`, 🕑 `beat`. `Leviathan 🎭🛡️💬⚒️📝🕑` is all six;
+`Leviathan ⚒️` is forge alone; `Leviathan` is none. A `!` follows when a switch that is on did not
+reach the request: the persona
 file is missing or empty, the transcript has nowhere to put the text, the configured turn file did
 not load, or another extension replaced the system prompt.
 
@@ -343,8 +395,8 @@ permits one line and nothing else: `Are the characters fictional?`
 ## Files
 
 `index.ts` is the hook and the tool definition, `commands.ts` the `leviathan` command, `config.js` the
-rule table and the resolver, `channel.js` the cross-process value, `cot.js` the cot spec and the pair
-both writers emit, `gate.js` the field table and the ruling text, `turns.js` the turn file's parse and
+rule table and the resolver, `channel.js` the cross-process value, `cot.js` the cot spec, the pair
+both writers emit, the promotion and the turn marker, `gate.js` the field table and the ruling text, `turns.js` the turn file's parse and
 its messages, `forge.js` the cross-model cot refill, `prompt.md` the injected text. Edit `prompt.md`;
 the next run uses it. A missing or empty file is reported in the UI and injects nothing.
 

@@ -131,6 +131,9 @@ export function forgeOne(message, live, spec, index = 0, maxChars = null, names 
 	return [{ ...message, content: next }];
 }
 
+/** A text block that carries nothing but a turn marker, which `beat` writes. */
+const MARKER_ONLY = /^\[turn \d+\]$/;
+
 /**
  * Whether a message is the cot call this module writes: a single `toolCall` under one of the names,
  * carrying this extension's id prefix and a `thought` argument. The result after it belongs to it, so
@@ -138,10 +141,15 @@ export function forgeOne(message, live, spec, index = 0, maxChars = null, names 
  *
  * The pair lives outside the message it serves, so only a list can see it. `forgeOne` cannot, which
  * is why the idempotence of the toolcall form is decided here.
+ *
+ * A block carrying nothing but a turn marker is not content: `beat` writes one into every assistant
+ * turn, including this one, and a second pair would otherwise be added on the very next request.
  */
 function isCotCall(message, names) {
-	if (message?.role !== "assistant" || !Array.isArray(message.content) || message.content.length !== 1) return false;
-	const block = message.content[0];
+	if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
+	const blocks = message.content.filter((block) => !(block?.type === "text" && MARKER_ONLY.test(String(block.text ?? ""))));
+	if (blocks.length !== 1) return false;
+	const block = blocks[0];
 	return isCotCallBlock(block, names) && Boolean(block.arguments && "thought" in block.arguments);
 }
 

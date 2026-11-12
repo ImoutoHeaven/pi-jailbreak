@@ -1,15 +1,15 @@
 /**
- * Five slots, five jobs, no bundle.
+ * Seven slots, seven jobs, no bundle.
  *
  * A model is whatever its record resolves to: `persona` puts text at the head of the system prompt
  * and withholds pi's stock identity sentence, `gate` declares `ask_authorize_gate`, `turns` splices a
  * fabricated conversation ahead of the first real user message, `forge` refills the reasoning pi
  * drops for a turn another model wrote, and `cot` says how that reasoning is written: fenced in a
  * tag, or as a real tool call. Nothing here asks whether a model "is a leviathan" — that word is
- * gone, because it never named one of the five and could not say which of them it meant.
+ * gone, because it never named one of the slots and could not say which of them it meant.
  *
  * Every slot resolves on its own, down session -> first matching rule -> the file's `default` ->
- * a built-in record with all four switches off. A model with nothing configured therefore gets an
+ * a built-in record with every switch off. A model with nothing configured therefore gets an
  * untouched request: this extension with no config changes nothing at all.
  *
  * The persona text goes in as the head of the leading system message's `content`, ahead of every
@@ -59,7 +59,7 @@ import {
 	SWITCHES,
 	turnsPath,
 } from "./config.js";
-import { COT_ACK } from "./cot.js";
+import { COT_ACK, beatHistory, transcribeHistory } from "./cot.js";
 import { applies, decode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { forgeHistory } from "./forge.js";
 import { cachedFile, loadTurns, toMessages } from "./turns.js";
@@ -90,7 +90,14 @@ const STOCK_PREAMBLES = new Set([
 ]);
 
 /** The footer glyph for each switch, in the order the footer renders them. */
-const GLYPHS = Object.freeze({ persona: "\u{1F3AD}", gate: "\u{1F6E1}\u{FE0F}", turns: "\u{1F4AC}", forge: "\u2692\u{FE0F}" });
+const GLYPHS = Object.freeze({
+	persona: "\u{1F3AD}",
+	gate: "\u{1F6E1}\u{FE0F}",
+	turns: "\u{1F4AC}",
+	forge: "\u2692\u{FE0F}",
+	transcribe: "\u{1F4DD}",
+	beat: "\u{1F551}",
+});
 
 /**
  * A plain JSON Schema, not a typebox builder: a typebox schema is JSON Schema, so pi sends and
@@ -140,6 +147,10 @@ type Decision = {
 	turnsSpec: string | false;
 	forge: Forge | false;
 	gate: boolean;
+	/** Promote a turn's own reasoning into text, dropping the thinking block. Off leaves it native. */
+	transcribe: boolean;
+	/** Append a per-turn position marker inside every assistant turn. Reads only the position. */
+	beat: boolean;
 	cot: string;
 	/** Every name the config names, so a turn carrying a cot under one of them counts as fenced for
 	 * all. Names only: a turn fenced as `text:think` is not refenced as `toolcall:think`. */
@@ -167,6 +178,8 @@ type CotForm = { form: "text" | "toolcall"; name: string };
 type Settings = {
 	persona?: string | false;
 	gate?: boolean;
+	transcribe?: boolean;
+	beat?: boolean;
 	turns?: string | false;
 	forge?: Forge | false;
 	cot?: string;
@@ -289,6 +302,8 @@ function buildDecision(s: State, ctx: any): Decision {
 		turnsSpec: turnsSpec ?? false,
 		forge: record.forge === false ? false : { maxChars: record.forge.maxChars },
 		gate: record.gate === true,
+		transcribe: record.transcribe === true,
+		beat: record.beat === true,
 		cot: record.cot,
 		// Every name the file names, plus the one this model resolved: a session-set cot is not in the
 		// file, and a fence it writes would otherwise be invisible to the next request.
@@ -598,11 +613,15 @@ function turnsWriteCot(specs: TurnSpec[] | null) {
 }
 
 /** The tools this record's request needs declared: the gate while its slot is on, and the cot tool
- * while a `toolcall:` cot can appear in what the two writers produce. */
+ * while a `toolcall:` cot can appear in what the writers produce. `transcribe` writes one too, and it
+ * writes for the live model, so a request whose history it promotes needs the tool declared even with
+ * `forge` off. */
 function wantedTools(current: Decision): string[] {
 	const want: string[] = [];
 	if (current.gate) want.push(GATE_TOOL);
-	if (current.cotForm.form === "toolcall" && (current.forge !== false || turnsWriteCot(current.turns))) want.push(current.cotForm.name);
+	if (current.cotForm.form === "toolcall" && (current.forge !== false || current.transcribe || turnsWriteCot(current.turns))) {
+		want.push(current.cotForm.name);
+	}
 	return want;
 }
 
@@ -656,7 +675,7 @@ function configure(s: State, ctx: any, name: string, value: string): { ok: boole
 /**
  * Write the live model's whole record into the config file as one rule.
  *
- * The rule is complete rather than a patch: all five slots, `false` included, so nothing about this
+ * The rule is complete rather than a patch: all seven slots, `false` included, so nothing about this
  * model is left to the file's `default` afterwards. That is what makes the file readable on its own
  * — a record that inherits half its slots cannot be read without running the resolver in your head.
  *
@@ -949,44 +968,54 @@ export default function leviathan(pi: ExtensionAPI) {
 		if (current.text && forced) {
 			report(s, ctx, `${basename(current.persona as string)} is not delivered (another extension replaced the system prompt)`, "warning");
 		}
-		// 1) Refill the CoT pi drops for a message written by another model. This runs first, on the
-		// transcript as it arrived, so the fabricated block's anchor below is computed on the list it
-		// is actually spliced into and the forge region can never overlap that block. It touches
-		// assistant messages only, and a message already stamped with the live model is left alone.
-		// A routed selection has no reachable physical model here, so it refills nothing.
+		// 1) The refill and the promotion, on the transcript as it arrived. Order is load-bearing:
+		//
+		//   `transcribe` first, because it is the one writer that reads only the message and not the
+		//   live model. A turn it promotes no longer carries a thinking block, so `forge` cannot see a cot
+		//   to add beside it, and the two can never put two reasoning traces on one turn. It runs even when
+		//   `forge` is off, since the whole point is to promote the live model's own turns.
+		//
+		//   `forge` second, on what promotion left: the foreign turns that had no readable cot to promote,
+		//   and every foreign turn when `transcribe` is off. A turn either writer already fenced is skipped
+		//   by both, which is the loop closing by itself once the model writes its own fence.
+		const promoted = current.transcribe ? transcribeHistory(messages, current.cotForm, current.cotNames, null) : messages;
+		// A routed selection has no reachable physical model here, so the refill has nothing to compare.
 		const routed = ctx?.model?.api === VIRTUAL_MODEL_API;
 		const forged =
 			current.forge === false || !hasModel(ctx) || routed
-				? messages
+				? promoted
 				: forgeHistory(
-						messages,
+						promoted,
 						{ provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id },
 						current.cotForm,
 						current.forge.maxChars,
 						current.cotNames,
 					);
+		// The turn markers last, on every fence in the list whichever writer wrote it, so position is read
+		// off the finished list. Pure in the position, so an append renumbers nothing already sent.
+		const marked = current.beat ? beatHistory(forged) : forged;
 		// 2) The prompt head, then the fabricated block. `project` only ever removes a section key
-		// from a system message, which forge never touched.
-		let next = project(forged, current.text !== null);
+		// from a system message, which neither writer adds.
+		let next = project(marked, current.text !== null);
 		// A refill is a change to the request, so it has to survive both steps below being no-ops.
-		// `undefined` means "send the transcript as it arrived", and a forged list is not that.
-		if (next === undefined && forged !== messages) next = forged;
+		// `undefined` means "send the transcript as it arrived", and a rewritten list is not that.
+		if (next === undefined && marked !== messages) next = marked;
 		// The leading system message, and where the splice leaves it: pi renders the prompt from
 		// index 0, and the fabricated block is anchored on the first message that is not a system one.
-		let at = leadingSystem(forged);
+		let at = leadingSystem(marked);
 		let delivered = false;
 		if (current.text) {
-			const projected = at < 0 ? undefined : next === undefined ? forged[at] : next[at];
+			const projected = at < 0 ? undefined : next === undefined ? marked[at] : next[at];
 			const existing = projected ? headText(projected.content) : undefined;
 			if (existing === undefined) {
 				// The transcript carries no system message, or the leading one holds blocks pi
 				// never puts there. Rewriting either would drop content, so the text stays out,
 				// the identity sentence stays in, and the loss is reported.
-				// The whole projection is undone, not only the head: `forged` is the list before
-				// the stock preamble was withheld, and it is also the list that carries a refill.
-				// `project(forged, false)` cannot serve here: with `stripIdentity` false it returns
-				// undefined by construction, which would throw that refill away.
-				next = forged === messages ? undefined : forged;
+				// The whole projection is undone, not only the head: `marked` is the list before
+				// the stock preamble was withheld, and it is also the list that carries a rewrite.
+				// `project(marked, false)` cannot serve here: with `stripIdentity` false it returns
+				// undefined by construction, which would throw that rewrite away.
+				next = marked === messages ? undefined : marked;
 				report(
 					s,
 					ctx,
@@ -1003,7 +1032,7 @@ export default function leviathan(pi: ExtensionAPI) {
 				const content = aligned ? existing : existing ? `${current.text}\n\n${existing}` : current.text;
 				if (content !== existing || at !== 0) {
 					// Never mutate the caller's array, message objects or sections objects.
-					next ??= forged.slice();
+					next ??= marked.slice();
 					next[at] = { ...projected, content };
 					if (at !== 0) {
 						// Pi renders the prompt from index 0 only, so the leading system message
@@ -1017,8 +1046,10 @@ export default function leviathan(pi: ExtensionAPI) {
 			}
 		}
 		// The fabricated conversation, spliced ahead of the first real user message. A run whose
-		// system prompt was replaced by another extension skips it and says so.
-		const spliced = injectTurns(s, ctx, current, forged, next, at, forced);
+		// system prompt was replaced by another extension skips it and says so. It is the last writer,
+		// so the block it adds carries its own fence and no turn marker: markers count the transcript, and
+		// the fabricated block is not part of it.
+		const spliced = injectTurns(s, ctx, current, next ?? marked, next, at, forced);
 		if (spliced.messages) next = spliced.messages;
 		// The footer reports what the request carried, not only what the record asked for.
 		if (current.persona !== false || current.turnsSpec !== false) noteDelivery(s, ctx, current, delivered && !forced, spliced.injected);
