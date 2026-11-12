@@ -908,50 +908,155 @@ console.log("ok turns messages");
 	const thinkBlock = (cot) => ({ type: "thinking", thinking: cot, thinkingSignature: "sig-" + cot });
 	const callBlock = (id, name) => ({ type: "toolCall", id, name, arguments: {} });
 	const bare = (cot) => "<" + "think" + ">\n" + cot + "\n</" + "think" + ">";
+	const onlyText = (message) => (message.content || []).filter((b) => b.type === "text").map((b) => b.text);
 
-	// The text form replaces the reasoning with a fence, in the same message, ahead of the call: no
-	// message is added, and no block but the thinking block is dropped.
+	// The text form writes one fence and drops the reasoning blocks. The calls travel after it, the
+	// stamp is untouched, and the input is never mutated.
 	{
 		const message = live([thinkBlock("my cot"), callBlock("t1", "exec")]);
 		const done = transcribeOne(message, SPEC_TEXT, NAMES);
-		assert.equal(done.length, 1, "the message is replaced, not joined");
-		assert.deepEqual(done[0].content.map((b) => b.type), ["text", "toolCall"], "the fence leads the call");
-		assert.equal(done[0].content[0].text, bare("my cot"), "the fence alone, with no reply");
-		assert.equal(done[0].content.some((b) => b.type === "thinking"), false, "the block is gone, not kept beside it");
-		assert.equal(done[0].provider, message.provider, "the stamp is untouched");
-		assert.equal(done[0].model, "gemini-4-carbon");
+		assert.deepEqual(done.content.map((b) => b.type), ["text", "toolCall"], "the fence leads the call");
+		assert.equal(done.content[0].text, bare("my cot"), "the fence alone, with no reply");
+		assert.equal(done.content.some((b) => b.type === "thinking"), false, "the block is gone, not kept beside it");
+		assert.equal(done.provider, message.provider, "the stamp is untouched");
+		assert.equal(done.model, "gemini-4-carbon");
 		assert.equal(message.content[0].type, "thinking", "the input message is not mutated");
 	}
 
-	// A turn with visible text keeps it, after the fence.
+	// A reply after the fence stays after it.
 	{
 		const message = live([thinkBlock("cot"), { type: "text", text: "the reply" }], "stop");
-		const [done] = transcribeOne(message, SPEC_TEXT, NAMES);
-		assert.deepEqual(done.content, [{ type: "text", text: bare("cot") + "\n\nthe reply" }], "one block, fence then reply");
+		assert.deepEqual(onlyText(transcribeOne(message, SPEC_TEXT, NAMES)), [bare("cot") + "\n\nthe reply"], "one block, fence then reply");
 	}
 
-	// Three turns are left exactly as they are, for three different reasons.
+	// Two turns are left exactly as they are.
 	{
-		const own = live([{ type: "text", text: bare("mine") }, callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(own, SPEC_TEXT, NAMES), own, "a turn the model fenced itself is the loop closing");
 		const none = live([callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(none, SPEC_TEXT, NAMES), none, "a turn with no reasoning has nothing to promote");
-		const opaque = live([{ type: "thinking", thinking: "[Reasoning redacted]", redacted: true }, callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(opaque, SPEC_TEXT, NAMES), opaque, "an unreadable block is not promoted");
+		assert.equal(transcribeOne(none, SPEC_TEXT, NAMES), none, "a turn with no reasoning has nothing to write");
+		const opaque = live([{ type: "thinking", thinking: "[Reasoning redacted]", thinkingSignature: "s", redacted: true }, callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(opaque, SPEC_TEXT, NAMES), opaque, "an unreadable block is not reasoning");
 		assert.equal(transcribeOne({ role: "user", content: [], timestamp: 0 }, SPEC_TEXT, NAMES).role, "user", "only assistant turns are read");
 	}
 
-	// The toolcall form inserts the pair and keeps the turn, which is the shape forge writes for a
-	// foreign one, so the two forms differ only in where the reasoning lands.
+	// The summary behind a signature is not a copy of the fence, so it is written into the fence instead
+	// of being dropped: the model paid for those bytes and the next request is the only place they can be
+	// read. The summary goes first — it is the provider's compression of the whole turn, and the model's
+	// own words read as the detail after it.
+	{
+		const both = live([{ type: "text", text: bare("mine") }, thinkBlock("provider summary"), callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(both, SPEC_TEXT, NAMES).content[0].text, bare("provider summary\n\nmine"), "one fence, summary first");
+		// The order is the same when the model's own fence leads the block, which is the shape the wire
+		// actually produces: the text block comes first and the credential follows it.
+		const wire = live([{ type: "text", text: bare("mine") }, { type: "thinking", thinking: "", thinkingSignature: "s" }, callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(wire, SPEC_TEXT, NAMES).content[0].text, bare("mine"), "an empty credential adds nothing");
+		// A summary with no fence at all becomes the fence, and the call still follows it.
+		const summaryOnly = live([thinkBlock("only trace"), callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(summaryOnly, SPEC_TEXT, NAMES).content[0].text, bare("only trace"), "a summary with no fence is the fence");
+	}
+
+	// A turn the wire already wrote is byte-identical after the pass: one fence, nothing outside it, and
+	// the credential dropped. This is the shape 358 of the turns in a real session carry.
+	{
+		const wire = live([{ type: "text", text: bare("mine") + "\n\nthe reply" }, { type: "thinking", thinking: "", thinkingSignature: "s" }, callBlock("t1", "exec")]);
+		const done = transcribeOne(wire, SPEC_TEXT, NAMES);
+		assert.equal(done.content[0].text, wire.content[0].text, "a clean fence is byte-identical");
+		assert.equal(done.content.filter((b) => b.type === "thinking").length, 0, "and its credential is gone");
+	}
+
+	// A fence the model started and never closed is closed here, and one opening tag is all it keeps.
+	{
+		const half = live([{ type: "text", text: "<" + "think" + ">\nreasoning never closed" }, thinkBlock("s"), callBlock("t1", "exec")]);
+		const body = transcribeOne(half, SPEC_TEXT, NAMES).content[0].text;
+		assert.equal(body, bare("s\n\nreasoning never closed"), "the summary leads and the half fence is closed");
+	}
+
+	// A tag the model wrote in the middle of a block: the words ahead of it are reasoning by decision, and
+	// the words behind it are the reply. Both survive, and the fence is rebuilt around the first part.
+	{
+		const mid = live([{ type: "text", text: "ahead\n" + "<think>" + "\ninside\n</" + "think" + ">\nbehind" }, thinkBlock("s"), callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(mid, SPEC_TEXT, NAMES).content[0].text, bare("s\n\nahead\n\ninside") + "\n\nbehind", "the prefix is folded in, the tail is the reply");
+	}
+
+	// Text ahead of a fence in an earlier block is reasoning too: the test is "did this block come before
+	// the fence", not "is it the same block". The rule is settled here so no later change has to guess.
+	{
+		const split = live([{ type: "text", text: "prose first" }, { type: "text", text: bare("cot") }]);
+		assert.equal(transcribeOne(split, SPEC_TEXT, NAMES).content[0].text, bare("prose first\n\ncot"), "prose ahead of the fence is folded in");
+		// ...and text after it is the reply, in block order.
+		const after = live([{ type: "text", text: bare("cot") }, { type: "text", text: "reply one" }, { type: "text", text: "reply two" }]);
+		assert.equal(transcribeOne(after, SPEC_TEXT, NAMES).content[0].text, bare("cot") + "\n\nreply one\n\nreply two", "and prose behind it is the reply");
+	}
+
+	// The rule that a reply mentioning the tag is not special: a fence is recognised anywhere, and the
+	// words are rebuilt. This is a decision, not an oversight, and it is pinned so nobody softens it
+	// later without deciding to.
+	{
+		const quoted = live([{ type: "text", text: "Never write " + "<think>" + " in a reply." }, callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(quoted, SPEC_TEXT, NAMES).content[0].text, bare("Never write\n\nin a reply."), "a quoted opening tag is folded in");
+		// A closing tag quoted in the reply is drawn into the fence instead, because the fence ends at the
+		// **last** closing tag in the block. The reasoning wins the ambiguity: a closer inside a cot is the
+		// shape that showed up in every real one, and reading to the first one threw the rest of the cot into
+		// the reply slot. The trade is pinned here so a later change makes it again on purpose.
+		const glued = live([{ type: "text", text: bare("cot") + "\n\nthe reply mentions </" + "think>" + " once" }, callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(glued, SPEC_TEXT, NAMES).content[0].text, "<" + "think>\ncot\n\n\nthe reply mentions\n</" + "think>\n\nonce", "a quoted closer is drawn into the fence");
+	}
+
+	// A tag with an attribute is not the fence: only a configured name is stripped, and only as a whole
+	// tag. The opener survives in the reply, its closer does not, and the result is stable.
+	{
+		const attr = live([thinkBlock("s"), { type: "text", text: "see <" + "think x>here</" + "think" + "> now" }, callBlock("t1", "exec")]);
+		const done = transcribeOne(attr, SPEC_TEXT, NAMES);
+		assert.equal(done.content[0].text, bare("s") + "\n\nsee <" + "think x>here now", "an attribute tag is not the fence, and its closer is still stripped");
+		assert.equal(transcribeOne(done, SPEC_TEXT, NAMES).content[0].text, done.content[0].text, "and the result does not drift");
+	}
+
+	// Two names, one fence: a turn written under another configured name is read as a fence and the tag
+	// it came with is stripped, so one turn never ends up carrying two.
+	{
+		// A turn written under another configured name is not this spec's fence: the tag it came with is
+		// stripped, so the turn never ends up carrying two, but its interior is not this writer's reasoning.
+		// The thinking block is, and it becomes the fence; the other name's text lands as the reply.
+		const other = live([{ type: "text", text: "<note>\nfrom another model\n</note>" }, thinkBlock("s"), callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(other, SPEC_TEXT, ["think", "note"]).content[0].text, bare("s") + "\n\nfrom another model", "the union of names strips both, and only this name is the fence");
+	}
+
+	// The whole turn is a fixed point: what the writer emits is what it reads, so a second pass is the
+	// same byte for byte. This is the property the prompt cache rests on.
+	{
+		const shapes = [
+			live([thinkBlock("c"), callBlock("t1", "exec")]),
+			live([thinkBlock("c"), { type: "text", text: "reply" }]),
+			live([{ type: "text", text: bare("mine") }, thinkBlock("s"), callBlock("t1", "exec")]),
+			live([{ type: "text", text: "ahead <" + "think>\ninside</" + "think" + "> behind" }, thinkBlock("s")]),
+			live([{ type: "text", text: "<" + "think>\nnever closed" }, thinkBlock("s")]),
+			live([{ type: "text", text: "no fence at all" }, thinkBlock("s")]),
+			live([{ type: "text", text: "prose" }, { type: "text", text: bare("cot") }]),
+		];
+		for (const shape of shapes) {
+			const once = transcribeOne(shape, SPEC_TEXT, NAMES);
+			const twice = transcribeOne(once, SPEC_TEXT, NAMES);
+			assert.deepEqual(twice, once, "the writer is its own fixed point");
+			const body = onlyText(once)[0] || "";
+			assert.equal((body.match(new RegExp("<" + "think" + ">", "gi")) || []).length, 1, "exactly one opening tag");
+			assert.equal((body.match(new RegExp("</" + "think" + ">", "gi")) || []).length, 1, "exactly one closing tag");
+		}
+	}
+
+	// The toolcall form writes the same reasoning as a call's argument, and the turn keeps only what it
+	// did besides reasoning, so the two forms differ only in where the cot lands.
 	{
 		const message = live([thinkBlock("my cot"), callBlock("t1", "exec")]);
 		const done = transcribeOne(message, SPEC_TOOL, NAMES);
 		assert.equal(done.length, 3, "the call, its ack, then the turn it belongs to");
 		assert.equal(done[0].content[0].arguments.thought, "my cot", "the reasoning is the call's argument");
 		assert.deepEqual(done[2].content.map((b) => b.type), ["toolCall"], "and it is no longer a block");
+		// A turn that was nothing but reasoning leaves nothing behind: the pair is the whole turn.
+		const bare_ = live([thinkBlock("my cot")], "stop");
+		const lone = transcribeOne(bare_, SPEC_TOOL, NAMES);
+		assert.equal(lone.length, 2, "the call and its ack, nothing else");
 
-		// The id is salted with the position, so two turns carrying identical reasoning under one stamp
-		// are still two calls. A transcript may not hold two calls with one id.
+		// The id is salted with the position, so two turns carrying identical reasoning under one stamp are
+		// still two calls. A transcript may not hold two calls with one id.
 		const twin = live([thinkBlock("my cot"), callBlock("t2", "read")]);
 		const ids = transcribeHistory([message, twin], SPEC_TOOL, NAMES)
 			.filter((m) => m.role === "assistant")
@@ -959,6 +1064,25 @@ console.log("ok turns messages");
 			.filter(Boolean);
 		assert.equal(ids.length, 2, "both turns get a pair");
 		assert.notEqual(ids[0], ids[1], "and identical reasoning under one stamp is still two ids");
+	}
+
+	// A turn the toolcall writer already answered is that turn's fence, not an exception to skip. The
+	// reasoning goes into the pair's argument and the turn keeps only its own calls, so the pair and the
+	// turn never show two traces — and the pair keeps the id the transcript already holds.
+	{
+		const served = live([thinkBlock("late summary"), callBlock("t1", "exec")]);
+		const first = transcribeHistory([served], SPEC_TOOL, NAMES);
+		assert.equal(first.length, 3, "the pair and the turn");
+		const again = transcribeHistory(first, SPEC_TOOL, NAMES);
+		assert.deepEqual(again, first, "a second pass changes nothing");
+		// Now the same turn arrives again from the wire, carrying reasoning the pair has not seen.
+		const later = [{ ...served, content: [thinkBlock("the newer trace"), callBlock("t1", "exec")] }];
+		const merged = transcribeHistory([first[0], first[1], later[0]], SPEC_TOOL, NAMES);
+		assert.equal(merged[0].content[0].arguments.thought, "the newer trace", "the reasoning goes into the pair");
+		assert.equal(merged[0].content[0].id, first[0].content[0].id, "and the id the transcript holds is kept");
+		assert.equal(merged[2].content.some((b) => b.type === "text"), false, "the turn carries no second fence");
+		const settled = transcribeHistory(merged, SPEC_TOOL, NAMES);
+		assert.deepEqual(settled, merged, "and that is stable too");
 	}
 
 	// The whole list: identity when nothing changed, byte-stable on a second pass, never longer.
@@ -973,7 +1097,7 @@ console.log("ok turns messages");
 		assert.equal(once.length, history.length, "and never a longer one");
 		assert.deepEqual(transcribeHistory(once, SPEC_TEXT, NAMES), once, "a second pass changes nothing");
 		const done = history.map((m, i) => (i === 1 ? { ...m, content: [{ type: "text", text: bare("x") }] } : m));
-		assert.equal(transcribeHistory(done, SPEC_TEXT, NAMES), done, "a list with nothing to promote keeps its identity");
+		assert.equal(transcribeHistory(done, SPEC_TEXT, NAMES), done, "a list whose turns are already written keeps its identity");
 		assert.equal(transcribeHistory(null, SPEC_TEXT, NAMES), null);
 	}
 
@@ -987,213 +1111,92 @@ console.log("ok turns messages");
 		assert.deepEqual(transcribeHistory(history, SPEC_TEXT, NAMES), transcribeHistory(history, SPEC_TEXT, NAMES), "pure");
 	}
 
-
-	// The double trace: a turn the model fenced itself, with an encrypted trace still behind the
-	// fence. The signature is the piece that goes; the fence is not overwritten with the provider's
-	// summary, because those are two different traces.
+	// The budget bounds the reasoning, never the reply: a cut reply is a turn that stopped talking.
 	{
-		const both = live([{ type: "text", text: bare("mine") }, thinkBlock("provider summary"), callBlock("t1", "exec")]);
-		// Shape-tolerant on purpose: with the signature left in place the function returns the message
-		// itself rather than a list, and the assertion below is what turns that into a failure.
-		const out = transcribeOne(both, SPEC_TEXT, NAMES, null, 0);
-		const done = Array.isArray(out) ? out[0] : out;
-		assert.deepEqual(done.content.map((b) => b.type), ["text", "toolCall"], "the signature goes, the fence stays");
-		assert.equal(done.content[0].text, bare("mine"), "the model\u0027s own fence is not overwritten");
-		assert.equal(both.content.length, 3, "the input message is not mutated");
-
-		// A fenced turn with no signature is the loop closed by itself.
-		const closed = live([{ type: "text", text: bare("mine") }, callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(closed, SPEC_TEXT, NAMES, null, 0), closed, "nothing left to promote");
-
-		// A summary too, and only the signature goes.
-		const rich = live([{ type: "text", text: bare("mine") }, thinkBlock("summary text"), callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(rich, SPEC_TEXT, NAMES, null, 0)[0].content[0].text, bare("mine"), "still the model\u0027s own fence");
-
-		// An empty fence is not a trace. The signed block behind it is the only thing the turn says, so
-		// dropping it would leave the turn with nothing at all.
-		const emptyFence = live([{ type: "text", text: bare("") }, thinkBlock("the only readable trace"), callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(emptyFence, SPEC_TEXT, NAMES, null, 0), emptyFence, "an empty fence does not authorise the drop");
-
-		// And only the signed block goes: an unsigned one is the model\u0027s own reasoning in the native
-		// shape, which a fence does not vouch for.
-		const mixed = live([{ type: "text", text: bare("mine") }, { type: "thinking", thinking: "unsigned, readable" }, thinkBlock("provider summary"), callBlock("t1", "exec")]);
-		const mixedOut = transcribeOne(mixed, SPEC_TEXT, NAMES, null, 0)[0];
-		assert.deepEqual(mixedOut.content.map((b) => b.type), ["text", "thinking", "toolCall"], "only the signed block is removed");
-		assert.equal(mixedOut.content[1].thinking, "unsigned, readable", "and the unsigned reasoning survives");
+		const long = live([thinkBlock("x".repeat(400)), { type: "text", text: "the reply" }], "stop");
+		const cut = transcribeOne(long, SPEC_TEXT, NAMES, 50).content[0].text;
+		assert.match(cut, /\[\.\.\. reasoning truncated\]/, "the reasoning is cut");
+		assert.match(cut, /the reply$/, "the reply is whole");
 	}
 
-	// The leak: a model that learned the fence leaves the closing tag in its own reasoning, and a
-	// fence built around that text closes at the model's tag with the rest landing in the reply slot.
+	// A lowercase that changes length must not move the cut. U+0130 is one code unit that lowercases to
+	// two, so an index taken from a lowered copy splits the tag and splices it into the reasoning. Every
+	// index comes from the block itself, which is what this pins.
 	{
-		const leaked = live([thinkBlock("first\n</think>\nsecond\n</Think>\nthird"), callBlock("t1", "exec")]);
-		const done = transcribeOne(leaked, SPEC_TEXT, NAMES, null, 0)[0];
-		const body = done.content[0].text;
-		assert.equal(body, bare("first\n\nsecond\n\nthird"), "every fence tag is removed, in any case");
-		assert.equal(body.indexOf("</think>"), body.length - "</think>".length, "the only closing tag is the one this module wrote");
-		assert.equal(body.indexOf("</think>"), body.lastIndexOf("</think>"), "exactly one of them");
-
-		// The union of every configured name, not just the resolved one.
-		assert.equal(stripTags("<note>a</note><think>b</think>", ["think", "note"]), "ab", "every configured name is stripped");
-		assert.equal(stripTags("<NOTE>a</Note>", ["note"]), "a", "case-insensitively");
-		assert.equal(stripTags("<div>keep</div>", ["think"]), "<div>keep</div>", "a tag nobody configured is left alone");
-
-		// Removal is a rewrite, and a rewrite can create the sequence it removes. One pass can hand
-		// back the very tag that would close the fence, so the strip repeats until nothing changes.
-		for (const hostile of ["<<think>think>", "</think</think>>", "<thi</think>nk>", "<</think>think>"]) {
-			assert.equal(stripTags(stripTags(hostile, ["think"]), ["think"]), stripTags(hostile, ["think"]), `a fixed point: ${hostile}`);
-			assert.equal(/<\/?think>/i.test(stripTags(hostile, ["think"])), false, `nothing left to close with: ${hostile}`);
+		const inside = live([{ type: "text", text: bare("cot \u0130\u0130") + "\n\nreply" }, thinkBlock("s"), callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(inside, SPEC_TEXT, NAMES).content[0].text, bare("s\n\ncot \u0130\u0130") + "\n\nreply", "a length-changing lowercase cannot shift the fence end");
+		const before = live([{ type: "text", text: "ahead \u0130\u0130 " + bare("cot") }, thinkBlock("s"), callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(before, SPEC_TEXT, NAMES).content[0].text, bare("s\n\nahead \u0130\u0130\n\ncot"), "and it cannot shift where the fence opens either");
+		// The whole turn is stable, which is the property the cache rests on.
+		for (const shape of [inside, before]) {
+			const once = transcribeOne(shape, SPEC_TEXT, NAMES);
+			assert.deepEqual(transcribeOne(once, SPEC_TEXT, NAMES), once, "and the result is a fixed point");
 		}
-
-		// A cot that is nothing but tags leaves nothing to promote.
-		const hollow = live([thinkBlock("</think> </think>"), callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(hollow, SPEC_TEXT, NAMES, null, 0), hollow, "a trace that was only tags is not a fence");
 	}
 
-	// A fenced turn heals its own fence. Those turns are the ones the signature sweep reaches, and the
-	// fence was written by the model or an earlier request, so the unfenced path never sees it again.
+	// A budget is applied to reasoning the writer then reads back, so it must not drift: the marker the cut
+	// appends is longer than the budget, and a second pass has to leave it alone.
 	{
-		const leaky = live([{ type: "text", text: bare("first half\n</think>\nthe other half") + "\n\nfinal reply" }, thinkBlock("provider summary"), callBlock("t1", "exec")]);
-		const done = transcribeOne(leaky, SPEC_TEXT, NAMES, null, 0)[0];
-		const body = done.content[0].text;
-		assert.equal((body.match(/<\/think>/g) || []).length, 1, "one closing tag, the one this module leaves");
-		assert.equal(body.indexOf("</think>"), body.lastIndexOf("</think>"), "and it is the last thing in the fence");
-		assert.match(body, /final reply$/, "the reply after the fence is untouched");
-		assert.equal(done.content.some((b) => b.type === "thinking"), false, "the signed block is gone");
-		const again = transcribeOne(done, SPEC_TEXT, NAMES, null, 0);
-		assert.equal((Array.isArray(again) ? again[0] : again).content[0].text, body, "a second pass is a no-op");
-		// A half-written fence: the model opens the tag and never closes it. That is a fence, so the
-		// promotion must not prepend a second opening tag in front of the first.
-		const half = live([{ type: "text", text: "<" + "think" + ">\nreasoning never closed" }, thinkBlock("provider summary"), callBlock("t1", "exec")]);
-		// Shape-tolerant: a broken fence repair leaves the message itself, and the assertions below are
-		// what turn that into a failure.
-		const halfRaw = transcribeOne(half, SPEC_TEXT, NAMES, null, 0);
-		const halfOut = Array.isArray(halfRaw) ? halfRaw[0] : halfRaw;
-		const halfText = (halfOut.content.find((b) => b.type === "text") || {}).text || "";
-		assert.equal((halfText.match(/<think>/g) || []).length, 1, "one opening tag, not two");
-		assert.equal((halfText.match(/<\/think>/g) || []).length, 1, "and the fence is closed here");
-		assert.match(halfText, /reasoning never closed/, "the reasoning inside it survives");
-		assert.equal(halfOut.content.some((b) => b.type === "thinking"), false, "the signed block is gone");
+		for (const budget of [1, 24, 47, 48, 49, 50, 120, 400]) {
+			const turn = live([thinkBlock("a".repeat(400))], "stop");
+			const once = transcribeOne(turn, SPEC_TEXT, NAMES, budget);
+			assert.deepEqual(transcribeOne(once, SPEC_TEXT, NAMES, budget), once, `a second pass with maxChars ${budget} changes nothing`);
+		}
+	}
 
-		// The tail is emitted raw, so a tag in it is not a reason to skip the repair: a stray closing
-		// tag inside the fence would then survive, which is the defect the repair exists to heal.
-		const strayWithTail = live([{ type: "text", text: "<" + "think" + ">a</" + "think" + ">b</" + "think" + ">c <" + "think" + ">d" }, thinkBlock("s"), callBlock("t1", "exec")]);
-		const healed = transcribeOne(strayWithTail, SPEC_TEXT, NAMES, null, 0)[0];
-		const healedText = (healed.content.find((b) => b.type === "text") || {}).text || "";
-		assert.equal(healedText, "<" + "think" + ">ab</" + "think" + ">c <" + "think" + ">d", "the stray tag heals and the quoted one is kept raw");
-		assert.match(healedText, /c <think>d$/, "the quotation survives as written");
+	// An empty fence with nothing readable behind it is left alone. The credential is the only trace the
+	// turn has, and a fence that says nothing cannot replace it.
+	{
+		const empty = live([{ type: "text", text: bare("") }, { type: "thinking", thinking: "", thinkingSignature: "credential" }, callBlock("t1", "exec")]);
+		assert.equal(transcribeOne(empty, SPEC_TEXT, NAMES), empty, "an empty fence and an unreadable credential stay as they are");
+	}
 
-		// The anchor is case-insensitive in both directions. `opensWith` accepts `<THINK>`, so a
-		// case-sensitive anchor would leave the turn fenced but unrepaired, and the signature beside it
-		// would stay forever.
-		const openUp = "<" + "THINK" + ">";
-		const closeUp = "</" + "THINK" + ">";
-		const upper = live([{ type: "text", text: openUp + "\nfirst\n" + closeUp + "\n99%\n" + closeUp }, thinkBlock("s"), callBlock("t1", "exec")]);
-		const upperOut = transcribeOne(upper, SPEC_TEXT, NAMES, null, 0);
-		const upperMsg = Array.isArray(upperOut) ? upperOut[0] : upperOut;
-		assert.equal(upperMsg.content.some((b) => b.type === "thinking" && b.thinkingSignature), false, "an uppercase fence is repaired and its signature dropped");
+	// A turn the toolcall form writes keeps its reply. The two forms differ in where the cot lands, and a
+	// visible answer must not be spent on the form that writes a call.
+	{
+		const turn = live([thinkBlock("cot"), { type: "text", text: "the reply" }], "stop");
+		const done = transcribeOne(turn, SPEC_TOOL, NAMES);
+		assert.deepEqual(done[2].content.map((b) => b.type), ["text"], "the turn keeps a block");
+		assert.equal(done[2].content[0].text, "the reply", "and it is the reply");
+		const round = transcribeHistory(done, SPEC_TOOL, NAMES);
+		assert.deepEqual(round, done, "and that shape is stable");
+	}
 
-		// The fence this module writes ends at its own close, not at a closing tag the reply quotes.
-		const quoted = live([{ type: "text", text: bare("clean reasoning") + "\n\nnever write " + "</think>" }, thinkBlock("s"), callBlock("t1", "exec")]);
-		const quotedOut = transcribeOne(quoted, SPEC_TEXT, NAMES, null, 0);
-		const quotedText = (Array.isArray(quotedOut) ? quotedOut[0] : quotedOut).content.find((b) => b.type === "text").text;
-		assert.equal(quotedText, bare("clean reasoning") + "\n\nnever write </think>", "the sentence that quotes the tag is not swallowed");
+	// The pair is the turn's fence even when the turn already carries one of its own: the reasoning moves
+	// into the pair and the fence on the turn goes, so the turn never shows two traces.
+	{
+		const pair = transcribeOne(live([thinkBlock("old")], "stop"), SPEC_TOOL, NAMES);
+		const fenced = live([{ type: "text", text: bare("fresh reasoning") }, callBlock("c1", "exec")]);
+		const merged = transcribeHistory([...pair, fenced], SPEC_TOOL, NAMES);
+		assert.equal(merged[0].content[0].arguments.thought, "fresh reasoning", "the pair takes the newer reasoning");
+		assert.equal(merged[0].content[0].id, pair[0].content[0].id, "and keeps its id");
+		assert.equal(merged[2].content.some((b) => b.type === "text"), false, "the turn carries no fence of its own");
+		assert.deepEqual(transcribeHistory(merged, SPEC_TOOL, NAMES), merged, "and that is stable");
+	}
+	// A pair answers an assistant turn the writer can read. The guard is the same one the unfenced path
+	// makes, so a message whose content is not a block list passes through instead of throwing.
+	{
+		const pair = transcribeOne(live([thinkBlock("stored")], "stop"), SPEC_TOOL, NAMES);
+		const flat = { ...live([], "stop"), content: "not a block list" };
+		const list = transcribeHistory([...pair, flat], SPEC_TOOL, NAMES);
+		assert.equal(list.length, 3, "the pair and the turn it cannot read both stay");
+		assert.equal(list[2], flat, "and the unreadable turn is untouched");
+		// The merge honours the same budget the fence would get.
+		const longTurn = live([thinkBlock("y".repeat(200)), { type: "text", text: "reply" }], "stop");
+		const bounded = transcribeHistory([...pair, longTurn], SPEC_TOOL, NAMES, 10);
+		assert.match(bounded[0].content[0].arguments.thought, /\[\.\.\. reasoning truncated\]$/, "a merged cot is cut by the budget");
+		assert.ok(bounded[0].content[0].arguments.thought.length < 60, "and is not the whole trace");
+	}
 
-		// The scan runs over the block itself, never over a lowered copy: U+0130 lowercases to two code
-		// units, so an index taken from the lowered text slices the original in the wrong place — the
-		// blank line before the reply disappears and the closing tag is cut in half.
-		const dottedBody = "<" + "think" + ">quoted </" + "think" + "> here caf\u0130n\u0130 more</" + "think" + ">\n\nreply";
-		const dottedExpected = "<" + "think" + ">quoted  here caf" + "\u0130n\u0130 more</" + "think" + ">\n\nreply";
-		const dotted = live([{ type: "text", text: dottedBody }, thinkBlock("s"), callBlock("t1", "exec")]);
-		const dottedOut = transcribeOne(dotted, SPEC_TEXT, NAMES, null, 0);
-		const dottedText = (Array.isArray(dottedOut) ? dottedOut[0] : dottedOut).content.find((b) => b.type === "text").text;
-		assert.equal(dottedText, dottedExpected, "a length-changing lowercase cannot shift the fence end");
-		assert.equal(dottedText.endsWith("</think>\n\nreply"), true, "the blank line and the reply survive");
-
-		// A cot that closes an idea, breaks a paragraph and keeps reasoning: the fence is the LAST
-		// blank-line tag, not the first, or the rest of the reasoning lands in the reply slot. Asserted
-		// structurally rather than against a literal, so the shape is what is pinned, not the spelling.
-		const midCot = "<" + "think" + ">" + "\n" + "first half" + "\n" + "</" + "think" + ">" + "\n\n" + "the other 99%" + "\n" + "</" + "think" + ">" + "\n\n" + "final reply";
-		const midOut = textOfOne(transcribeOne(live([{ type: "text", text: midCot }, thinkBlock("s"), callBlock("t1", "exec")]), SPEC_TEXT, NAMES, null, 0));
-		assert.equal((midOut.match(/<\/think>/g) || []).length, 1, "one closing tag after the repair");
-
-		// The same cot on a turn with **no reply** behind it. This is the shape the whole rule exists
-		// for — a tool call whose fence closes the block — and it is the only case that reaches the
-		// `nothing after it` half of the disjunction. A reply-only fixture passes through the
-		// blank-line reading instead, which is why the clause went uncovered.
-		const noReply = { ...live([{ type: "text", text: "<" + "think" + ">" + NL + "first half" + NL + "</" + "think" + ">" + NL + NL + "the other 99%" + NL + "</" + "think" + ">" }, thinkBlock("s"), callBlock("t1", "exec")]) };
-		const noReplyOut = textOfOne(transcribeOne(noReply, SPEC_TEXT, NAMES, null, 0));
-		assert.equal((noReplyOut.match(/<\/think>/g) || []).length, 1, "a tool-call turn with no reply keeps its reasoning inside one fence");
-		assert.equal(noReplyOut.slice(noReplyOut.lastIndexOf("</think>") + 8).trim(), "", "and nothing is left in the reply slot");
-		assert.match(noReplyOut, /the other 99%[\s\S]*<\/think>$/, "the reasoning sits inside the fence");
-		assert.match(midOut, /the other 99%[\s\S]*<\/think>/, "the rest of the reasoning stays inside the fence");
-		assert.match(midOut, /<\/think>[\s\S]*final reply$/, "and the reply follows the fence");
-
-		// CRLF: the break is `\r?\n[ \t]*\r?\n`, so a block with CRLF endings behaves like one with LF.
-		const crlf = "<" + "think" + ">" + "\r\n" + "clean" + "\r\n" + "</" + "think" + ">" + "\r\n\r\n" + "never write </" + "think" + ">";
-		assert.equal(textOfOne(transcribeOne(live([{ type: "text", text: crlf }, thinkBlock("s"), callBlock("t1", "exec")]), SPEC_TEXT, NAMES, null, 0)), crlf, "a CRLF block is read the same way");
-
-		// Two fences in one block: the quoted one is not pulled into the reasoning.
-		const twoFences = "<" + "think" + ">" + "\n" + "A <" + "think" + "> B</" + "think" + ">" + "\n\n" + "more" + "\n" + "</" + "think" + ">" + "\n\n" + "reply";
-		assert.equal(textOfOne(transcribeOne(live([{ type: "text", text: twoFences }, thinkBlock("s"), callBlock("t1", "exec")]), SPEC_TEXT, NAMES, null, 0)), twoFences, "a block with two fences is left alone");
-
-		// The shape that used to be an unavoidable trade, now separated instead: a reply that quotes the
-		// closing tag mid-sentence is not the fence's close, because a fence writes its close on a line
-		// of its own. Both sides are pinned here — the reasoning keeps its content and the reply keeps
-		// its paragraphs.
-		const quotedGoesOn = "<" + "think" + ">" + NL + "cot" + NL + "</" + "think" + ">" + NL + NL + "reply para" + NL + NL + "never write </" + "think" + ">" + NL + NL + "more reply";
-		const goesOnOut = textOfOne(transcribeOne(live([{ type: "text", text: quotedGoesOn }, thinkBlock("s"), callBlock("t1", "exec")]), SPEC_TEXT, NAMES, null, 0));
-		const fenceClose = goesOnOut.indexOf("</think>\n");
-		assert.equal(goesOnOut.slice(0, fenceClose).trim(), "<think>" + NL + "cot", "the cot is only the cot");
-		assert.equal(goesOnOut.slice(fenceClose + 8), NL + NL + "reply para" + NL + NL + "never write </think>" + NL + NL + "more reply", "and the whole reply, quotation included, stays outside");
-		assert.equal((goesOnOut.match(/<\/think>/g) || []).length, 2, "one fence close plus the quoted one");
-
-		// A fence whose close is not on its own line still falls back to the blank-line reading.
-		const inline = "<" + "think" + ">" + NL + "cot" + NL + "trailing </" + "think" + ">" + NL + NL + "reply";
-		const inlineOut = textOfOne(transcribeOne(live([{ type: "text", text: inline }, thinkBlock("s"), callBlock("t1", "exec")]), SPEC_TEXT, NAMES, null, 0));
-		assert.equal(inlineOut, inline, "an inline close is still read as the fence end");
-
-		// The two shapes the anchor still misreads, pinned so the next change is a decision. A reply
-		// that quotes the bare close on a line of its own, with prose straight after, keeps its
-		// quotation; the same quotation followed by a blank line is still drawn into the cot, which is
-		// the cost of the fallback. A cot whose real close is glued stays unrepaired.
-		const quotedLine = "<" + "think" + ">" + NL + "cot" + NL + "</" + "think" + ">" + NL + NL + "here is how a fence ends:" + NL + "</" + "think" + "> like that";
-		const quotedLineOut = textOfOne(transcribeOne(live([{ type: "text", text: quotedLine }, thinkBlock("s"), callBlock("t1", "exec")]), SPEC_TEXT, NAMES, null, 0));
-		assert.equal((quotedLineOut.match(/<\/think>/g) || []).length, 2, "a line-initial quotation with prose after it stays outside");
-		assert.match(quotedLineOut, /like that$/, "and its line is intact");
-
-		const quotedBlank = "<" + "think" + ">" + NL + "cot" + NL + "</" + "think" + ">" + NL + NL + "here is how a fence ends:" + NL + "</" + "think" + ">" + NL + NL + "like that";
-		const quotedBlankOut = textOfOne(transcribeOne(live([{ type: "text", text: quotedBlank }, thinkBlock("s"), callBlock("t1", "exec")]), SPEC_TEXT, NAMES, null, 0));
-		assert.equal((quotedBlankOut.match(/<\/think>/g) || []).length, 1, "the same quotation with a blank line after it is drawn in: the fallback cost");
-
-		const gluedClose = "<" + "think" + ">" + NL + "idea one" + NL + "</" + "think" + ">" + NL + NL + "more" + NL + "real cot</" + "think" + ">reply glued";
-		const gluedOut = textOfOne(transcribeOne(live([{ type: "text", text: gluedClose }, thinkBlock("s"), callBlock("t1", "exec")]), SPEC_TEXT, NAMES, null, 0));
-		assert.equal(gluedOut, gluedClose, "a glued real close is not repaired");
-		// A fence needs no newline after the tag. `fenced` and the repair have to agree on what a fence
-		// is; when they did not, a turn fenced as `<think>reasoning` read as unfenced, the promotion
-		// prepended a second opening tag, and the next pass changed the request again.
-		assert.equal(opensWith("<think>reasoning", "think"), true, "the tag alone is a fence");
-		assert.equal(opensWith("<THINK>reasoning", "think"), true, "in either case");
-		assert.equal(opensWith("<thinkable>x", "think"), false, "and the closing bracket is part of it");
-		assert.equal(carriesCot([{ type: "text", text: "<think>reasoning" }], NAMES), true, "so the turn counts as fenced");
-		const noNewline = live([{ type: "text", text: "<think>reasoning on the same line" }, thinkBlock("provider summary"), callBlock("t1", "exec")]);
-		const sameLine = transcribeOne(noNewline, SPEC_TEXT, NAMES, null, 0);
-		const sameLineOut = Array.isArray(sameLine) ? sameLine[0] : sameLine;
-		assert.equal(((sameLineOut.content.find((b) => b.type === "text") || {}).text.match(/<think>/g) || []).length, 1, "no second opening tag is prepended");
-		const sameLineAgain = transcribeOne(sameLineOut, SPEC_TEXT, NAMES, null, 0);
-		assert.equal((Array.isArray(sameLineAgain) ? sameLineAgain[0] : sameLineAgain).content.find((b) => b.type === "text").text, (sameLineOut.content.find((b) => b.type === "text") || {}).text, "and a second pass is a no-op");
-
-
-
-		// A clean fence is left byte-identical.
-		const clean = live([{ type: "text", text: bare("mine") }, thinkBlock("provider summary"), callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(clean, SPEC_TEXT, NAMES, null, 0)[0].content[0].text, bare("mine"), "nothing to repair");
-
-		// The interior is what decides whether the turn has a cot, not the whole turn: a reply after the
-		// fence, or a marker `beat` appends, must not stand in for reasoning.
-		const replyAfter = live([{ type: "text", text: bare("") + "\n\nthe reply" }, thinkBlock("only trace"), callBlock("t1", "exec")]);
-		assert.equal(transcribeOne(replyAfter, SPEC_TEXT, NAMES, null, 0), replyAfter, "a reply is not a cot");
-		const beaten = beatOne({ ...replyAfter, content: [{ type: "text", text: bare("") }, thinkBlock("only trace"), callBlock("t1", "exec")] }, 3);
-		assert.equal(transcribeOne(beaten, SPEC_TEXT, NAMES, null, 3), beaten, "and neither is a turn marker");
+	// The budget never makes the writer drift, including when the cut falls inside a surrogate pair: the
+	// note a cut trace carries is not cut again, so the bytes a second request sees are the ones the first
+	// one wrote.
+	{
+		for (const budget of [3, 4, 5, 6, 7, 8, 12, 20]) {
+			const turn = live([thinkBlock("\u{1F600}".repeat(6))], "stop");
+			const once = transcribeOne(turn, SPEC_TEXT, NAMES, budget);
+			assert.deepEqual(transcribeOne(once, SPEC_TEXT, NAMES, budget), once, `a surrogate cut is stable at maxChars ${budget}`);
+		}
 	}
 	console.log("ok transcribe");
 }

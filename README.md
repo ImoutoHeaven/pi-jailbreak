@@ -66,7 +66,7 @@ version fails loudly instead of being ignored.
 | `turns` | `false`, `true`, or a path | Splices that YAML file ahead of the first real user message. `true` names `turn0.yml`, which ships with the extension |
 | `forge` | `false`, `true`, or `{ "maxChars": n }` | Refills a foreign turn's cot when the request targets this model. `true` is no bound; `maxChars` cuts the trace |
 | `cot` | `text:<tag>` or `toolcall:<name>` | How the writers write the cot. `text:<think>` and `text:think` are one tag |
-| `transcribe` | `false` or `true` | Writes a turn's own reasoning as text and drops the thinking block, so the next request carries it as bytes a model reads instead of a signature it cannot use |
+| `transcribe` | `false` or `true` | Writes a turn's own reasoning as one fence — the summary behind a signature merged in, every readable block replaced — so the next request carries bytes a model reads instead of a signature it cannot use |
 | `beat` | `false` or `true` | Appends `[turn <position>]` inside a text block of every assistant turn |
 
 Each slot resolves on its own, down the same layers, and reports which layer answered:
@@ -125,70 +125,89 @@ byte-identical, so the prompt cache keeps hitting.
 
 ### transcribe
 
-`forge` answers one question: a turn pi will not carry, whose reasoning is about to be lost. The
-turn in front of it, written by the live model, pi carries as it is — and on a backend that signs its
+`forge` answers one question: a turn pi will not carry, whose reasoning is about to be lost. The turn
+in front of it, written by the live model, pi carries as it is — and on a backend that signs its
 reasoning, that means the next request carries a signature the model cannot read, plus whatever
-summary the provider chose to include. `transcribe` closes that gap: it writes the readable reasoning
-into the turn's own text, as the same fence `cot` names, and drops the thinking block.
+summary the provider chose to include. `transcribe` closes that gap: it writes that reasoning into the
+turn's own text as the fence `cot` names, and the thinking block goes.
 
-The drop is the part that matters. A fence beside a thinking block is two reasoning traces on one
-turn, which is the state `forge`'s second invariant exists to prevent. `transcribe` is the writer that
-chooses the other trade: the wire format stops being native, and in return the reasoning is ordinary
-text on the next request, on every model, at every provider.
+A turn can carry reasoning in three places at once, and any two of them can be present together: the
+thinking blocks, the interior of a fence the model wrote itself, and the words ahead of that fence.
+`transcribe` reads all three into one piece of text and writes exactly one fence, so the shape a model
+meets on the next request is the same shape every time — one opening tag, the reasoning, one closing
+tag, then the reply. It is the only writer that reconstructs a turn rather than adding to one.
 
-It reads the message and nothing else — not the live model, not the clock, not the run. That is what
-keeps a model switch free: the same history yields the same bytes whoever asks for it. It is also
-what makes it idempotent.
+Where each piece comes from is settled by the blocks, not by their order. Whether a text block is
+reasoning or reply depends on whether it came before or after the fence: with no fence anywhere the
+text is the reply and the reasoning is the thinking blocks alone, and with one, every text block ahead
+of it is reasoning and every block behind it is the reply. A block that carries the fence contributes
+both — the words in front of the tag, then its interior, then whatever follows as the reply. The rule
+is stated once and holds for every arrangement a wire can produce.
 
-A turn that already carries a fence is the case the slot exists for, not an exception. If the block
-behind that fence is signed, the turn shows a fence and an encrypted trace at once, and the signature
-is the piece that goes — a credential vouches for reasoning it carried, and a fence in front of it is
-a different, readable trace. The signature is dropped, not the fence: measured over every such turn in
-a real session, the summary behind the signature is absent from the fence and sometimes longer than
-it, so promoting the block over the fence would overwrite what the model actually wrote. A fenced
-turn with no signature is the loop closed by itself, and is left alone: the absence of a signature is
-the whole test, and no state records that the model learned.
+The thinking blocks are read, not discarded, and this is the part that changed. Measured over real
+turns that carry a fence and a signature together, the fence holds almost none of the summary: the two
+are different traces. Keeping only the fence threw away reasoning the model had already paid for, and
+keeping the block beside the fence showed two traces on one turn. So the summary is written into the
+fence, ahead of the model's own words, because it is the provider's compression of the whole turn and
+the model's own words read as the detail that follows it. Nothing readable is dropped and the turn
+ends up with one trace.
 
-A model that learned the fence leaves the closing tag in its own reasoning, so every cot is stripped
-of every configured fence tag — the union of names, in either case, and before the fence is built, so
-the fence this module writes can not be a candidate. Removal rather than escaping: an escape is a
-spelling the model has never seen, and a model that learns it starts emitting it, while a removal is
-invisible and teaches nothing. Without it a fence closes at the model's tag and the rest of the
-reasoning lands in what the model reads as the reply.
+A signature is a credential, and a credential beside a fence vouches for reasoning the request cannot
+read anyway. Every reasoning block is replaced by the fence, so no signature survives a pass.
 
-The same strip repairs a fence that is already in the transcript. A turn that carries both a fence and
-a signature is rewritten from its fence interior, so a stray tag left inside heals on the next
-request, and a fence whose opening tag was never closed is closed here rather than opened a second
-time. The interior, not the whole turn, is also what decides whether the turn still has a cot: a reply
-after the fence, or a marker `beat` appends, is not reasoning and must not stand in for it.
+`maxChars` bounds the reasoning, never the reply. A cut reply is a turn that stopped talking.
 
-Where the fence ends is the one judgement the repair makes, and it rests on placement rather than on
-punctuation: this module writes the closing tag on a line of its own, so a closing tag that starts a
-line is the fence's own and one inside a sentence is a quotation. The last line-initial tag with
-nothing behind it, or with a blank line and the reply behind it, is the fence; a line-initial tag with
-prose straight after it is a quotation, so the scan passes over it and lands on the real close. When
-no tag starts a line at all — a fence someone else wrote — the last line-initial tag is tried, then the
-blank-line reading, then the last tag. One shape still misreads — a reply that quotes the bare close on
-its own line *and* leaves a blank line after it is drawn into the cot — because it is byte-for-byte the
-shape the first reading must accept, and the corpus says that shape is the one worth keeping. A block
-with more than one opening tag is left alone: there is no single interior to rebuild.
+The result is a fixed point. Every piece is stripped of the configured tags and trimmed before it is
+joined, a piece another piece already contains is dropped, and a blank reply is left out, so a second
+pass finds one fence with no tags inside it and nothing outside it and rebuilds the same bytes. A turn
+the extension has written is therefore byte-identical on every request after the first, which is what
+keeps the prompt cache hitting; only the first request that carries a turn written by a model changes
+it once. The decision reads the message and the spec and nothing else — not the live model, not the
+clock, not the run — so the same history yields the same bytes and a model switch costs nothing beyond
+the request it happens on.
+
+A model that learned the fence leaves the closing tag in its own reasoning, so the fence is stripped of
+every configured fence tag — the union of names, in either case, and before the fence is built, so the
+fence this module writes can not be a candidate. Removal rather than escaping: an escape is a spelling
+the model has never seen, and a model that learns it starts emitting it, while a removal is invisible
+and teaches nothing.
+
+That strip is applied as a rule and not as a judgement. A reply that mentions the tag is folded into
+the reasoning like any other words ahead of a fence, and a closing tag quoted in a reply is drawn into
+the fence, because the fence ends at the last closing tag in the block. Both are pinned in the check so
+a later change makes the trade again on purpose. A tag with an attribute is not the fence: only a
+configured name is stripped, and only as a whole tag.
+
+Where the fence ends is the one place a block can be read two ways, and the reasoning wins it: a
+closing tag inside a cot is the shape every real one had, so the scan takes the last one. A half-written
+fence — the model opened the tag and never closed it — runs to the end of its block and is closed here,
+and a stray closer with nothing behind it is dropped. Two opening tags in one block are read as one
+fence: the prefix is reasoning and the rest is the interior, so the turn still ends up with a single
+tag pair.
+
+The toolcall form writes the same reasoning as the argument of a call and leaves the turn with only
+what it did besides reasoning, so the two forms differ in where the cot lands and in nothing else. A
+turn already preceded by a cot pair is that pair's turn: the reasoning goes into the pair's `thought`
+and the turn keeps only its own calls. The pair's id is kept — it is derived from the cot and the turn,
+and the position that salts it moves when a message is inserted, so recomputing it would rewrite an id
+the transcript already holds.
 
 Nothing here is written to the session. The transcript keeps its thinking blocks and its signatures,
-so turning the slot off restores the native shape exactly; the promotion lives in the request and
+so turning the slot off restores the native shape exactly; the writing lives in the request and
 nowhere else. The two slots are independent: `forge` alone keeps the native wire format, `transcribe`
-alone promotes the live model's own turns, and both together promote everything readable.
+alone writes the live model's own turns, and both together write everything readable.
 
 With both on, the promotion is the stronger writer and runs first, on every turn it can read — the
 live model's and a foreign one's alike. That has one consequence worth naming: `forge`'s `maxChars`
 stops applying to any turn the promotion reached, because the turn is already carrying a cot and
 `forge` leaves it alone. A bound is a decision about what to cut from a trace that is being brought
 back, and `transcribe` exists to make the trace visible in the first place, so a cut there would
-undo the slot. The order is a preference rather than a requirement: a signed block behind a fence is
-dropped, and a turn already preceded by a cot pair is skipped by both writers, so either order
-produces the same one-trace request in both forms.
+undo the slot. The order is a preference rather than a requirement: `forge` writes a fence out of the
+same bytes a thinking block carries, the strip drops the copy that adds nothing, and both orders
+produce the same one-trace request in both forms.
 
 The readable text is what the provider exposes. When that is a summary, the summary is what gets
-promoted, and the full trace stays encrypted where it was; nothing here can recover it.
+written into the fence, and the full trace stays encrypted where it was; nothing here can recover it.
 
 ### beat
 
