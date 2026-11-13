@@ -104,11 +104,17 @@ export function forgeOne(message, live, spec, index = 0, maxChars = null, names 
 	if (fenced(content, names)) return null;
 	const own = ownCot(message);
 	if (!own) return null;
-	// The same strip the promotion applies. A cot that carries the tag would close the fence early, and
-	// `forge` writes the fence just as `transcribe` does — one writer cleaning and the other not is how
-	// the leak survives with `transcribe` off.
-	const cot = clampCot(stripTags(own, names), maxChars);
-	if (!cot.trim()) return null;
+	// Strip configured tags and trim per block before joining, matching `transcribe` byte for byte when a
+	// thinking block carries fence tags around newlines.
+	const cleaned = (message.content ?? [])
+		.filter((block) => block?.type === "thinking" && !block.redacted)
+		.map((block) => String(block.thinking ?? "").trim())
+		.filter((text) => text && text !== "[Reasoning redacted]")
+		.map((text) => stripTags(text, names).trim())
+		.filter(Boolean)
+		.join("\n\n");
+	const cot = clampCot(cleaned, maxChars);
+	if (!cot) return null;
 	if (spec.form === "toolcall") {
 		// Insertion, not a rewrite: the message may already carry a call of its own, and a second
 		// `toolCall` in one content would leave two calls waiting for results pi then answers with a

@@ -155,7 +155,7 @@ export function isCotPairMessage(message, names) {
 	const blocks = message.content.filter((block) => !(block?.type === "text" && MARKER_ONLY.test(String(block.text ?? ""))));
 	if (blocks.length !== 1) return false;
 	const block = blocks[0];
-	return isCotCall(block, names) && Boolean(block.arguments && "thought" in block.arguments);
+	return isCotCall(block, names) && typeof block.arguments?.thought === "string";
 }
 
 /** Whether the message at `index` is preceded by a cot pair that answers it. */
@@ -189,6 +189,19 @@ export function ownCot(message) {
 
 /** The marker `beat` writes. One per block, at the very end, so stripping it is unambiguous. */
 const BEAT_MARK = /\n?\[turn \d+\]$/;
+
+/** `text` with every trailing `[turn <digits>]` suffix and preceding whitespace removed in one backward scan. */
+function stripTrailingMarkers(text) {
+	let end = text.length;
+	while (end >= 8 && text[end - 1] === "]") {
+		let p = end - 2;
+		while (p >= 0 && text[p] >= "0" && text[p] <= "9") p--;
+		if (p === end - 2 || p < 5 || text.slice(p - 5, p + 1) !== "[turn ") break;
+		end = p - 5;
+		while (end > 0 && /\s/.test(text[end - 1])) end--;
+	}
+	return end === text.length ? text : text.slice(0, end);
+}
 
 /**
  * A block's text with its turn marker: the previous one, if any, is removed first, so a second pass
@@ -267,10 +280,13 @@ const TRUNCATED = "\n[... reasoning truncated]";
  */
 export function clampCot(cot, maxChars) {
 	if (!Number.isSafeInteger(maxChars) || maxChars <= 0 || cot.length <= maxChars) return cot;
-	if (cot.endsWith(TRUNCATED)) return cot;
+	const source = cot.endsWith(TRUNCATED) ? cot.slice(0, -TRUNCATED.length) : cot;
+	if (source !== cot && (source.length <= maxChars || (maxChars === 1 && source.length === 2 && /[\uD800-\uDBFF]/.test(source[0])))) {
+		return cot;
+	}
 	let cut = maxChars;
-	if (/[\uD800-\uDBFF]/.test(cot[cut - 1])) cut = cut > 1 ? cut - 1 : 2;
-	return cut < cot.length ? `${cot.slice(0, cut)}${TRUNCATED}` : cot.slice(0, cut);
+	if (/[\uD800-\uDBFF]/.test(source[cut - 1])) cut = cut > 1 ? cut - 1 : 2;
+	return cut < source.length || source !== cot ? `${source.slice(0, cut)}${TRUNCATED}` : source.slice(0, cut);
 }
 
 /**
@@ -290,27 +306,48 @@ export function clampCot(cot, maxChars) {
  * and the next reader is configured for `note`.
  */
 export function stripTags(text, names) {
-	const tags = new Set((names ?? []).map((name) => String(name).toLowerCase()));
+	const tags = new Set();
+	let maxLen = 0;
+	for (const raw of names ?? []) {
+		const name = String(raw).toLowerCase();
+		if (!name || name.includes("<") || name.includes(">")) continue;
+		tags.add(name);
+		if (name.length > maxLen) maxLen = name.length;
+	}
 	const body = String(text ?? "");
 	if (tags.size === 0 || !body.includes("<")) return body;
-	let out = "";
-	// Where every `<` in `out` sits, so the text between the innermost one and the current `>` is the
-	// only candidate to check.
+	// Include the leading `/` of a closing tag. No character shrinks when lowercased, so a span wider
+	// than `maxLen + 1` code units cannot lowercase to a configured tag.
+	const limit = maxLen + 1;
+	const out = [];
+	// Where every `<` in `out` sits. Once a `>` stays in `out` without matching, every `<` ahead of it
+	// has a `>` after it and can never form a tag name, so the whole stack clears in one step.
 	const opens = [];
-	for (const ch of body) {
-		out += ch;
+	for (let i = 0; i < body.length; i++) {
+		const ch = body[i];
+		out.push(ch);
 		if (ch === "<") {
 			opens.push(out.length - 1);
 			continue;
 		}
 		if (ch !== ">" || opens.length === 0) continue;
 		const at = opens[opens.length - 1];
-		const raw = out.slice(at + 1, out.length - 1).toLowerCase();
-		if (!tags.has(raw.startsWith("/") ? raw.slice(1) : raw)) continue;
-		out = out.slice(0, at);
+		const span = out.length - 2 - at;
+		if (span <= 0 || span > limit) {
+			opens.length = 0;
+			continue;
+		}
+		let raw = "";
+		for (let k = at + 1; k < out.length - 1; k++) raw += out[k];
+		const name = raw.toLowerCase();
+		if (!tags.has(name.startsWith("/") ? name.slice(1) : name)) {
+			opens.length = 0;
+			continue;
+		}
+		out.length = at;
 		opens.pop();
 	}
-	return out;
+	return out.join("");
 }
 
 /**
@@ -343,70 +380,88 @@ function fenceCloseAt(text, close) {
 /** One message's readable reasoning, in the order it was written, and the reply that followed it. */
 function splitTurn(message, spec, names) {
 	const thinking = [];
-	const fenced = [];
-	const prose = [];
+	const texts = [];
 	for (const block of message.content) {
-		if (block?.type !== "thinking") continue;
-		if (block.redacted) continue;
-		const text = String(block.thinking ?? "").trim();
-		if (!text || text === "[Reasoning redacted]") continue;
-		thinking.push(text);
+		if (block?.type === "thinking") {
+			if (block.redacted) continue;
+			const text = String(block.thinking ?? "").trim();
+			if (!text || text === "[Reasoning redacted]") continue;
+			thinking.push(text);
+		} else if (block?.type === "text") {
+			texts.push(String(block.text ?? ""));
+		}
 	}
+	// `beat` appends `BEAT_MARK` to the last text block. Strip that exact suffix first so `splitTurn` and
+	// `beatText` agree on what is a marker, and `thinking` blocks whose own text looks like one stay intact.
+	if (texts.length > 0) texts[texts.length - 1] = texts[texts.length - 1].replace(BEAT_MARK, "");
 	const { open, close } = fenceTags(spec.name);
-	// Whether any text block carries the fence at all decides what a text block means. With no fence
-	// anywhere the text is the reply, and the reasoning is the thinking blocks alone; with one, every
-	// block ahead of it is reasoning and every block behind it is the reply. One scan ahead of the
-	// expensive one, so the answer does not depend on block order or on how many blocks there are.
-	const carries = message.content.some((block) => block?.type === "text" && fenceOpenAt(block.text, open) >= 0);
-	let seen = false;
-	for (const block of message.content) {
-		if (block?.type !== "text") continue;
-		const text = String(block.text ?? "");
-		const at = fenceOpenAt(text, open);
-		if (at < 0) {
-			(!carries || seen ? prose : fenced).push(text);
-			continue;
+	// A fence spans from the first opening tag across the turn's text blocks to the last closing tag
+	// after it, or to the end of the turn when the model never closed it. With no opening tag anywhere,
+	// every text block is the reply and the reasoning is the thinking blocks alone.
+	let openBlock = -1;
+	let openAt = -1;
+	for (let i = 0; i < texts.length; i++) {
+		const at = fenceOpenAt(texts[i], open);
+		if (at >= 0) {
+			openBlock = i;
+			openAt = at;
+			break;
 		}
-		seen = true;
-		// Everything ahead of the opening tag is reasoning by decision, not by inference: a model that is
-		// writing a fence was still thinking when it wrote the words in front of it.
-		fenced.push(text.slice(0, at));
-		const rest = text.slice(at + open.length);
-		// The last closing tag, because that is the shape every real one had: a closing tag inside a cot is
-		// the model's own, and reading to the first one threw the rest of the reasoning into the reply.
-		const end = fenceCloseAt(rest, close);
-		if (end < 0) {
-			// A half-written fence: the model opened the tag and never closed it. Its interior runs to the
-			// end of the block. A stray closer with nothing behind it is dropped here on purpose, so the one
-			// tag this module writes is the one that closes the fence.
-			fenced.push(rest);
-			continue;
-		}
-		fenced.push(rest.slice(0, end));
-		prose.push(rest.slice(end + close.length));
 	}
-	// The order across blocks is the order the writers have always used: reasoning the turn wrote ahead
-	// of the fence, in block order, with the thinking blocks first because their text is the lead-in the
-	// model wrote before it started a fence.
-	// A piece that another piece already contains is dropped. `forge` writes a fence out of the same bytes a
-	// thinking block carries, so a turn fused by both writers says its reasoning twice; merging the two as
-	// they stand would double it. Nothing is lost by the drop: a contained piece adds no new bytes.
+	const pre = [];
+	const inside = [];
+	const prose = [];
+	if (openBlock < 0) {
+		prose.push(...texts);
+	} else {
+		for (let i = 0; i < openBlock; i++) pre.push(texts[i]);
+		pre.push(texts[openBlock].slice(0, openAt));
+		const tail = [texts[openBlock].slice(openAt + open.length), ...texts.slice(openBlock + 1)];
+		let closeBlock = -1;
+		let closeAt = -1;
+		for (let j = tail.length - 1; j >= 0; j--) {
+			const end = fenceCloseAt(tail[j], close);
+			if (end >= 0) {
+				closeBlock = j;
+				closeAt = end;
+				break;
+			}
+		}
+		const afterClose = closeBlock < 0 ? [] : [tail[closeBlock].slice(closeAt + close.length), ...tail.slice(closeBlock + 1)];
+		// An opening tag after the last closing tag starts a fence the model never closed, so the reasoning
+		// runs to the end of the turn's text.
+		if (closeBlock < 0 || afterClose.some((part) => fenceOpenAt(part, open) >= 0)) {
+			inside.push(...tail);
+		} else {
+			for (let j = 0; j < closeBlock; j++) inside.push(tail[j]);
+			inside.push(tail[closeBlock].slice(0, closeAt));
+			prose.push(...afterClose);
+		}
+	}
+	const clean = (list) => list.map((text) => stripTags(text, names).trim()).filter(Boolean);
+	const summary = clean(thinking).join("\n\n");
+	const lead = clean(pre).join("\n\n");
+	const interior = clean(inside).join("\n\n");
+	// A piece that an earlier piece already contains is dropped, ignoring any truncation note `forge`
+	// appended when cutting the same thinking bytes to `maxChars`, and replacing an earlier piece when a
+	// later one already opens with it as a full line.
 	const pieces = [];
-	for (const text of [...thinking, ...fenced]) {
-		const piece = stripTags(text, names).trim();
+	for (const piece of [summary, lead, interior]) {
 		if (!piece) continue;
-		if (pieces.some((seen) => seen.includes(piece))) continue;
+		const core = piece.endsWith(TRUNCATED) ? piece.slice(0, -TRUNCATED.length) : piece;
+		if (pieces.some((seen) => seen.includes(core))) continue;
+		for (let i = pieces.length - 1; i >= 0; i--) {
+			const prev = pieces[i];
+			if ((prev.endsWith(TRUNCATED) && piece.includes(prev.slice(0, -TRUNCATED.length))) || piece.startsWith(`${prev}\n`)) {
+				pieces.splice(i, 1);
+			}
+		}
 		pieces.push(piece);
 	}
-	const before = pieces;
-	// A marker is not a reply. `beat` appends it inside the last text block, which on a turn that said
-	// nothing else is the block this writer just rebuilt, and reading it back as a reply would add a
-	// paragraph break on the next request — one byte change on a turn already sent. It is dropped here and
-	// `beat` writes it again in the same place, so the block stays byte-identical.
-	const after = prose
-		.map((text) => stripTags(text, names).trim())
-		.filter((text) => text && !MARKER_ONLY.test(text));
-	return { reasoning: before.join("\n\n"), reply: after.join("\n\n") };
+	// Tag removal, trimming, or dropped blank blocks can expose trailing `[turn N]` suffixes at the end of
+	// `reply`; strip them in one backward scan so Pass 1 settles in linear time.
+	const reply = stripTrailingMarkers(clean(prose).join("\n\n"));
+	return { reasoning: pieces.join("\n\n"), reply };
 }
 
 /**
@@ -488,8 +543,8 @@ function turnWithoutReasoning(message, reply) {
  * One message with its reasoning written as text, or the message itself when it is left alone.
  *
  * The two forms differ only in where the cot ends up: the text form rebuilds the turn's own text block,
- * the toolcall form puts the reasoning in the argument of a call and leaves the turn with only its
- * calls, so the fence travels ahead of the message as a pair of its own.
+ * the toolcall form puts the reasoning in the argument of a call and leaves the turn with its reply and
+ * its calls, so the fence travels ahead of the message as a pair of its own.
  *
  * `index` salts the call id. Two turns carrying identical reasoning under one stamp would otherwise
  * produce one id twice, and a transcript may not hold two calls with one id.
@@ -534,13 +589,14 @@ export function transcribeHistory(messages, spec, names, maxChars = null) {
 		// same one `transcribeOne` makes: reading a turn the writer cannot read must not throw.
 		if (pair && message?.role === "assistant" && Array.isArray(message.content)) {
 			const { reasoning, reply } = splitTurn(message, spec, names);
-			// Nothing readable: the pair is already the whole trace, and the turn is left as it is.
+			// Nothing readable: the pair is already the whole trace (or belongs to a reasoning-only turn
+			// ahead of this one), and this message stays as it is.
 			if (!reasoning) {
 				out.push(message);
 				continue;
 			}
-			// The same bound the fence would get: a merge is the same cot, written into the pair instead.
-			const merged = mergedPair(pair, clampCot(reasoning, maxChars), names);
+			// The same bound the fence would get: merge into the pair's existing thought without discarding it.
+			const merged = mergedPair(pair, reasoning, names, maxChars);
 			if (merged) {
 				out[out.length - 2] = merged;
 				changed = true;
@@ -572,10 +628,25 @@ export function transcribeHistory(messages, spec, names, maxChars = null) {
  * close the fence early. Nothing else about the pair changes: not its id, not its stamp, not its
  * result message.
  */
-function mergedPair(pair, cot, names) {
-	const call = pair.content.find((block) => block?.type === "toolCall");
+function mergedPair(pair, reasoning, names, maxChars) {
+	const call = pair.content.find((block) => isCotCall(block, names));
 	if (!call || typeof call.arguments?.thought !== "string") return null;
-	const clean = stripTags(cot, names).trim();
-	if (!clean || clean === stripTags(call.arguments.thought, names).trim()) return null;
-	return { ...pair, content: [{ ...call, arguments: { ...call.arguments, thought: clean } }] };
+	const existing = stripTags(call.arguments.thought, names).trim();
+	const incoming = stripTags(reasoning, names).trim();
+	const pieces = [];
+	for (const piece of [existing, incoming]) {
+		if (!piece) continue;
+		const core = piece.endsWith(TRUNCATED) ? piece.slice(0, -TRUNCATED.length) : piece;
+		if (pieces.some((seen) => seen.includes(core))) continue;
+		for (let i = pieces.length - 1; i >= 0; i--) {
+			if (pieces[i].endsWith(TRUNCATED) && piece.includes(pieces[i].slice(0, -TRUNCATED.length))) pieces.splice(i, 1);
+		}
+		pieces.push(piece);
+	}
+	const cot = clampCot(pieces.join("\n\n"), maxChars);
+	if (!cot || cot === call.arguments.thought) return null;
+	return {
+		...pair,
+		content: pair.content.map((block) => (block === call ? { ...call, arguments: { ...call.arguments, thought: cot } } : block)),
+	};
 }

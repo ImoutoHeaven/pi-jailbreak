@@ -985,6 +985,22 @@ console.log("ok turns messages");
 		// ...and text after it is the reply, in block order.
 		const after = live([{ type: "text", text: bare("cot") }, { type: "text", text: "reply one" }, { type: "text", text: "reply two" }]);
 		assert.equal(transcribeOne(after, SPEC_TEXT, NAMES).content[0].text, bare("cot") + "\n\nreply one\n\nreply two", "and prose behind it is the reply");
+
+		// A fence opened in one text block and closed in a later one keeps every continuation block inside
+		// the reasoning and puts only what follows the closing tag into the reply.
+		const across = live([{ type: "text", text: "<" + "think>先分析A" }, { type: "text", text: "继续分析B</" + "think>最终回答C" }], "stop");
+		assert.equal(transcribeOne(across, SPEC_TEXT, NAMES).content[0].text, bare("先分析A\n\n继续分析B") + "\n\n最终回答C", "a fence across two blocks keeps its continuation inside");
+		const acrossThree = live([{ type: "text", text: "<" + "think>part 1" }, { type: "text", text: "part 2" }, { type: "text", text: "part 3</" + "think>final reply" }], "stop");
+		assert.equal(transcribeOne(acrossThree, SPEC_TEXT, NAMES).content[0].text, bare("part 1\n\npart 2\n\npart 3") + "\n\nfinal reply", "middle blocks stay inside the open fence");
+		const unclosedAcross = live([{ type: "text", text: "<" + "think>part 1" }, { type: "text", text: "part 2" }], "stop");
+		assert.equal(transcribeOne(unclosedAcross, SPEC_TEXT, NAMES).content[0].text, bare("part 1\n\npart 2"), "an unclosed multi-block fence runs to the end of the turn");
+		const leakedAcross = live([{ type: "text", text: "<" + "think>part 1</" + "think>still cot" }, { type: "text", text: "part 2</" + "think>reply" }], "stop");
+		assert.equal(transcribeOne(leakedAcross, SPEC_TEXT, NAMES).content[0].text, bare("part 1still cot\n\npart 2") + "\n\nreply", "the last closing tag across blocks ends the fence");
+		const subAcross = live([{ type: "text", text: "<" + "think>foobar" }, { type: "text", text: "bar</" + "think>reply" }], "stop");
+		assert.equal(transcribeOne(subAcross, SPEC_TEXT, NAMES).content[0].text, bare("foobar\n\nbar") + "\n\nreply", "a continuation that is a substring of an earlier block is not dropped");
+		const acrossTool = transcribeOne(across, SPEC_TOOL, NAMES);
+		assert.equal(acrossTool[0].content[0].arguments.thought, "先分析A\n\n继续分析B", "the toolcall form reads a multi-block fence the same way");
+		assert.equal(acrossTool[2].content[0].text, "最终回答C", "and keeps only the reply on the turn");
 	}
 
 	// The rule that a reply mentioning the tag is not special: a fence is recognised anywhere, and the
@@ -1078,7 +1094,7 @@ console.log("ok turns messages");
 		// Now the same turn arrives again from the wire, carrying reasoning the pair has not seen.
 		const later = [{ ...served, content: [thinkBlock("the newer trace"), callBlock("t1", "exec")] }];
 		const merged = transcribeHistory([first[0], first[1], later[0]], SPEC_TOOL, NAMES);
-		assert.equal(merged[0].content[0].arguments.thought, "the newer trace", "the reasoning goes into the pair");
+		assert.equal(merged[0].content[0].arguments.thought, "late summary\n\nthe newer trace", "the newer reasoning is merged into the pair without discarding what it held");
 		assert.equal(merged[0].content[0].id, first[0].content[0].id, "and the id the transcript holds is kept");
 		assert.equal(merged[2].content.some((b) => b.type === "text"), false, "the turn carries no second fence");
 		const settled = transcribeHistory(merged, SPEC_TOOL, NAMES);
@@ -1168,7 +1184,7 @@ console.log("ok turns messages");
 		const pair = transcribeOne(live([thinkBlock("old")], "stop"), SPEC_TOOL, NAMES);
 		const fenced = live([{ type: "text", text: bare("fresh reasoning") }, callBlock("c1", "exec")]);
 		const merged = transcribeHistory([...pair, fenced], SPEC_TOOL, NAMES);
-		assert.equal(merged[0].content[0].arguments.thought, "fresh reasoning", "the pair takes the newer reasoning");
+		assert.equal(merged[0].content[0].arguments.thought, "old\n\nfresh reasoning", "the pair merges the newer reasoning without losing its existing thought");
 		assert.equal(merged[0].content[0].id, pair[0].content[0].id, "and keeps its id");
 		assert.equal(merged[2].content.some((b) => b.type === "text"), false, "the turn carries no fence of its own");
 		assert.deepEqual(transcribeHistory(merged, SPEC_TOOL, NAMES), merged, "and that is stable");
@@ -1197,6 +1213,118 @@ console.log("ok turns messages");
 			const once = transcribeOne(turn, SPEC_TEXT, NAMES, budget);
 			assert.deepEqual(transcribeOne(once, SPEC_TEXT, NAMES, budget), once, `a surrogate cut is stable at maxChars ${budget}`);
 		}
+	}
+
+	// `stripTags` stays linear when an unmatched `<` precedes a long run of `>` characters, and clears
+	// nested or reassembled tags in the same single scan.
+	{
+		for (const hostile of ["<<" + "think>think>", "</" + "think</" + "think>>", "<abc<th<" + "think>ink>"]) {
+			const cleaned = stripTags(hostile, ["think", "note"]);
+			assert.equal(/<\/?think>/i.test(cleaned), false, `no tag survives in ${hostile}`);
+			assert.equal(stripTags(cleaned, ["think", "note"]), cleaned, `fixed point on ${hostile}`);
+		}
+		assert.equal(stripTags("<abc<th<" + "think>ink>", ["think"]), "<abc", "an outer partial tag reassembled by an inner strip is removed too");
+		const long = "<" + "x>".repeat(32000) + "<" + "think>drop</" + "think>keep";
+		const start = performance.now();
+		const stripped = stripTags(long, ["think", "note"]);
+		const elapsed = performance.now() - start;
+		assert.equal(stripped, "<" + "x>".repeat(32000) + "dropkeep", "unmatched brackets stay untouched and real tags still go");
+		assert.ok(elapsed < 250, `stripTags on 64k unmatched brackets stays linear (${elapsed.toFixed(1)}ms)`);
+	}
+
+	// Standalone pairs from reasoning-only turns leave following redacted or empty-fence turns intact,
+	// non-string `thought` arguments are ignored, unclosed openers after a closed fence stay inside the
+	// reasoning, pre-fence cross-block substrings survive, and `beat` markers inside unclosed empty fences
+	// never promote into reasoning.
+	{
+		const bareOnly = live([thinkBlock("cot 1")], "stop");
+		const redacted = live([{ type: "thinking", thinking: "[Reasoning redacted]", thinkingSignature: "s2", redacted: true }], "stop");
+		const r1 = transcribeHistory([bareOnly, redacted], SPEC_TOOL, ["think", "note"]);
+		assert.equal(r1.length, 3, "standalone pair plus following redacted turn");
+		assert.equal(transcribeHistory(r1, SPEC_TOOL, ["think", "note"]), r1, "second pass keeps the redacted turn and array identity");
+
+		const emptyPinned = live([{ type: "text", text: bare("") }, { type: "thinking", thinking: "", thinkingSignature: "cred" }, callBlock("t1", "exec")]);
+		const e1 = transcribeHistory([bareOnly, emptyPinned], SPEC_TOOL, ["think", "note"]);
+		assert.equal(transcribeHistory(e1, SPEC_TOOL, ["think", "note"]), e1, "second pass keeps the pinned empty-fence credential intact");
+
+		const noteTurn = live([{ type: "text", text: "<note>\ncot 2\n</note>\n\nreply 2" }], "stop");
+		const s1 = transcribeHistory([bareOnly, noteTurn], SPEC_TOOL, ["think", "note"]);
+		const s2 = transcribeHistory(s1, { form: "toolcall", name: "note" }, ["think", "note"]);
+		assert.equal(s2[0].content[0].arguments.thought, "cot 1\n\ncot 2", "switching cot names preserves the earlier pair's thought");
+		assert.equal(transcribeHistory(s2, { form: "toolcall", name: "note" }, ["think", "note"]), s2, "and settles to identity");
+
+		const preSub = live([{ type: "text", text: "foobar" }, { type: "text", text: "bar<" + "think>cot</" + "think>reply" }], "stop");
+		assert.equal(transcribeOne(preSub, SPEC_TEXT, NAMES).content[0].text, bare("foobar\n\nbar\n\ncot") + "\n\nreply", "pre-fence cross-block substring is preserved");
+
+		const closedThenUnclosed = live([{ type: "text", text: "<" + "think>part 1</" + "think>" }, { type: "text", text: "<" + "think>part 2 unclosed" }], "stop");
+		assert.equal(transcribeOne(closedThenUnclosed, SPEC_TEXT, NAMES).content[0].text, bare("part 1\n\npart 2 unclosed"), "an unclosed opener after a closed fence stays inside the reasoning");
+
+		const halfEmpty = [
+			{ role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 },
+			live([{ type: "text", text: "<" + "think>" }, { type: "thinking", thinking: "", thinkingSignature: "cred" }, callBlock("t1", "exec")]),
+		];
+		for (const spec of [SPEC_TEXT, SPEC_TOOL]) {
+			const p1 = beatHistory(transcribeHistory(halfEmpty, spec, NAMES));
+			const p2 = beatHistory(transcribeHistory(p1, spec, NAMES));
+			assert.deepEqual(p2, p1, `unclosed empty fence + beat is stable in ${spec.form} mode`);
+		}
+
+		const pair = transcribeOne(live([thinkBlock("stored")], "stop"), SPEC_TOOL, NAMES);
+		const badPair = [
+			{ ...pair[0], content: [{ type: "toolCall", id: "cot_bad", name: "think", arguments: { thought: 123 } }] },
+			pair[1],
+			live([thinkBlock("real reasoning"), callBlock("c2", "exec")]),
+		];
+		const preserved = transcribeHistory(badPair, SPEC_TOOL, NAMES);
+		assert.equal(preserved.length, 5, "a non-string thought is not treated as a pair, so the turn gets its own pair");
+		assert.equal(preserved[2].content[0].arguments.thought, "real reasoning", "and the turn's reasoning survives");
+
+		// A thinking block whose text happens to look like `[turn N]` is real reasoning, not a `beat` marker.
+		const markerInThink = live([thinkBlock("[turn 0]"), callBlock("c3", "exec")]);
+		assert.equal(transcribeOne(markerInThink, SPEC_TEXT, NAMES).content[0].text, bare("[turn 0]"), "marker-shaped thinking text is promoted");
+
+		// Trailing newline after `[turn 0]` inside an unclosed fence agrees between `transcribe` and `beat`.
+		const trailingMarker = [
+			{ role: "user", content: [{ type: "text", text: "q" }], timestamp: 0 },
+			live([{ type: "text", text: "<" + "think>\n[turn 0]\n" }, { type: "thinking", thinking: "", thinkingSignature: "cred" }, callBlock("t1", "exec")]),
+		];
+		for (const spec of [SPEC_TEXT, SPEC_TOOL]) {
+			const m1 = beatHistory(transcribeHistory(trailingMarker, spec, NAMES));
+			const m2 = beatHistory(transcribeHistory(m1, spec, NAMES));
+			assert.deepEqual(m2, m1, `trailing newline after marker-like text settles on pass 1 in ${spec.form} mode`);
+		}
+
+		// `maxChars` still cuts merged reasoning when a later segment already ends with the truncation note.
+		const preTrunc = live([thinkBlock("x".repeat(500)), { type: "text", text: "<" + "think>\ny\n[... reasoning truncated]\n</" + "think>\n\nreply" }], "stop");
+		const clampedText = transcribeOne(preTrunc, SPEC_TEXT, NAMES, 50);
+		assert.ok(clampedText.content[0].text.length < 120, "maxChars cuts long earlier reasoning even when a later piece ends with TRUNCATED");
+		assert.deepEqual(transcribeOne(clampedText, SPEC_TEXT, NAMES, 50), clampedText, "and remains a fixed point");
+		const preTruncTool = transcribeHistory([...pair, live([{ type: "thinking", thinking: "x".repeat(500), thinkingSignature: "s" }, { type: "text", text: "<" + "think>\ny\n[... reasoning truncated]\n</" + "think>" }, callBlock("c4", "exec")])], SPEC_TOOL, NAMES, 50);
+		assert.ok(preTruncTool[0].content[0].arguments.thought.length < 100, "mergedPair honours maxChars when incoming ends with TRUNCATED");
+
+		// Trailing `[turn N]` exposed only after tag stripping, trimming, or dropping blank blocks still settles
+		// on Pass 1, preserving fixed-point reference identity and `beat` byte stability.
+		for (const msg of [
+			live([thinkBlock("cot"), { type: "text", text: "hello\n[turn 0]\n" }], "stop"),
+			live([thinkBlock("cot"), { type: "text", text: "[turn 0]</note>" }], "stop"),
+			live([thinkBlock("cot"), { type: "text", text: "hello\n[turn 0]" }, { type: "text", text: "   " }], "stop"),
+			live([thinkBlock("cot"), { type: "text", text: "hello\n[turn 0]\n[turn 1]" }], "stop"),
+		]) {
+			const once = transcribeOne(msg, SPEC_TEXT, ["think", "note"]);
+			assert.equal(transcribeOne(once, SPEC_TEXT, ["think", "note"]), once, "exposed trailing marker settles on Pass 1");
+			const p1 = beatHistory(transcribeHistory([msg], SPEC_TEXT, ["think", "note"]));
+			const p2 = beatHistory(transcribeHistory(p1, SPEC_TEXT, ["think", "note"]));
+			assert.deepEqual(p2, p1, "and stays byte-stable with beat");
+		}
+		const stacked = live([thinkBlock("cot"), { type: "text", text: "hello" + "\n[turn 0]".repeat(32000) }], "stop");
+		const nearMiss = live([thinkBlock("cot"), { type: "text", text: "hello" + "\n[turn 0]".repeat(32000) + "x" }], "stop");
+		const t0 = performance.now();
+		const stackedOut = transcribeOne(stacked, SPEC_TEXT, NAMES);
+		const nearMissOut = transcribeOne(nearMiss, SPEC_TEXT, NAMES);
+		const markerElapsed = performance.now() - t0;
+		assert.equal(stackedOut.content[0].text, bare("cot") + "\n\nhello", "32k stacked trailing markers strip cleanly");
+		assert.ok(nearMissOut.content[0].text.endsWith("x"), "near-miss trailing markers stay intact");
+		assert.ok(markerElapsed < 250, `trailing marker strip stays linear on 32k markers (${markerElapsed.toFixed(1)}ms)`);
 	}
 	console.log("ok transcribe");
 }
@@ -1334,6 +1462,29 @@ console.log("ok turns messages");
 		assert.deepEqual(forgeThen, toolThen, "the toolcall form converges too: one pair, not two");
 		assert.equal(forgeThen.filter((m) => m.role === "assistant").length, 2, "a pair and the turn, nothing more");
 		assert.equal(forgeThen.some((m) => (m.content || []).some((b) => b.type === "thinking" && b.thinkingSignature)), false, "and no signature left any way round");
+
+		const multiThink = {
+			...foreign2,
+			content: [
+				{ type: "thinking", thinking: "<think>\ncot one\n</think>", thinkingSignature: "s1" },
+				{ type: "thinking", thinking: "cot two", thinkingSignature: "s2" },
+				{ type: "toolCall", id: "t3", name: "exec", arguments: {} },
+			],
+		};
+		for (const spec of [textSpec, toolSpec]) {
+			assert.deepEqual(
+				transcribeHistory(forgeHistory([multiThink], B, spec, null, ["think"]), spec, ["think"]),
+				forgeHistory(transcribeHistory([multiThink], spec, ["think"]), B, spec, null, ["think"]),
+				`multi-block thinking with tags converges across writer orders in ${spec.form} mode`,
+			);
+		}
+		assert.deepEqual(
+			transcribeHistory(forgeHistory([multiThink], B, textSpec, 5, ["think"]), textSpec, ["think"]),
+			forgeHistory(transcribeHistory([multiThink], textSpec, ["think"]), B, textSpec, 5, ["think"]),
+			"bounded forge + transcribe converges to the full trace in text mode",
+		);
+		const boundedTool = transcribeHistory(forgeHistory([multiThink], B, toolSpec, 5, ["think"]), toolSpec, ["think"]);
+		assert.equal(boundedTool[0].content[0].arguments.thought, "cot one\n\ncot two", "bounded forge + transcribe keeps the full trace once in toolcall mode");
 	}
 }
 
@@ -3652,6 +3803,37 @@ console.log("ok gate");
 	const block = readme.split("```json\n")[1]?.split("```")[0];
 	assert.ok(block, "README carries the example as a json block");
 	assert.deepEqual(JSON.parse(block), example, "the README block and the example file agree");
+	// Every fenced block in README opens and closes cleanly, and every json/yaml example parses.
+	let inFence = false;
+	let fenceLang = "";
+	let fenceBuf = [];
+	let yamlBlocks = 0;
+	for (const line of readme.split("\n")) {
+		if (!line.startsWith("```")) {
+			if (inFence) fenceBuf.push(line);
+			continue;
+		}
+		const tag = line.slice(3).trim();
+		if (!inFence) {
+			inFence = true;
+			fenceLang = tag;
+			fenceBuf = [];
+			continue;
+		}
+		assert.equal(tag, "", `a closing fence in README carries no language tag (saw \`\`\`${tag} inside \`\`\`${fenceLang})`);
+		const body = fenceBuf.join("\n");
+		if (fenceLang === "json") JSON.parse(body);
+		if (fenceLang === "yaml") {
+			yamlBlocks++;
+			const turnsParsed = parseTurns(body);
+			assert.equal(turnsParsed.error, undefined, `README yaml block must parse as a turns file: ${turnsParsed.error}`);
+		}
+		inFence = false;
+		fenceLang = "";
+	}
+	assert.equal(inFence, false, "every fenced code block in README is closed");
+	assert.equal(yamlBlocks, 1, "README carries one valid turns yaml example");
+	assert.equal((readme.match(/^## The fabricated conversation$/gm) || []).length, 1, "section heading appears once");
 	assert.ok(readme.includes("Leviathan \u{1F3AD}"), "the footer's glyphs are documented");
 }
 console.log("ok example config");
