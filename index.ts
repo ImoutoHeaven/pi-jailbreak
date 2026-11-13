@@ -5,8 +5,9 @@
  * and withholds pi's stock identity sentence, `gate` declares `ask_authorize_gate`, `turns` splices a
  * fabricated conversation ahead of the first non-system message, `forge` refills the reasoning pi
  * drops for a turn another model wrote, `cot` says how reasoning is written (`text:<tag>` or
- * `toolcall:<name>`), `transcribe` promotes turns into unsigned plaintext fences (`true` merges
- * summaries, `"strict"` keeps only model-written fences), and `beat` stamps visible assistant replies
+ * `toolcall:<name>`), `transcribe` promotes turns into unsigned plaintext fences (`true` merges all
+ * readable `thinking`, `"strict"` keeps native plaintext `thinking` and inline fences while dropping
+ * encrypted summaries), and `beat` stamps visible assistant replies
  * with their turn index.
  *
  * Every slot resolves independently down session -> first matching rule -> the file's `default` ->
@@ -847,23 +848,26 @@ export default function leviathan(pi: ExtensionAPI) {
 		}
 
 		const routed = ctx?.model?.api === VIRTUAL_MODEL_API;
+		const liveModel =
+			hasModel(ctx) && !routed
+				? { provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id }
+				: null;
 		const transcribeMode: "merge" | "strict" | null =
 			current.transcribe === "strict"
 				? "strict"
 				: current.transcribe === true || (routed && current.forge)
 					? "merge"
 					: null;
-		const promoted = transcribeMode ? transcribeHistory(work, effectiveCot, current.cotNames, transcribeMode) : work;
-		const forged =
-			!current.forge || !hasModel(ctx) || routed || transcribeMode !== null
-				? promoted
-				: forgeHistory(
-						promoted,
-						{ provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id },
-						effectiveCot,
-						current.cotNames,
-					);
-		const marked = current.beat ? beatHistory(forged) : forged;
+		const rewritten = transcribeMode
+			? transcribeHistory(work, effectiveCot, current.cotNames, {
+					mode: transcribeMode,
+					live: liveModel,
+					forge: current.forge,
+				})
+			: current.forge && liveModel
+				? forgeHistory(work, liveModel, effectiveCot, current.cotNames)
+				: work;
+		const marked = current.beat ? beatHistory(rewritten) : rewritten;
 		let next = project(marked, Boolean(current.text) && !forced);
 		if (next === undefined && marked !== work) next = marked;
 

@@ -12,8 +12,8 @@
  * `forge` copies that exact predicate and promotes readable reasoning on foreign turns into the
  * configured `cot` fence while preserving the turn's original `(provider, api, model)` stamp and
  * `thinking` blocks so Pi strips foreign blocks and signatures downstream. When a foreign turn
- * carries both a native `thinking` summary and an inline fence or live cot tool call, `forge` merges
- * them into a single trace so neither the provider summary nor the model's notes are lost.
+ * carries both native `thinking` and an inline fence or live cot tool call, `forge` merges them
+ * into a single trace so neither native reasoning nor inline notes are lost.
  */
 
 import {
@@ -25,8 +25,10 @@ import {
 	mergeCotPieces,
 	ownCot,
 	pairId,
+	splitThinking,
 	splitTurn,
 	stripTags,
+	unextractedReply,
 } from "./cot.js";
 
 export { ownCot };
@@ -45,9 +47,12 @@ export function forgeOne(message, live, spec, index = 0, names = [spec?.name]) {
 	if (isSameModel(message, live)) return null;
 	if (message.content.some((b) => isCotCall(b, names))) return null;
 
-	const { summary, interior, reply, hadFence } = splitTurn(message, names);
+	const alreadyExtracted = message.forgedCot === true;
+	const { thinking, interior, reply, hadFence } = alreadyExtracted
+		? { ...splitThinking(message, names), interior: "", reply: unextractedReply(message), hadFence: false }
+		: splitTurn(message, names);
 	// Without readable thinking blocks that Pi would drop on a model switch, forge has nothing to refill.
-	if (!summary) return null;
+	if (!thinking) return null;
 	const thinkingBlocks = message.content.filter((b) => b?.type === "thinking");
 	const otherBlocks = message.content.filter((b) => b?.type !== "thinking" && b?.type !== "text");
 
@@ -56,8 +61,7 @@ export function forgeOne(message, live, spec, index = 0, names = [spec?.name]) {
 		if (liveIdx >= 0) {
 			const liveCall = message.content[liveIdx];
 			const liveThought = stripTags(liveCall.arguments.thought, names).trim();
-			if (summary && mergeCotPieces([summary, liveThought]) === liveThought) return null;
-			const merged = mergeCotPieces([summary, interior, liveThought]);
+			const merged = mergeCotPieces([thinking, interior, liveThought]);
 			if (!hadFence && merged === liveCall.arguments.thought) return null;
 			const updatedOthers = otherBlocks.map((b) =>
 				b === liveCall ? { ...liveCall, arguments: { ...liveCall.arguments, thought: merged } } : b,
@@ -67,28 +71,31 @@ export function forgeOne(message, live, spec, index = 0, names = [spec?.name]) {
 				...(hadFence ? (reply ? [{ type: "text", text: reply }] : []) : message.content.filter((b) => b?.type === "text")),
 				...updatedOthers,
 			];
-			return [{ ...message, content: nextContent }];
+			return [{ ...message, content: nextContent, forgedCot: true }];
 		}
-		const cot = mergeCotPieces([summary, interior]);
+		const cot = mergeCotPieces([thinking, interior]);
 		if (!cot || (hadFence && cot === interior)) return null;
-		const pair = cotPair(cot, spec.name, pairId(`${index}\u0000${cot}`, message), message);
 		const visibleTexts = hadFence
 			? reply
 				? [{ type: "text", text: reply }]
 				: []
 			: message.content.filter((b) => b?.type === "text" && String(b.text ?? "").trim() !== "");
-		if (visibleTexts.length === 0 && otherBlocks.length === 0) return pair;
+		const standalone = visibleTexts.length === 0 && otherBlocks.length === 0;
+		const pair = cotPair(cot, spec.name, pairId(`${index}\u0000${cot}`, message, standalone), message);
+		if (standalone) return pair;
 		if (!hadFence) return [...pair, message];
-		return [...pair, { ...message, content: [...thinkingBlocks, ...visibleTexts, ...otherBlocks] }];
+		return [...pair, { ...message, content: [...thinkingBlocks, ...visibleTexts, ...otherBlocks], forgedCot: true }];
 	}
 
-	const cot = mergeCotPieces([summary, interior]);
+	const cot = mergeCotPieces([thinking, interior]);
 	if (!cot || (hadFence && cot === interior)) return null;
 	const fencedText = reply ? `${cotText(cot, spec.name)}\n\n${reply}` : cotText(cot, spec.name);
 
 	const firstText = message.content.find((b) => b?.type === "text");
 	const textBlock = firstText ? { ...firstText, text: fencedText } : { type: "text", text: fencedText };
-	return [{ ...message, content: [...thinkingBlocks, textBlock, ...otherBlocks] }];
+	const nextMsg = { ...message, content: [...thinkingBlocks, textBlock, ...otherBlocks] };
+	delete nextMsg.forgedCot;
+	return [nextMsg];
 }
 
 /**

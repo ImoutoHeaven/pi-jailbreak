@@ -1,53 +1,50 @@
 /**
- * The cot fence: one spec, two forms, and the pair a toolcall form needs.
+ * The two shapes a chain-of-thought can take in a message list, and the two message-list writers
+ * that share them:
  *
- * A cot is written into a request as either of two things, and the slot says which:
+ * - `text:<name>` writes `<name>\n...\n</name>` at the head of the assistant's first text block,
+ *   ahead of any reply text and inside the same block so the cot and the reply travel together.
+ * - `toolcall:<name>` writes a fabricated `assistant` message carrying one `toolCall` with
+ *   `{ thought }` followed by its matching `toolResult` ("OK"), ahead of the turn it belongs to.
+ *   When the turn already carries a live model-issued call to `<name>` with a string `thought`
+ *   argument, writers merge into that call in place rather than prepending a second pair.
  *
- *     text:<tag>        the reasoning, fenced in a tag, at the head of the assistant's first text
- *                       block: `<tag>\n...cot...\n</tag>\n\n<reply>`
- *     toolcall:<name>   the reasoning as the argument of a real tool call, answered by its result,
- *                       ahead of the assistant message it belongs to
- *
- * The text form changes one block's bytes. The toolcall form inserts two messages, because a
- * `toolCall` without a `toolResult` is not a shape a transcript may hold: pi's own
- * `transformMessages` answers such a call with `isError: true, "No result provided"`, so a half pair
+ * A fabricated tool call cannot live without its result: pi's `transformMessages` synthesizes an
+ * error result ("No result provided", `isError: true`) for every unanswered `toolCall`, which
  * would put a fabricated error into the history. `cotPair` therefore always returns both.
- *
- * Both forms are pure: the id comes from the cot's own bytes and the stamp it is written under, so
- * two calls with the same arguments produce identical messages and a grown conversation keeps every
- * already-sent position byte-identical.
  */
 
-const NUL = "\u0000";
-
-/** The reply a fabricated cot call gets. One short token, so the pair costs a few bytes and says
- * nothing a model could mistake for an answer. */
 export const COT_ACK = "OK";
 
-/** The id prefix `pairId` always writes. */
-export const PAIR_PREFIX = "cot_";
+const PAIR_PREFIX = "cot_";
+const STANDALONE_PAIR_PREFIX = "cot_s_";
+const NUL = "\u0000";
+const PLAINTEXT_REASONING_FIELDS = new Set(["reasoning_content", "reasoning", "reasoning_text"]);
 
-/** A text block that carries nothing but a turn marker, which `beat` writes. */
-export const MARKER_ONLY = /^\[turn \d+\]$/;
-
-/** The marker `beat` writes. One per block, at the very end, so stripping it is unambiguous. */
-export const BEAT_MARK = /\n?\[turn \d+\]$/;
-
-/** The zero usage record every fabricated message carries: the request pays for none of it. */
 export function zeroUsage() {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
 }
 
-/** A deterministic call id: the same cot under the same stamp always yields the same id, and the
- * result after it answers nothing else. */
-export function pairId(cot, stamp = {}) {
-	const text = `${stamp.provider ?? ""}/${stamp.api ?? ""}/${stamp.model ?? ""}\u0000${cot}`;
+/**
+ * Deterministic 32-bit FNV-1a id for a fabricated cot call. Same inputs give the same id so prompt
+ * caches hold across requests; `standalone` marks thought-only pairs (`cot_s_`) so adjacent
+ * assistant turns never merge into them.
+ */
+export function pairId(seed, stamp, standalone = false) {
+	const text = `${stamp?.provider ?? ""}${NUL}${stamp?.model ?? ""}${NUL}${stamp?.timestamp ?? 0}${NUL}${seed}`;
 	let hash = 0x811c9dc5;
 	for (let i = 0; i < text.length; i++) {
 		hash ^= text.charCodeAt(i);
 		hash = Math.imul(hash, 0x01000193) >>> 0;
 	}
-	return `${PAIR_PREFIX}${hash.toString(36)}`;
+	return `${standalone ? STANDALONE_PAIR_PREFIX : PAIR_PREFIX}${hash.toString(36)}`;
 }
 
 /**
@@ -129,18 +126,41 @@ export function fenced(blocks, names) {
 	return false;
 }
 
-/** Whether a message is the fabricated cot call message this extension writes. */
-export function isCotPairMessage(message, names) {
-	if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
-	const blocks = message.content.filter((block) => !(block?.type === "text" && MARKER_ONLY.test(String(block.text ?? ""))));
-	if (blocks.length !== 1) return false;
+/** The single fabricated cot call inside `message`, or null when `message` is not a `cotPair` call. */
+function getCotPairCall(message, names) {
+	if (message?.role !== "assistant" || !Array.isArray(message.content)) return null;
+	const blocks = message.content.filter(
+		(block) => !(block?.type === "text" && stripTrailingMarkers(String(block.text ?? "")).trim() === ""),
+	);
+	if (blocks.length !== 1) return null;
 	const block = blocks[0];
-	return isCotCall(block, names) && typeof block.arguments?.thought === "string";
+	return isCotCall(block, names) && typeof block.arguments?.thought === "string" ? block : null;
 }
 
-/** Whether the message at `index` is preceded by a fabricated cot pair that answers it. */
+/** Whether a message is the fabricated cot call message this extension writes. */
+export function isCotPairMessage(message, names) {
+	return getCotPairCall(message, names) !== null;
+}
+
+/**
+ * Whether the assistant message at `index` is preceded by a fabricated cot pair that belongs to it.
+ * Standalone thought-only pairs (`cot_s_`), pairs from another model stamp, unreadable non-array
+ * contents, and consecutive `cotPair` messages are excluded so adjacent turns never fuse.
+ */
 export function afterCotPair(messages, index, names) {
-	return index >= 2 && messages[index - 1]?.role === "toolResult" && isCotPairMessage(messages[index - 2], names);
+	if (index < 2) return false;
+	const message = messages[index];
+	if (message?.role !== "assistant" || !Array.isArray(message.content) || isCotPairMessage(message, names)) return false;
+	const pairMsg = messages[index - 2];
+	const ackMsg = messages[index - 1];
+	const pairCall = getCotPairCall(pairMsg, names);
+	if (!pairCall || String(pairCall.id ?? "").startsWith(STANDALONE_PAIR_PREFIX)) return false;
+	if (ackMsg?.role !== "toolResult" || (ackMsg.toolCallId !== undefined && ackMsg.toolCallId !== pairCall.id)) return false;
+	return (
+		pairMsg.provider === message.provider &&
+		pairMsg.api === message.api &&
+		(pairMsg.model === "" || pairMsg.model === message.model)
+	);
 }
 
 /** Readable thinking text carried in `thinking` blocks, skipping redacted or empty entries. */
@@ -158,30 +178,38 @@ export function ownCot(message) {
 
 /** `text` with every trailing `[turn <digits>]` suffix and preceding whitespace removed in one backward scan. */
 export function stripTrailingMarkers(text) {
-	let end = text.length;
-	while (end >= 8 && text[end - 1] === "]") {
-		let p = end - 2;
+	let cur = text.length;
+	while (cur > 0 && /\s/.test(text[cur - 1])) cur--;
+	let matched = false;
+	while (cur >= 8 && text[cur - 1] === "]") {
+		let p = cur - 2;
 		while (p >= 0 && text[p] >= "0" && text[p] <= "9") p--;
-		if (p === end - 2 || p < 5 || text.slice(p - 5, p + 1) !== "[turn ") break;
-		end = p - 5;
-		while (end > 0 && /\s/.test(text[end - 1])) end--;
+		if (p === cur - 2 || p < 5 || text.slice(p - 5, p + 1) !== "[turn ") break;
+		matched = true;
+		cur = p - 5;
+		while (cur > 0 && /\s/.test(text[cur - 1])) cur--;
 	}
-	return end === text.length ? text : text.slice(0, end);
+	return matched ? text.slice(0, cur) : text;
 }
 
 /** A block's text with its turn marker, replacing any previous trailing marker idempotently. */
 export function beatText(text, turn) {
-	const rest = String(text ?? "").replace(BEAT_MARK, "");
+	const rest = stripTrailingMarkers(String(text ?? "")).trimEnd();
 	return rest ? `${rest}\n[turn ${turn}]` : `[turn ${turn}]`;
 }
 
 /**
- * Stamp `[turn <turn>]` onto the last existing text block of an assistant message.
+ * Stamp `[turn <turn>]` onto the last non-empty visible `text` block of an assistant message.
  *
  * Tool-only steps and fabricated `cotPair` call messages carry no text blocks and are left untouched:
  * inserting a synthetic text block ahead of `toolCall` breaks signed carrier adjacency when
  * `transcribe` is off, double-numbers `toolcall:` turns, and teaches models to speak bare markers
  * before silent tool calls.
+ *
+ * Existing `textSignature` fields are preserved intentionally when `transcribe` is off: providers
+ * store reasoning-item pairing ids or multi-turn encrypted thought tokens in `textSignature` rather
+ * than a byte hash over `text`, so deleting `textSignature` while native `thinking` blocks remain
+ * breaks multi-turn replay.
  */
 export function beatOne(message, turn) {
 	if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
@@ -189,7 +217,7 @@ export function beatOne(message, turn) {
 	for (let i = 0; i < message.content.length; i++) {
 		if (
 			message.content[i]?.type === "text" &&
-			String(message.content[i].text ?? "").replace(BEAT_MARK, "").trim() !== ""
+			stripTrailingMarkers(String(message.content[i].text ?? "")).trim() !== ""
 		) {
 			last = i;
 		}
@@ -292,9 +320,103 @@ export function mergeCotPieces(pieces) {
 	return out.join("\n\n");
 }
 
+/**
+ * Classify a `thinkingSignature` into `"empty"`, `"plaintext"` (unencrypted verbatim reasoning), or
+ * `"opaque"` (encrypted or signed reasoning/summary).
+ */
+function classifyThinkingSignature(sig) {
+	if (sig === undefined || sig === "") return "empty";
+	if (typeof sig !== "string") return "opaque";
+	if (PLAINTEXT_REASONING_FIELDS.has(sig)) return "plaintext";
+	if (!sig.startsWith("{") && !sig.startsWith("[")) return "opaque";
+	try {
+		const parsed = JSON.parse(sig);
+		if (Array.isArray(parsed)) {
+			return parsed.length > 0 &&
+				parsed.every((d) => d && typeof d === "object" && d.type === "reasoning.text" && !d.signature)
+				? "plaintext"
+				: "opaque";
+		}
+		if (parsed && typeof parsed === "object") {
+			const hasSummary = Array.isArray(parsed.summary) && parsed.summary.length > 0;
+			const hasContent = Array.isArray(parsed.content) && parsed.content.length > 0;
+			return !parsed.encrypted_content && !hasSummary && hasContent ? "plaintext" : "opaque";
+		}
+	} catch {
+		return "opaque";
+	}
+	return "opaque";
+}
+
+/**
+ * Whether `message` carries any opaque/encrypted reasoning signature or redacted block across any
+ * of its `thinking`, `text`, or `toolCall` blocks (including trailing empty signed carriers).
+ */
+function hasOpaqueTurnSignature(message) {
+	for (const block of message?.content ?? []) {
+		if (block?.type === "thinking") {
+			if (block.redacted || classifyThinkingSignature(block.thinkingSignature) === "opaque") return true;
+			continue;
+		}
+		if (block?.type === "toolCall" && block.thoughtSignature) return true;
+		if (block?.type === "text" && typeof block.textSignature === "string" && block.textSignature.length > 0) {
+			if (!block.textSignature.startsWith("{")) return true;
+			try {
+				const parsed = JSON.parse(block.textSignature);
+				if (!parsed || typeof parsed !== "object" || typeof parsed.id !== "string") return true;
+			} catch {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+function isPlaintextThinkingBlock(block, opaqueTurn) {
+	const kind = classifyThinkingSignature(block?.thinkingSignature);
+	return kind === "plaintext" || (kind === "empty" && !opaqueTurn);
+}
+
+/** Extract both all readable `thinking` text and native `plaintext` thinking text in block order. */
+export function splitThinking(message, names) {
+	const all = [];
+	const plain = [];
+	const opaqueTurn = hasOpaqueTurnSignature(message);
+	for (const block of message?.content ?? []) {
+		if (block?.type !== "thinking" || block.redacted) continue;
+		const text = String(block.thinking ?? "").trim();
+		if (!text || text === "[Reasoning redacted]") continue;
+		const cleaned = stripTags(text, names).trim();
+		if (!cleaned) continue;
+		all.push(cleaned);
+		if (isPlaintextThinkingBlock(block, opaqueTurn)) plain.push(cleaned);
+	}
+	return { thinking: mergeCotPieces(all), plaintext: mergeCotPieces(plain) };
+}
+
+/** Read visible reply text from `message` without parsing any leading `<tag>` as a fence. */
+export function unextractedReply(message) {
+	const texts = [];
+	for (const block of message?.content ?? []) {
+		if (block?.type === "text") texts.push(String(block.text ?? ""));
+	}
+	for (let i = texts.length - 1; i >= 0; i--) {
+		const stripped = stripTrailingMarkers(texts[i]);
+		if (stripped.trim() !== "") {
+			texts[i] = stripped;
+			break;
+		}
+		texts[i] = "";
+	}
+	const b0 = texts.findIndex((t) => t.trim() !== "");
+	if (b0 < 0) return "";
+	const rawReply = texts.slice(b0).join("\n\n").replace(/^(?:[ \t]*\r?\n)+/, "").trimEnd();
+	return stripTrailingMarkers(rawReply);
+}
+
 /** Match a configured opening fence tag at the very start of `text` (ignoring leading whitespace). */
 function matchLeadingOpenTag(text, names) {
-	const match = /^\s*<([A-Za-z][A-Za-z0-9_-]*)>/.exec(text);
+	const match = /^\s*<([A-Za-z_][A-Za-z0-9_-]*)>/.exec(text);
 	if (!match) return null;
 	const lowered = match[1].toLowerCase();
 	const known = (names ?? []).some((name) => String(name).toLowerCase() === lowered);
@@ -308,7 +430,7 @@ function trimAfterFence(text) {
 }
 
 /**
- * Parse an assistant message into `{ summary, interior, reply, hadFence }`.
+ * Parse an assistant message into `{ thinking, plaintext, interior, reply, hadFence }`.
  *
  * A text CoT fence is recognized only when the first non-whitespace text block opens with `<tag>`
  * for some tag in `names`. Balanced `<tag>` / `</tag>` pairs are tracked so code examples inside
@@ -317,38 +439,27 @@ function trimAfterFence(text) {
  * the text stays visible prose. `reply` is never passed through `stripTags`, keeping literal tag
  * examples in user-facing answers and code blocks intact.
  */
-function thinkingSummary(message, names) {
-	const thinking = [];
-	for (const block of message?.content ?? []) {
-		if (block?.type !== "thinking" || block.redacted) continue;
-		const text = String(block.thinking ?? "").trim();
-		if (!text || text === "[Reasoning redacted]") continue;
-		const cleaned = stripTags(text, names).trim();
-		if (cleaned) thinking.push(cleaned);
-	}
-	return mergeCotPieces(thinking);
-}
-
 export function splitTurn(message, names) {
-	const summary = thinkingSummary(message, names);
+	const { thinking, plaintext } = splitThinking(message, names);
 	const texts = [];
 	for (const block of message?.content ?? []) {
 		if (block?.type === "text") texts.push(String(block.text ?? ""));
 	}
 	for (let i = texts.length - 1; i >= 0; i--) {
-		if (texts[i].replace(BEAT_MARK, "").trim() !== "") {
-			texts[i] = texts[i].replace(BEAT_MARK, "");
+		const stripped = stripTrailingMarkers(texts[i]);
+		if (stripped.trim() !== "") {
+			texts[i] = stripped;
 			break;
 		}
 		texts[i] = "";
 	}
 	const b0 = texts.findIndex((t) => t.trim() !== "");
-	if (b0 < 0) return { summary, interior: "", reply: "", hadFence: false };
+	if (b0 < 0) return { thinking, plaintext, interior: "", reply: "", hadFence: false };
 
 	const lead = matchLeadingOpenTag(texts[b0], names);
 	if (!lead) {
 		const rawReply = texts.slice(b0).join("\n\n").replace(/^(?:[ \t]*\r?\n)+/, "").trimEnd();
-		return { summary, interior: "", reply: stripTrailingMarkers(rawReply), hadFence: false };
+		return { thinking, plaintext, interior: "", reply: stripTrailingMarkers(rawReply), hadFence: false };
 	}
 
 	const tail = [texts[b0].slice(lead.afterOpen), ...texts.slice(b0 + 1)];
@@ -374,10 +485,10 @@ export function splitTurn(message, names) {
 	if (closeBlock < 0) {
 		if (message.stopReason === "length") {
 			const interior = mergeCotPieces(tail.map((part) => stripTags(part, names)));
-			return { summary, interior, reply: "", hadFence: true };
+			return { thinking, plaintext, interior, reply: "", hadFence: true };
 		}
 		const rawReply = texts.slice(b0).join("\n\n").replace(/^(?:[ \t]*\r?\n)+/, "").trimEnd();
-		return { summary, interior: "", reply: stripTrailingMarkers(rawReply), hadFence: false };
+		return { thinking, plaintext, interior: "", reply: stripTrailingMarkers(rawReply), hadFence: false };
 	}
 
 	const insideParts = [...tail.slice(0, closeBlock), tail[closeBlock].slice(0, closeStart)];
@@ -386,7 +497,7 @@ export function splitTurn(message, names) {
 	const restAfter = tail.slice(closeBlock + 1);
 	const rawAfter = (closeTail ? [closeTail, ...restAfter] : restAfter).join("\n\n");
 	const reply = stripTrailingMarkers(trimAfterFence(rawAfter).trimEnd());
-	return { summary, interior, reply, hadFence: true };
+	return { thinking, plaintext, reply, interior, hadFence: true };
 }
 
 function sameBlocks(a, b) {
@@ -418,11 +529,13 @@ function scrubEnvelope(message, content) {
 	const cleanEnvelope =
 		message.model === "" &&
 		message.responseId === undefined &&
-		message.providerThinkingLevel === undefined;
+		message.providerThinkingLevel === undefined &&
+		message.forgedCot === undefined;
 	if (cleanEnvelope && sameBlocks(content, message.content)) return message;
 	const next = { ...message, model: "", content };
 	delete next.responseId;
 	delete next.providerThinkingLevel;
+	delete next.forgedCot;
 	return next;
 }
 
@@ -461,19 +574,30 @@ function scrubbedUnfencedContent(message, replaceIdx = -1, mergedThought = "") {
 	return out;
 }
 
-function resolveReasoning(summary, interior, mode) {
-	return mode === "strict" ? interior : mergeCotPieces([summary, interior]);
+function sameStamp(message, live) {
+	return message.provider === live.provider && message.api === live.api && message.model === live.id;
+}
+
+function resolveThinkingPart(thinking, plaintext, mode, useThinking) {
+	if (!useThinking) return "";
+	return mode === "strict" ? plaintext : thinking;
+}
+
+function resolveOptions(options) {
+	const mode = options?.mode === "strict" ? "strict" : "merge";
+	const live = options?.live?.provider && options?.live?.id ? options.live : null;
+	const forge = options?.forge ?? true;
+	return { mode, live, forge };
 }
 
 /**
- * Transcribe one assistant message in `"merge"` (`transcribe: true`) or `"strict"`
- * (`transcribe: "strict"`) mode.
+ * Transcribe one assistant message under `options` (`{ mode, live, forge }`).
  *
  * Returns either a single message, an array of replacement messages (`[]` when an empty/opaque-only
  * thinking turn had nothing left after stripping, or `[...pair, turn]` for `toolcall:`), or the
  * original `message` reference when already in canonical transcribed form.
  */
-export function transcribeOne(message, spec, names, index = 0, mode = "merge") {
+export function transcribeOne(message, spec, names, index = 0, options = {}) {
 	if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
 	if (isCotPairMessage(message, names)) {
 		const cleaned = message.content.map((b) => scrubOtherBlock(b));
@@ -485,37 +609,40 @@ export function transcribeOne(message, spec, names, index = 0, mode = "merge") {
 		return content.length === 0 ? [] : scrubEnvelope(message, content);
 	}
 
-	const { summary, interior, reply, hadFence } = splitTurn(message, names);
+	const { mode, live, forge } = resolveOptions(options);
+	const isForeign = Boolean(live && !sameStamp(message, live));
+	const useThinking = !isForeign || forge;
+	const alreadyExtracted = message.forgedCot === true;
+	const { thinking, plaintext, interior, reply, hadFence } = alreadyExtracted
+		? { ...splitThinking(message, names), interior: "", reply: unextractedReply(message), hadFence: false }
+		: splitTurn(message, names);
+	const thinkingPart = resolveThinkingPart(thinking, plaintext, mode, useThinking);
 
 	if (spec.form === "toolcall") {
 		const liveIdx = findLiveCotCall(message.content, names);
 		if (liveIdx >= 0) {
 			const liveCall = message.content[liveIdx];
 			const liveThought = stripTags(liveCall.arguments.thought, names).trim();
-			// Already merged by forge on an earlier step: strip thinking/signatures without re-parsing visible reply text.
-			if (summary && mergeCotPieces([summary, liveThought]) === liveThought) {
-				const content = scrubbedUnfencedContent(message);
-				return content.length === 0 ? [] : scrubEnvelope(message, content);
-			}
-			const merged = mergeCotPieces(mode === "strict" ? [interior, liveThought] : [summary, interior, liveThought]);
+			const merged = mergeCotPieces([thinkingPart, interior, liveThought]);
 			const content = hadFence
 				? [...(reply ? [scrubTextBlock(message.content[0], reply)] : []), ...scrubbedNonThinkingNonText(message, liveIdx, merged)]
 				: scrubbedUnfencedContent(message, liveIdx, merged);
 			return content.length === 0 ? [] : scrubEnvelope(message, content);
 		}
-		const cot = resolveReasoning(summary, interior, mode);
+		const cot = mergeCotPieces([thinkingPart, interior]);
 		const rest = hadFence
 			? [...(reply ? [scrubTextBlock(message.content[0], reply)] : []), ...scrubbedNonThinkingNonText(message)]
 			: scrubbedUnfencedContent(message);
 		if (!cot) {
 			return rest.length === 0 ? [] : scrubEnvelope(message, rest);
 		}
-		const id = pairId(`${index}${NUL}${cot}`, message);
+		const standalone = rest.length === 0;
+		const id = pairId(`${index}${NUL}${cot}`, message, standalone);
 		const pair = cotPair(cot, spec.name, id, { provider: message.provider, api: message.api, model: "" });
-		return rest.length === 0 ? pair : [...pair, scrubEnvelope(message, rest)];
+		return standalone ? pair : [...pair, scrubEnvelope(message, rest)];
 	}
 
-	const cot = resolveReasoning(summary, interior, mode);
+	const cot = mergeCotPieces([thinkingPart, interior]);
 	if (!cot) {
 		const content = hadFence
 			? [...(reply ? [scrubTextBlock(message.content[0], reply)] : []), ...scrubbedNonThinkingNonText(message)]
@@ -547,28 +674,42 @@ export function mergedPair(pair, reasoning, names, scrub = false) {
 }
 
 /**
- * Transcribe an entire message list under `mode` (`"merge"` or `"strict"`). Returns the input array
- * itself when nothing changed.
+ * Transcribe an entire message list under `options` (`{ mode, live, forge }`). Returns the input
+ * array itself when nothing changed.
  */
-export function transcribeHistory(messages, spec, names, mode = "merge") {
+export function transcribeHistory(messages, spec, names, options = {}) {
 	if (!Array.isArray(messages) || !spec) return messages;
+	const { mode, live, forge } = resolveOptions(options);
 	let changed = false;
 	const out = [];
 	for (let index = 0; index < messages.length; index++) {
 		const message = messages[index];
 		const pair = afterCotPair(messages, index, names) ? out[out.length - 2] : null;
 		if (pair && message?.role === "assistant" && Array.isArray(message.content)) {
-			// When already transcribed (model === "") or preceded by a forged pair (messages[index - 2].model !== ""),
-			// any leading <tag> left on message is literal user-facing prose rather than an unextracted fence.
-			const alreadyExtracted = message.model === "" || messages[index - 2]?.model !== "";
-			const { summary, interior, reply, hadFence } = alreadyExtracted
-				? { summary: thinkingSummary(message, names), interior: "", reply: "", hadFence: false }
+			const isForeign = Boolean(live && !sameStamp(message, live));
+			const useThinking = !isForeign || forge;
+			const alreadyExtracted = message.model === "" || message.forgedCot === true;
+			const { thinking, plaintext, interior, reply, hadFence } = alreadyExtracted
+				? { ...splitThinking(message, names), interior: "", reply: unextractedReply(message), hadFence: false }
 				: splitTurn(message, names);
-			const cot = resolveReasoning(summary, interior, mode);
+			const thinkingPart = resolveThinkingPart(thinking, plaintext, mode, useThinking);
+			const cot = mergeCotPieces([thinkingPart, interior]);
 			if (cot) {
 				const updatedPair = mergedPair(pair, cot, names, true);
 				if (updatedPair) {
 					out[out.length - 2] = updatedPair;
+					changed = true;
+				} else {
+					const scrubbedPair = scrubEnvelope(pair, pair.content.map((b) => scrubOtherBlock(b)));
+					if (scrubbedPair !== pair) {
+						out[out.length - 2] = scrubbedPair;
+						changed = true;
+					}
+				}
+			} else {
+				const scrubbedPair = scrubEnvelope(pair, pair.content.map((b) => scrubOtherBlock(b)));
+				if (scrubbedPair !== pair) {
+					out[out.length - 2] = scrubbedPair;
 					changed = true;
 				}
 			}
@@ -584,7 +725,7 @@ export function transcribeHistory(messages, spec, names, mode = "merge") {
 			out.push(doneTurn);
 			continue;
 		}
-		const done = transcribeOne(message, spec, names, index, mode);
+		const done = transcribeOne(message, spec, names, index, options);
 		if (done === message) {
 			out.push(message);
 			continue;

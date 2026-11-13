@@ -140,7 +140,7 @@ function plainSlot(value) {
 	return value === false || value === true ? { spec: value } : null;
 }
 
-/** The transcribe slot: off, full summary+fence merge (`true`), or fence-only (`"strict"`). */
+/** The transcribe slot: off, full readable merge (`true`), or summary-free plaintext+fence (`"strict"`). */
 function transcribeSlot(value) {
 	return TRANSCRIBE_MODES.includes(value) ? { spec: value } : null;
 }
@@ -399,7 +399,7 @@ const ON = new Set(["on", "true", "yes"]);
 
 /**
  * One assignment from the command, or the reason it is not one. `default` removes the slot, `off`
- * and `on` are the two switch values, `strict` sets fence-only transcription, and anything else is a
+ * and `on` are the two switch values, `strict` sets summary-free transcription, and anything else is a
  * path or a cot spec.
  */
 export function settingFromCommand(name, value) {

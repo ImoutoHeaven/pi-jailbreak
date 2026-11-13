@@ -61,9 +61,9 @@ the built-in record.
 | `persona` | `false`, `true`, or a path | Prepends text to the leading system message. `true` selects the shipped `prompt.md`; other relative paths resolve against the config file's directory |
 | `gate` | `false` or `true` | Activates `ask_authorize_gate` while enabled |
 | `turns` | `false`, `true`, or a path | Splices a YAML turn sequence ahead of the first non-system message. `true` selects the shipped `turn0.yml` |
-| `forge` | `false` or `true` | Refills readable reasoning on foreign turns Pi would drop |
+| `forge` | `false` or `true` | Controls whether `thinking` blocks on foreign turns (`!isSameModel`) are promoted across model switches |
 | `cot` | `text:<tag>` or `toolcall:<name>` | Selects how writers format chain-of-thought. `text:<think>` and `text:think` name the same tag |
-| `transcribe` | `false`, `true`, or `"strict"` | Rewrites turns into unsigned fences and removes all `thinking` blocks. `true` merges readable `thinking` summaries with inline fences; `"strict"` drops `thinking` summaries and keeps only model-written fences |
+| `transcribe` | `false`, `true`, or `"strict"` | Rewrites turns into unsigned fences and removes all `thinking` blocks and signatures. `true` merges all readable `thinking` blocks with inline fences; `"strict"` keeps native plaintext `thinking` and inline fences while dropping encrypted `thinking` summaries |
 | `beat` | `false` or `true` | Appends `[turn <position>]` to the last text block of assistant replies that carry visible text |
 
 Each slot resolves independently down four layers and records which layer answered:
@@ -87,8 +87,9 @@ Each assistant turn has three cases:
 
 - Same `(provider, api, model)` as the live model: Pi carries the native `thinking` block, so `forge`
   leaves the turn unchanged.
-- Foreign model with readable `thinking` text not yet present in an existing fence: `forge` merges
-  readable `thinking` summaries and any leading inline fence into one single trace and preserves the
+- Foreign model with readable `thinking` text not yet present in an existing fence or live cot tool
+  call: `forge` merges all readable `thinking` blocks with any leading inline fence or live cot tool
+  call into one single trace and preserves the
   turn's original `(provider, api, model)` stamp so Pi strips the native `thinking` block on the
   wire. Foreign turns whose leading fence or preceding `cot_` pair already contains the full
   reasoning stay as they are.
@@ -96,8 +97,9 @@ Each assistant turn has three cases:
   `forge` writes nothing because an opaque signature is valid only to the model that produced it.
 
 On selections Pi routes per request (`api: "pi-virtual"`), Pi picks the physical model after
-extension hooks run. Enabling `forge` on a virtual selection promotes turns through `transcribe` so
-both same-model and cross-model routes receive one plaintext trace without double-tracing.
+extension hooks run. Enabling `forge` on a virtual selection promotes turns through `transcribe` and
+strips historical `thinking` signatures so both same-model and cross-model routes receive one
+plaintext trace without replaying native and fenced reasoning together.
 
 Refilling happens only on the outgoing request and leaves the session file untouched. Because output
 is a pure function of each message's persisted bytes, the live model triple, and `cot`, growing
@@ -140,11 +142,20 @@ conditions subsequent turns to emit plaintext fences directly.
 
 `transcribe` supports two active modes:
 
-- `true`: merges readable `thinking` summaries and any leading inline fence into one single fence in
-  order (`[summary, interior]`), preserving full information when switching models during transition
-  turns.
-- `"strict"`: discards `thinking` summaries and retains only reasoning the model wrote inside a
-  leading fence (or live cot tool call), while still stripping all `thinking` blocks and signatures.
+- `true`: merges all readable `thinking` blocks (both native plaintext `thinking` and encrypted
+  `thinking` summaries) with any leading inline fence into one trace in block order.
+- `"strict"`: retains native plaintext `thinking` blocks (such as `reasoning_content` fields and
+  unencrypted reasoning text items) together with any leading inline fence or live cot tool call,
+  while discarding encrypted or signed `thinking` summaries so third-person summary phrasing never
+  enters the fence.
+
+`forge` and `transcribe` compose orthogonally by turn ownership. `transcribe` always promotes
+same-model turns (`isSameModel`) and strips all `thinking` blocks, signatures, and model-affinity
+stamps across the outgoing history. On foreign turns (`!isSameModel`), `forge: false` drops foreign
+`thinking` blocks and keeps only reasoning already present in a leading `text` fence or live cot tool
+call, whereas `forge: true` promotes
+foreign `thinking` blocks according to the active `transcribe` mode (`true` promotes all readable
+blocks, and `"strict"` promotes native plaintext `thinking` while dropping encrypted summaries).
 
 A text fence is recognized only when the first non-whitespace text block opens with `<tag>` for a
 configured cot tag name (without attributes). Balanced `<tag>` and `</tag>` pairs delimit the fence
@@ -152,8 +163,7 @@ interior across text blocks; an unclosed opening fence counts as reasoning only 
 `stopReason === "length"` truncated the response mid-thought. Configured tags inside the reasoning
 interior are stripped in a single linear scan, while literal tag examples inside the visible reply or
 code blocks remain untouched. Segments are deduplicated by exact equality and `\n\n`-delimited
-paragraph containment without dropping substrings inside sentences. When `transcribe` is active, it
-handles both live and foreign turns directly and `forge` skips the already-promoted transcript.
+paragraph containment without dropping substrings inside sentences.
 
 `transcribe` modifies only the outgoing request; turning it off restores the persisted native blocks
 and signatures.
@@ -197,7 +207,7 @@ model in the process tree.
 | `/leviathan turns on\|off\|<path>\|default` | Splice `turn0.yml`, a custom YAML file, or nothing |
 | `/leviathan forge on\|off\|default` | Refill foreign cots, or leave off |
 | `/leviathan cot <form>:<name>\|default` | Set the cot format |
-| `/leviathan transcribe on\|off\|strict\|default` | Promote reasoning with summaries (`on`), fence-only (`strict`), or leave native blocks (`off`) |
+| `/leviathan transcribe on\|off\|strict\|default` | Promote all readable reasoning (`on`), plaintext and inline fences without summaries (`strict`), or leave native blocks (`off`) |
 | `/leviathan beat on\|off\|default` | Stamp visible assistant replies with `[turn <position>]` |
 | `/leviathan inherit keyed\|tree\|none` | Set child-process inheritance scope |
 | `/leviathan remember` | Prepend this model's complete seven-slot record to `leviathan.json` and apply it |

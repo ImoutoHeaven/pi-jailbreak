@@ -10,7 +10,7 @@ import { configCots, configPath, cotNames, cotSpec, DEFAULT_COT, DEFAULT_PROMPT,
 import { applies, decode, encode, ENV_NAME, modelKey, publish } from "./channel.js";
 import { loadTurns, parseTurns, toMessages } from "./turns.js";
 import { forgeHistory, forgeOne, isSameModel, ownCot, prefixStable } from "./forge.js";
-import { COT_ACK, beatHistory, beatOne, beatText, fenced as carriesCot, opensWith, stripTags, transcribeHistory, transcribeOne } from "./cot.js";
+import { COT_ACK, beatHistory, beatOne, beatText, cotPair, fenced as carriesCot, opensWith, splitTurn, stripTags, transcribeHistory, transcribeOne } from "./cot.js";
 
 /** A cot spec, as the config parses one. */
 const TEXT_THINK = { form: "text", name: "think" };
@@ -1046,9 +1046,9 @@ console.log("ok turns messages");
 		const other = live([{ type: "text", text: "<note>\nfrom another model\n</note>\n\nvisible reply" }, thinkBlock("s"), callBlock("t1", "exec")]);
 		assert.equal(transcribeOne(other, SPEC_TEXT, ["think", "note"]).content[0].text, bare("s\n\nfrom another model") + "\n\nvisible reply", "cross-tag fence re-wraps into current tag without leaking reasoning (#03)");
 
-		assert.equal(transcribeOne(shortNote, SPEC_TEXT, NAMES, 0, "strict").content[0].text, bare("笔记G1") + "\n\n42", "strict mode drops summary and keeps model-written fence");
+		assert.equal(transcribeOne(shortNote, SPEC_TEXT, NAMES, 0, { mode: "strict" }).content[0].text, bare("笔记G1") + "\n\n42", "strict mode drops summary and keeps model-written fence");
 		const summaryOnlyReply = live([thinkBlock("English summary"), { type: "text", text: "Visible answer", textSignature: "ts" }], "stop");
-		const strictBare = transcribeOne(summaryOnlyReply, SPEC_TEXT, NAMES, 0, "strict");
+		const strictBare = transcribeOne(summaryOnlyReply, SPEC_TEXT, NAMES, 0, { mode: "strict" });
 		assert.deepEqual(strictBare.content, [{ type: "text", text: "Visible answer" }], "strict mode on summary-only turn drops summary and strips thinking/signature");
 		assert.equal(strictBare.model, "");
 	}
@@ -1156,7 +1156,7 @@ console.log("ok turns messages");
 	// The pair is the turn's fence even when the turn already carries one of its own: the reasoning moves
 	// into the pair and the fence on the turn goes, so the turn never shows two traces.
 	{
-		const pair = transcribeOne(live([thinkBlock("old")], "stop"), SPEC_TOOL, NAMES);
+		const pair = transcribeOne(live([thinkBlock("old"), callBlock("c0", "exec")]), SPEC_TOOL, NAMES).slice(0, 2);
 		const fenced = live([{ type: "text", text: bare("fresh reasoning") }, callBlock("c1", "exec")]);
 		const merged = transcribeHistory([...pair, fenced], SPEC_TOOL, NAMES);
 		assert.equal(merged[0].content[0].arguments.thought, "old\n\nfresh reasoning", "the pair merges the newer reasoning without losing its existing thought");
@@ -1167,7 +1167,7 @@ console.log("ok turns messages");
 	// A pair answers an assistant turn the writer can read. The guard is the same one the unfenced path
 	// makes, so a message whose content is not a block list passes through instead of throwing.
 	{
-		const pair = transcribeOne(live([thinkBlock("stored")], "stop"), SPEC_TOOL, NAMES);
+		const pair = transcribeOne(live([thinkBlock("stored"), callBlock("c0", "exec")]), SPEC_TOOL, NAMES).slice(0, 2);
 		const flat = { ...live([], "stop"), content: "not a block list" };
 		const list = transcribeHistory([...pair, flat], SPEC_TOOL, NAMES);
 		assert.equal(list.length, 3, "the pair and the turn it cannot read both stay");
@@ -1217,7 +1217,7 @@ console.log("ok turns messages");
 		const s2 = transcribeHistory(s1, { form: "toolcall", name: "note" }, ["think", "note"]);
 		assert.equal(s2, s1, "and settles to identity across cot names");
 
-		const pair = transcribeOne(live([thinkBlock("stored")], "stop"), SPEC_TOOL, NAMES);
+		const pair = transcribeOne(live([thinkBlock("stored"), callBlock("c0", "exec")]), SPEC_TOOL, NAMES).slice(0, 2);
 		const badPair = [
 			{ ...pair[0], content: [{ type: "toolCall", id: "cot_bad", name: "think", arguments: { thought: 123 } }] },
 			pair[1],
@@ -4164,6 +4164,430 @@ console.log("ok example config");
 		await select({ type: "model_select", model: NORMAL }, { model: NORMAL, ui: u });
 		assert.equal(activeTools.includes(GATE_TOOL), false, "inherit none narrows * back to live model");
 		await command.handler("reset", ctx);
+	}
+
+	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
+}
+// Orthogonal forge x transcribe (2x3), native plaintext thinking classification, and toolcall edge guards
+{
+	const command = commands.get("leviathan");
+	const u = ui();
+	const liveCtxModel = { provider: "CLIProxy", api: "custom-resp", id: "gemini-4-hydrogen" };
+	const ctx = { model: liveCtxModel, ui: u };
+	const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: {} };
+
+	// 1. Structural classification of thinking blocks: plaintext vs encrypted summary vs redacted.
+	{
+		for (const sig of ["reasoning_content", "reasoning", "reasoning_text", undefined, ""]) {
+			const m = {
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "first-person cot", ...(sig !== undefined ? { thinkingSignature: sig } : {}) }, { type: "text", text: "ans" }],
+				stopReason: "stop",
+			};
+			const sp = splitTurn(m, ["think"]);
+			assert.equal(sp.thinking, "first-person cot");
+			assert.equal(sp.plaintext, "first-person cot", `sig=${String(sig)} is native plaintext`);
+		}
+
+		// Unsigned thinking with JSON message-id textSignature is still plaintext; with base64 thoughtSignature is summary.
+		{
+			const jsonTextSig = {
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "open-weight cot", thinkingSignature: JSON.stringify({ id: "rs_1", type: "reasoning", content: [{ type: "reasoning_text", text: "open-weight cot" }] }) },
+					{ type: "text", text: "ans", textSignature: JSON.stringify({ v: 1, id: "msg_1", phase: "final_answer" }) },
+				],
+				stopReason: "stop",
+			};
+			assert.equal(splitTurn(jsonTextSig, ["think"]).plaintext, "open-weight cot");
+
+			const detailPlain = {
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "detail cot", thinkingSignature: JSON.stringify([{ type: "reasoning.text", text: "detail cot" }]) }],
+				stopReason: "stop",
+			};
+			assert.equal(splitTurn(detailPlain, ["think"]).plaintext, "detail cot");
+
+			for (const summaryTurn of [
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "thought summary" },
+						{ type: "text", text: "ans", textSignature: "CiQBase64ThoughtSig==" },
+					],
+					stopReason: "stop",
+				},
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "thought summary" },
+						{ type: "toolCall", id: "c1", name: "read", arguments: {}, thoughtSignature: "CiQBase64ThoughtSig==" },
+					],
+					stopReason: "toolUse",
+				},
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "resp summary", thinkingSignature: JSON.stringify({ id: "rs_2", type: "reasoning", summary: [{ type: "summary_text", text: "resp summary" }], encrypted_content: "gAAAA" }) },
+					],
+					stopReason: "stop",
+				},
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "or summary", thinkingSignature: JSON.stringify([{ type: "reasoning.summary", summary: "or summary" }, { type: "reasoning.encrypted", data: "enc" }]) },
+					],
+					stopReason: "stop",
+				},
+			]) {
+				const sp = splitTurn(summaryTurn, ["think"]);
+				assert.equal(sp.thinking.length > 0, true);
+				assert.equal(sp.plaintext, "", "encrypted/signed summary is excluded from plaintext");
+			}
+		}
+	}
+
+	// 2. Full 2x3 (forge: false|true) x (transcribe: false|true|"strict") orthogonal matrix through guard().
+	{
+		const foreignPlainTurn = {
+			role: "assistant",
+			provider: "CLIProxy-Chat",
+			api: "custom-chat",
+			model: "deepseek-flash",
+			usage: zero,
+			stopReason: "stop",
+			timestamp: 1,
+			content: [
+				{ type: "thinking", thinking: "DS_PLAIN", thinkingSignature: "reasoning_content" },
+				{ type: "text", text: "DS_REPLY" },
+			],
+		};
+		const foreignSummaryTurn = {
+			role: "assistant",
+			provider: "OtherProv",
+			api: "custom-resp",
+			model: "gpt-5",
+			usage: zero,
+			stopReason: "stop",
+			timestamp: 2,
+			content: [
+				{ type: "thinking", thinking: "GPT_SUMMARY", thinkingSignature: JSON.stringify({ id: "rs_g", type: "reasoning", summary: [{ type: "summary_text", text: "GPT_SUMMARY" }], encrypted_content: "enc" }) },
+				{ type: "text", text: "GPT_REPLY" },
+			],
+		};
+		const foreignInlineTurn = {
+			role: "assistant",
+			provider: "OtherProv",
+			api: "custom-resp",
+			model: "other-fenced",
+			usage: zero,
+			stopReason: "stop",
+			timestamp: 3,
+			content: [
+				{ type: "thinking", thinking: "FOREIGN_SUM", thinkingSignature: "enc_sig" },
+				{ type: "text", text: "<think>FOREIGN_INLINE</think>\n\nINLINE_REPLY" },
+			],
+		};
+		const liveSummaryAndFenceTurn = {
+			role: "assistant",
+			provider: liveCtxModel.provider,
+			api: liveCtxModel.api,
+			model: liveCtxModel.id,
+			usage: zero,
+			stopReason: "stop",
+			timestamp: 4,
+			content: [
+				{ type: "thinking", thinking: "GEM_SUMMARY", thinkingSignature: JSON.stringify({ id: "rs_l", type: "reasoning", summary: [{ type: "summary_text", text: "GEM_SUMMARY" }], encrypted_content: "enc" }) },
+				{ type: "text", text: "<think>GEM_OWN</think>\n\nGEM_REPLY", textSignature: JSON.stringify({ v: 1, id: "msg_l" }) },
+			],
+		};
+		const livePlainTurn = {
+			role: "assistant",
+			provider: liveCtxModel.provider,
+			api: liveCtxModel.api,
+			model: liveCtxModel.id,
+			usage: zero,
+			stopReason: "stop",
+			timestamp: 5,
+			content: [
+				{ type: "thinking", thinking: "GEM_PLAIN", thinkingSignature: "reasoning_content" },
+				{ type: "text", text: "GEM_PLAIN_REPLY" },
+			],
+		};
+
+		const transcript = [
+			head(""),
+			{ role: "user", content: [{ type: "text", text: "u1" }], timestamp: 0 },
+			foreignPlainTurn,
+			foreignSummaryTurn,
+			foreignInlineTurn,
+			liveSummaryAndFenceTurn,
+			livePlainTurn,
+		];
+
+		const runCell = async (forge, transcribe, cot = "text:think") => {
+			writeConfig([{ provider: liveCtxModel.provider, model: liveCtxModel.id, forge, transcribe, cot }]);
+			await command.handler("reset", ctx);
+			activeTools = ["read", "bash"];
+			await before({ systemPromptOptions: { sections: {} } }, ctx);
+			const res = guard({ type: "context_with_system", messages: transcript }, ctx);
+			const out = res?.messages ?? transcript;
+			assert.equal(guard({ type: "context_with_system", messages: out }, ctx), undefined, `Pass 2 settled for forge=${forge}, transcribe=${transcribe}, cot=${cot}`);
+			return out.filter((m) => m.role === "assistant");
+		};
+
+		// (1) forge: false, transcribe: false -> untouched
+		{
+			const a = await runCell(false, false);
+			assert.equal(a[0], foreignPlainTurn);
+			assert.equal(a[3], liveSummaryAndFenceTurn);
+		}
+		// (2) forge: true, transcribe: false -> foreign refilled, live untouched with signatures intact
+		{
+			const a = await runCell(true, false);
+			assert.equal(a[0].content[1].text, "<think>\nDS_PLAIN\n</think>\n\nDS_REPLY");
+			assert.equal(a[1].content[1].text, "<think>\nGPT_SUMMARY\n</think>\n\nGPT_REPLY");
+			assert.equal(a[2].content[1].text, "<think>\nFOREIGN_SUM\n\nFOREIGN_INLINE\n</think>\n\nINLINE_REPLY");
+			assert.equal(a[3], liveSummaryAndFenceTurn, "live turn untouched when transcribe: false");
+			assert.equal(a[4], livePlainTurn);
+		}
+		// (3) forge: false, transcribe: true -> live merged & scrubbed; foreign thinking NOT promoted, foreign inline fence kept
+		{
+			const a = await runCell(false, true);
+			assert.equal(a[0].content[0].text, "DS_REPLY", "forge:false does not promote foreign plaintext thinking");
+			assert.equal(a[1].content[0].text, "GPT_REPLY", "forge:false does not promote foreign summary");
+			assert.equal(a[2].content[0].text, "<think>\nFOREIGN_INLINE\n</think>\n\nINLINE_REPLY", "existing foreign text fence retained without foreign summary");
+			assert.equal(a[3].content[0].text, "<think>\nGEM_SUMMARY\n\nGEM_OWN\n</think>\n\nGEM_REPLY");
+			assert.equal(a[4].content[0].text, "<think>\nGEM_PLAIN\n</think>\n\nGEM_PLAIN_REPLY");
+			assert.ok(a.every((m) => m.model === "" && !m.content.some((b) => b.type === "thinking")));
+		}
+		// (4) forge: true, transcribe: true -> both live and foreign merge all readable thinking + inline fences
+		{
+			const a = await runCell(true, true);
+			assert.equal(a[0].content[0].text, "<think>\nDS_PLAIN\n</think>\n\nDS_REPLY");
+			assert.equal(a[1].content[0].text, "<think>\nGPT_SUMMARY\n</think>\n\nGPT_REPLY");
+			assert.equal(a[2].content[0].text, "<think>\nFOREIGN_SUM\n\nFOREIGN_INLINE\n</think>\n\nINLINE_REPLY");
+			assert.equal(a[3].content[0].text, "<think>\nGEM_SUMMARY\n\nGEM_OWN\n</think>\n\nGEM_REPLY");
+			assert.equal(a[4].content[0].text, "<think>\nGEM_PLAIN\n</think>\n\nGEM_PLAIN_REPLY");
+		}
+		// (5) forge: false, transcribe: "strict" -> live keeps plaintext + inline (drops summary); foreign thinking dropped
+		{
+			const a = await runCell(false, "strict");
+			assert.equal(a[0].content[0].text, "DS_REPLY");
+			assert.equal(a[1].content[0].text, "GPT_REPLY");
+			assert.equal(a[2].content[0].text, "<think>\nFOREIGN_INLINE\n</think>\n\nINLINE_REPLY");
+			assert.equal(a[3].content[0].text, "<think>\nGEM_OWN\n</think>\n\nGEM_REPLY", "live summary stripped in strict mode");
+			assert.equal(a[4].content[0].text, "<think>\nGEM_PLAIN\n</think>\n\nGEM_PLAIN_REPLY", "live native plaintext preserved in strict mode");
+		}
+		// (6) forge: true, transcribe: "strict" -> foreign native plaintext inherited, encrypted summaries dropped everywhere!
+		{
+			const a = await runCell(true, "strict");
+			assert.equal(a[0].content[0].text, "<think>\nDS_PLAIN\n</think>\n\nDS_REPLY", "foreign DeepSeek plaintext inherited under forge:on + transcribe:strict");
+			assert.equal(a[1].content[0].text, "GPT_REPLY", "foreign encrypted summary dropped under transcribe:strict");
+			assert.equal(a[2].content[0].text, "<think>\nFOREIGN_INLINE\n</think>\n\nINLINE_REPLY", "foreign inline fence kept while foreign summary dropped");
+			assert.equal(a[3].content[0].text, "<think>\nGEM_OWN\n</think>\n\nGEM_REPLY", "live summary dropped");
+			assert.equal(a[4].content[0].text, "<think>\nGEM_PLAIN\n</think>\n\nGEM_PLAIN_REPLY", "live plaintext preserved");
+
+			const toolAsst = await runCell(true, "strict", "toolcall:think");
+			assert.equal(toolAsst[0].content[0].arguments.thought, "DS_PLAIN", "toolcall form inherits foreign plaintext under forge:on + transcribe:strict");
+			assert.equal(toolAsst[2].content[0].text, "GPT_REPLY", "toolcall form drops foreign summary without emitting cotPair");
+		}
+	}
+
+	// 3. Probe5 Case 1: live CoT toolCall + self-written <think> fence + summary === liveThought.
+	{
+		const spec = { form: "toolcall", name: "think" };
+		const probe1 = {
+			role: "assistant",
+			provider: "Other",
+			api: "custom-resp",
+			model: "m1",
+			usage: zero,
+			stopReason: "toolUse",
+			timestamp: 10,
+			content: [
+				{ type: "thinking", thinking: "SUMMARY", thinkingSignature: JSON.stringify({ id: "rs_p1", type: "reasoning", summary: [{ type: "summary_text", text: "SUMMARY" }], encrypted_content: "enc" }) },
+				{ type: "text", text: "<think>\nOWN-FENCE\n</think>\n\n<think>demo</think> reply" },
+				{ type: "toolCall", id: "call_cot_1", name: "think", arguments: { thought: "SUMMARY" } },
+			],
+		};
+
+		// transcribe: true ("merge")
+		const tMerge = transcribeHistory([probe1], spec, ["think"], { mode: "merge" });
+		assert.equal(tMerge.length, 1);
+		assert.equal(tMerge[0].content[0].text, "<think>demo</think> reply", "OWN-FENCE stripped from text while literal <think>demo</think> stays");
+		assert.equal(tMerge[0].content[1].arguments.thought, "SUMMARY\n\nOWN-FENCE", "OWN-FENCE merged into live think toolCall");
+		assert.equal(transcribeHistory(tMerge, spec, ["think"], { mode: "merge" }), tMerge, "Pass 2 reference fixed point");
+
+		// transcribe: "strict" (also with distinct liveThought to verify SUMMARY is dropped)
+		const probe1Distinct = {
+			...probe1,
+			content: [probe1.content[0], probe1.content[1], { type: "toolCall", id: "call_cot_1", name: "think", arguments: { thought: "LIVE-NOTE" } }],
+		};
+		const tStrict = transcribeHistory([probe1Distinct], spec, ["think"], { mode: "strict" });
+		assert.equal(tStrict[0].content[0].text, "<think>demo</think> reply");
+		assert.equal(tStrict[0].content[1].arguments.thought, "OWN-FENCE\n\nLIVE-NOTE", "strict drops SUMMARY and merges OWN-FENCE + LIVE-NOTE");
+		assert.equal(transcribeHistory(tStrict, spec, ["think"], { mode: "strict" }), tStrict);
+
+		// forge: true (+ beatHistory + Pass 2)
+		const f1 = forgeHistory([probe1], liveCtxModel, spec, ["think"]);
+		assert.equal(f1[0].content[1].text, "<think>demo</think> reply", "forge strips OWN-FENCE even when liveThought === SUMMARY");
+		assert.equal(f1[0].content[2].arguments.thought, "SUMMARY\n\nOWN-FENCE");
+		assert.equal(forgeHistory(f1, liveCtxModel, spec, ["think"]), f1, "forge Pass 2 reference fixed point");
+		const fBeaten = beatHistory(f1);
+		assert.deepEqual(beatHistory(forgeHistory(fBeaten, liveCtxModel, spec, ["think"])), fBeaten, "forge + beat Pass 2 preserves literal <think>demo</think>");
+	}
+
+	// 4. Probe5 Case 2: consecutive assistant turns where first was forged into standalone cotPair.
+	{
+		const spec = { form: "toolcall", name: "think" };
+		const thoughtOnlyForeign = {
+			role: "assistant",
+			provider: "Foreign",
+			api: "custom",
+			model: "f1",
+			usage: zero,
+			stopReason: "length",
+			timestamp: 1,
+			content: [{ type: "thinking", thinking: "T1", thinkingSignature: "reasoning_content" }],
+		};
+		const nextFencedTurn = {
+			role: "assistant",
+			provider: "Foreign",
+			api: "custom",
+			model: "f1",
+			usage: zero,
+			stopReason: "stop",
+			timestamp: 2,
+			content: [{ type: "text", text: "<think>T2</think>\n\nVisible reply" }],
+		};
+		const forged = forgeHistory([thoughtOnlyForeign, nextFencedTurn], liveCtxModel, spec, ["think"]);
+		const promoted = transcribeHistory(forged, spec, ["think"]);
+		assert.equal(promoted.length, 5, "standalone forged cotPair does not swallow next turn");
+		assert.equal(promoted[0].content[0].arguments.thought, "T1");
+		assert.equal(promoted[2].content[0].arguments.thought, "T2");
+		assert.equal(promoted[4].content[0].text, "Visible reply", "second turn's <think>T2</think> is extracted cleanly");
+
+		// Hand-built non-empty-model cotPair followed by assistant turn with <think> fence.
+		const handBuilt = [
+			...cotPair("T1", "think", "cot_manual", { provider: "Foreign", api: "custom", model: "f1" }),
+			nextFencedTurn,
+		];
+		const handPromoted = transcribeHistory(handBuilt, spec, ["think"]);
+		assert.equal(handPromoted.at(-1).content[0].text, "Visible reply", "hand-built cotPair never leaves <think>T2</think> unextracted");
+	}
+
+	// 5. Orthogonal review Round-1 regression guards (#1-#6): structuredClone, sibling opaque thinking, beatText trailing whitespace, standalone transcribeOne, _tag, afterCotPair null content.
+	{
+		const spec = { form: "toolcall", name: "think" };
+		// #1: structuredClone survival across forge Pass 2 and forge -> transcribe
+		const cloneLiveMsg = {
+			role: "assistant",
+			provider: "Other",
+			api: "custom-resp",
+			model: "m1",
+			stopReason: "toolUse",
+			timestamp: 10,
+			usage: zero,
+			content: [
+				{ type: "thinking", thinking: "SUMMARY", thinkingSignature: "reasoning_content" },
+				{ type: "text", text: "<think>\nOWN-FENCE\n</think>\n\n<think>demo</think> reply" },
+				{ type: "toolCall", id: "call_cot_1", name: "think", arguments: { thought: "SUMMARY" } },
+			],
+		};
+		const cPass1 = forgeHistory([cloneLiveMsg], liveCtxModel, spec, ["think"]);
+		const cCloned1 = structuredClone(cPass1);
+		const cPass2 = forgeHistory(cCloned1, liveCtxModel, spec, ["think"]);
+		assert.equal(cPass2, cCloned1, "forge Pass 2 stays reference-identical after structuredClone (#1a)");
+		assert.equal(cPass2[0].content[1].text, "<think>demo</think> reply");
+		const cTransLive = transcribeHistory(structuredClone(cPass1), spec, ["think"], { mode: "merge", live: liveCtxModel, forge: true });
+		assert.equal(cTransLive[0].content[0].text, "<think>demo</think> reply", "forge -> structuredClone -> transcribe keeps literal <think> (#1a)");
+		assert.equal(cTransLive[0].forgedCot, undefined, "forgedCot stripped by scrubEnvelope");
+
+		const clonePairMsg = { ...cloneLiveMsg, stopReason: "stop", content: cloneLiveMsg.content.slice(0, 2) };
+		const fPair1 = forgeHistory([clonePairMsg], liveCtxModel, spec, ["think"]);
+		const fPairPromoted = transcribeHistory(structuredClone(fPair1), spec, ["think"], { mode: "merge", live: liveCtxModel, forge: true });
+		assert.equal(fPairPromoted[2].content[0].text, "<think>demo</think> reply", "paired cotPair survives structuredClone into transcribe (#1b)");
+		assert.equal(fPairPromoted[0].content[0].arguments.thought, "SUMMARY\n\nOWN-FENCE");
+
+		// #2: trailing empty signed thinking carrier or redacted sibling marks unsigned thinking as summary
+		for (const sibling of [
+			{ type: "thinking", thinking: "", thinkingSignature: "CiQBase64Sig==" },
+			{ type: "thinking", thinking: "[Reasoning redacted]", redacted: true, thinkingSignature: "enc" },
+		]) {
+			const gemTurn = {
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "thinking", thinking: "The user wants X." }, { type: "text", text: "X." }, sibling],
+			};
+			assert.equal(splitTurn(gemTurn, ["think"]).plaintext, "", "sibling opaque/redacted thinking marks unsigned thinking as summary (#2)");
+		}
+
+		// #3: beatText / beatHistory settles on Pass 1 when text has trailing whitespace and no marker
+		for (const trailingWs of ["Done.\n", "Done.   ", "Line 1\n\n  "]) {
+			const wsMsg = { role: "assistant", content: [{ type: "text", text: trailingWs }] };
+			const bp1 = beatHistory([wsMsg]);
+			const bp2 = beatHistory(bp1);
+			assert.equal(bp2, bp1, `beatHistory settles to exact reference on Pass 2 for ${JSON.stringify(trailingWs)} (#3)`);
+		}
+
+		// #4: transcribeOne thought-only turn emits cot_s_ and commutes with forgeHistory without fusing next turn
+		const tOnly = {
+			role: "assistant",
+			provider: "P",
+			api: "A",
+			model: "f1",
+			stopReason: "length",
+			timestamp: 1,
+			usage: zero,
+			content: [{ type: "thinking", thinking: "T1", thinkingSignature: "reasoning_content" }],
+		};
+		const ftOnly = transcribeHistory(forgeHistory([tOnly], liveCtxModel, spec, ["think"]), spec, ["think"], { mode: "merge", live: liveCtxModel, forge: true });
+		const tfOnly = forgeHistory(transcribeHistory([tOnly], spec, ["think"], { mode: "merge", live: liveCtxModel, forge: true }), liveCtxModel, spec, ["think"]);
+		assert.deepEqual(ftOnly, tfOnly, "thought-only turn commutes across forge <-> transcribe (#4a)");
+		const tNext = {
+			role: "assistant",
+			provider: "P",
+			api: "A",
+			model: "f2",
+			stopReason: "stop",
+			timestamp: 2,
+			usage: zero,
+			content: [{ type: "text", text: "<think>T2</think>\n\nVisible reply" }],
+		};
+		const combinedStandalone = transcribeHistory([...transcribeHistory([tOnly], spec, ["think"]), tNext], spec, ["think"]);
+		assert.equal(combinedStandalone.length, 5, "standalone transcribed cotPair never fuses into following assistant turn (#4b)");
+
+		// #5: underscore-prefixed cot tag name (_think) recognized by matchLeadingOpenTag
+		const uTurn = {
+			role: "assistant",
+			provider: "F",
+			api: "A",
+			model: "2",
+			stopReason: "stop",
+			usage: zero,
+			content: [{ type: "thinking", thinking: "COT" }, { type: "text", text: "ANS" }],
+		};
+		const up1 = forgeHistory([uTurn], liveCtxModel, { form: "text", name: "_think" }, ["_think"]);
+		const up2 = forgeHistory(up1, liveCtxModel, { form: "text", name: "_think" }, ["_think"]);
+		assert.equal(up2, up1, "underscore-prefixed <_think> fence settles on Pass 2 (#5)");
+	}
+
+	// 6. beatOne preserves textSignature when transcribe is off.
+	{
+		const signedTurn = {
+			role: "assistant",
+			provider: liveCtxModel.provider,
+			api: liveCtxModel.api,
+			model: liveCtxModel.id,
+			usage: zero,
+			stopReason: "stop",
+			timestamp: 1,
+			content: [{ type: "text", text: "Answer", textSignature: "CiQThoughtToken==" }],
+		};
+		const beaten = beatOne(signedTurn, 3);
+		assert.equal(beaten.content[0].text, "Answer\n[turn 3]");
+		assert.equal(beaten.content[0].textSignature, "CiQThoughtToken==", "beatOne keeps textSignature intact when transcribe is off");
 	}
 
 	writeConfig([{ provider: "CLIProxy-Chat", model: "deepseek-*", persona: true, gate: true, forge: true }]);
