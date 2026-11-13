@@ -6,12 +6,12 @@
  * slots resolve to. That is the whole point: a model can carry forge alone, or persona and gate with
  * no turns, and no slot drags another along.
  *
- * Every slot resolves on its own, down the same three layers, and reports which layer answered:
+ * Every slot resolves on its own, down the same four layers, and reports which layer answered:
  *
  *     session  ->  the first matching rule  ->  the file's `default`  ->  the built-in record
  *
  * The built-in record turns every switch off, so an extension with nothing configured changes
- * nothing. `cot` falls back to `text:think`, and the two writers below are off.
+ * nothing. `cot` falls back to `text:think`, and the writers below are off.
  *
  * A rule matches by provider and model: both optional, a missing field matches anything, a pattern
  * without `*` is exact, and `*` is the only wildcard. Every other regex metacharacter is escaped
@@ -32,6 +32,7 @@ export const CONFIG_NAME = "leviathan.json";
 export const DEFAULT_PROMPT = "prompt.md";
 export const DEFAULT_TURNS = "turn0.yml";
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
+export const TRANSCRIBE_MODES = Object.freeze([false, true, "strict"]);
 /**
  * How the cot reaches a request, in the two forms it has. The form and the name are one value, so a
  * slot cannot say "toolcall" without saying which tool: `text:<tag>` fences the reasoning in a tag
@@ -41,11 +42,9 @@ export const COT_FORMS = Object.freeze(["text", "toolcall"]);
 /** The value a session uses when nothing names one. */
 export const DEFAULT_COT = "text:think";
 /**
- * Tool names a `toolcall:` form may not take: every tool pi itself can declare. A cot that borrows a
- * real tool's name registers a second tool under that name, which replaces pi's own in the session,
- * and its fabricated call becomes indistinguishable from a real one. `tool_search` and `codemode`
- * are the extension tools pi ships enabled or one setting away; `ask_authorize_gate` is this
- * extension's own.
+ * Tool names a `toolcall:` form may not take: built-in Pi tools and standard companion extension
+ * tools. A cot that borrows a real tool's name registers a second tool under that name, which
+ * replaces the real tool in the session and makes fabricated calls indistinguishable from live ones.
  */
 export const RESERVED_COT_NAMES = Object.freeze([
 	"read",
@@ -60,6 +59,14 @@ export const RESERVED_COT_NAMES = Object.freeze([
 	"codemode",
 	"tool_search",
 	"ask_authorize_gate",
+	"team",
+	"subagent",
+	"checkpoint",
+	"history_read",
+	"history_search",
+	"history_list_items",
+	"history_list_windows",
+	"get_context_remaining",
 ]);
 
 /** The slots, in the order the footer renders them. */
@@ -72,9 +79,9 @@ export const SETTINGS_KEYS = Object.freeze([...SLOTS, "inherit"]);
 const CONFIG_KEYS = Object.freeze(["default", "inherit", "rules"]);
 const RULE_KEYS = Object.freeze(["provider", "model", ...SLOTS]);
 const COT_ERROR = `cot must be text:<tag> or toolcall:<name>, and not ${RESERVED_COT_NAMES.join(", ")}`;
-const HUMAN_ERROR = (slot) => `${slot} must be false, true, or a non-empty path`;
-const FORGE_ERROR = "forge must be false, true, or { maxChars: <positive whole number> | null }";
-const MAX_CHARS_ERROR = "maxChars must be a positive whole number, or null for no bound";
+const PATH_ERROR = (slot) => `${slot} must be false, true, or a non-empty path`;
+const BOOL_ERROR = (slot) => `${slot} must be false or true`;
+const TRANSCRIBE_ERROR = 'transcribe must be false, true, or "strict"';
 
 /**
  * The record a session uses when nothing is configured, and the tail of every resolution. Every switch
@@ -117,13 +124,6 @@ export function cotLabel(spec) {
 	return `${spec.form}:${spec.name}`;
 }
 
-/** A character bound as `{ maxChars }`, where `null` is no bound at all. `null` is the only value
- * outside the bound, and a value that is neither is rejected rather than read as one of the two. */
-function charBound(value) {
-	if (value === null) return { bound: { maxChars: null } };
-	return Number.isSafeInteger(value) && value > 0 ? { bound: { maxChars: value } } : null;
-}
-
 /**
  * One path slot as the spec it names, or null when the value is not one. `true` means the file that
  * ships with the extension, so a config written on one machine reads the same on another.
@@ -140,37 +140,30 @@ function plainSlot(value) {
 	return value === false || value === true ? { spec: value } : null;
 }
 
-/** The forge slot: off, on with no bound, or on with a bound. */
-function forgeSlot(value) {
-	if (value === false) return { spec: false };
-	if (value === true) return { spec: { maxChars: null } };
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	for (const key of Object.keys(value)) {
-		if (key !== "maxChars") return null;
-	}
-	if (!("maxChars" in value)) return null;
-	const read = charBound(value.maxChars);
-	return read ? { spec: read.bound } : null;
+/** The transcribe slot: off, full summary+fence merge (`true`), or fence-only (`"strict"`). */
+function transcribeSlot(value) {
+	return TRANSCRIBE_MODES.includes(value) ? { spec: value } : null;
 }
 
 /**
- * One slot from a value, or the reason it is not one. Every slot rejects what it cannot read, so a
- * typo is never quietly read as "off".
+ * One slot from a value, or null when the value is invalid. Every slot rejects what it cannot read,
+ * so a typo is never quietly read as "off".
  */
 function slotSpec(slot, value) {
 	if (slot === "persona") return pathSlot(value, DEFAULT_PROMPT);
 	if (slot === "turns") return pathSlot(value, DEFAULT_TURNS);
-	if (slot === "gate" || slot === "transcribe" || slot === "beat") return plainSlot(value);
-	if (slot === "forge") return forgeSlot(value);
+	if (slot === "gate" || slot === "forge" || slot === "beat") return plainSlot(value);
+	if (slot === "transcribe") return transcribeSlot(value);
 	const cot = cotSpec(value);
 	return cot ? { spec: cotLabel(cot) } : null;
 }
 
 /** A slot's error message, which names the slot and what it takes. */
 function slotError(slot) {
-	if (slot === "forge") return FORGE_ERROR;
+	if (slot === "persona" || slot === "turns") return PATH_ERROR(slot);
+	if (slot === "transcribe") return TRANSCRIBE_ERROR;
 	if (slot === "cot") return COT_ERROR;
-	return HUMAN_ERROR(slot);
+	return BOOL_ERROR(slot);
 }
 
 /**
@@ -375,6 +368,9 @@ function settingValue(key, value) {
 		if (text === shipped) return { value: shipped };
 		return { value: absolutePath(text) };
 	}
+	if (key === "transcribe" && typeof value === "string" && value.trim().toLowerCase() === "strict") {
+		return { value: "strict" };
+	}
 	const read = slotSpec(key, value);
 	if (!read) return { error: slotError(key) };
 	return { value: read.spec };
@@ -397,16 +393,14 @@ export function sessionSettings(value) {
 	return { settings: out };
 }
 
-/** The two words a command may use for a slot's off and on state. */
+/** The words a command may use for a slot's off and on state. */
 const OFF = new Set(["off", "false", "no"]);
 const ON = new Set(["on", "true", "yes"]);
 
 /**
  * One assignment from the command, or the reason it is not one. `default` removes the slot, `off`
- * and `on` are the two switch values, and anything else is a path or a cot spec.
- *
- * The command lowercases only the verb, so a slot arrives as typed. `forge` also takes
- * `maxChars <n>` and `maxChars none`, which set the bound and turn the slot on.
+ * and `on` are the two switch values, `strict` sets fence-only transcription, and anything else is a
+ * path or a cot spec.
  */
 export function settingFromCommand(name, value) {
 	const key = String(name ?? "").toLowerCase();
@@ -428,17 +422,9 @@ export function settingFromCommand(name, value) {
 	if (ON.has(keyword)) {
 		if (key === "persona") return { key, value: DEFAULT_PROMPT };
 		if (key === "turns") return { key, value: DEFAULT_TURNS };
-		// `forge on` is the slot with no bound: the bound is a value, and no bound is a value too.
-		if (key === "forge") return { key, value: { maxChars: null } };
 		return { key, value: true };
 	}
-	// `forge maxChars 1200` and `forge maxChars none` name the bound and turn the slot on with it.
-	if (key === "forge" && keyword.startsWith("maxchars")) {
-		const argument = keyword.slice("maxchars".length).trim();
-		const bound = argument === "none" || argument === "null" ? { bound: { maxChars: null } } : charBound(Number(argument));
-		if (!bound) return { error: MAX_CHARS_ERROR };
-		return { key, value: bound.bound };
-	}
+	if (key === "transcribe" && keyword === "strict") return { key, value: "strict" };
 	const read = settingValue(key, text);
 	return read.error ? { error: read.error } : { key, value: read.value };
 }
@@ -458,7 +444,7 @@ export function loadConfig(path, fallbackDir) {
 	let text;
 	try {
 		text = readFileSync(path, "utf8");
-	} catch (readError) {
+	} catch {
 		return { config: emptyConfig(fallbackDir) };
 	}
 	const hit = cache.get(path);

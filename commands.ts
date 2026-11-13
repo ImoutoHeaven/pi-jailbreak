@@ -29,13 +29,12 @@ const ARGS = [
 	"forge on",
 	"forge off",
 	"forge default",
-	"forge maxChars 1200",
-	"forge maxChars none",
 	"cot text:think",
 	"cot toolcall:think",
 	"cot default",
 	"transcribe on",
 	"transcribe off",
+	"transcribe strict",
 	"transcribe default",
 	"beat on",
 	"beat off",
@@ -48,7 +47,7 @@ const ARGS = [
 ];
 
 const USAGE =
-	"persona on|off|<path>|default · gate on|off|default · turns on|off|<path>|default · forge on|off|maxChars <n|none>|default · cot <form>:<name>|default · transcribe on|off|default · beat on|off|default · inherit keyed|tree|none · remember · reset";
+	"persona on|off|<path>|default · gate on|off|default · turns on|off|<path>|default · forge on|off|default · cot <form>:<name>|default · transcribe on|off|strict|default · beat on|off|default · inherit keyed|tree|none · remember · reset";
 
 /** The verbs that set one slot, plus the scope key. The first token is lowercased, so a slot's verb
  * compares case-insensitively while its value keeps the case the user typed. */
@@ -84,11 +83,10 @@ export function registerCommands(pi: any, hooks: Hooks) {
 				const current = hooks.reset(ctx);
 				// The receipt says what the file answers now, one word per slot.
 				const said = SLOTS.map((slot) => {
-					const value = current[slot === "turns" ? "turnsSpec" : slot];
-					if (slot === "forge") return value === false ? "forge off" : `forge ${value.maxChars === null ? "on" : value.maxChars}`;
-					if (value === true) return `${slot} on`;
-					if (value === false) return `${slot} off`;
-					return `${slot} ${value}`;
+					const resolved = current[slot === "turns" ? "turnsSpec" : slot];
+					if (resolved === true) return `${slot} on`;
+					if (resolved === false) return `${slot} off`;
+					return `${slot} ${resolved}`;
 				});
 				say(ctx, `leviathan reset (config: ${said.join(", ")})`);
 				return;

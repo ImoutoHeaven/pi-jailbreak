@@ -2,15 +2,8 @@
  * The fabricated conversation: the file format, its parse, its cache, and its mapping to messages.
  *
  * One YAML item is one message, and item order is conversation order. The block is spliced ahead of
- * the first real user message, so the model reads it as history rather than as a request, and it is
+ * the first non-system message, so the model reads it as history rather than as a request, and it is
  * rebuilt from the file on every request: the transcript records nothing for it.
- *
- * Rejection is whole. A file with one bad item injects nothing, because a half-fabricated history
- * would leave the model an assistant turn nobody answered. The structural rules are the ones a
- * transcript needs: a `result` answers the `call` before it, the sequence begins with `user`,
- * and no assistant is left with empty content, which pi drops from a transcript.
- *
- * Pure functions and one cache. `toMessages` is the only one that runs per request.
  */
 
 import { createRequire } from "node:module";
@@ -18,8 +11,6 @@ import { cotPair, cotText, pairId, zeroUsage } from "./cot.js";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 
-// A missing package disables injection and leaves the system-prompt half working, so the import is
-// guarded: failing here at load time would take the whole extension with it.
 const require = createRequire(import.meta.url);
 let YAML = null;
 try {
@@ -30,33 +21,16 @@ try {
 
 const MISSING = "the yaml package is not installed (run npm install in the pi-leviathan directory)";
 const KEYS = ["user", "assistant", "result"];
-/** The keys each role's mapping may carry. `result` takes a string and no mapping at all. */
 const TAKES = { user: ["text"], assistant: ["text", "cot", "call"] };
 const CALL_KEYS = ["name", "arguments"];
 
-/** One file, read and parsed once per revision, per kind of parse. */
 const files = new Map();
 
-/**
- * The first line of a parser message. The yaml package puts the line and the column in it, and the
- * lines after it are the source excerpt, which a report does not need.
- */
 function firstLine(error) {
 	const text = String(error?.message ?? error).split("\n")[0].trim().replace(/:$/, "");
 	return text || "unreadable";
 }
 
-/**
- * Read one file once per revision, per kind of parse. The bytes are what make a revision, and the
- * parse result is kept whether it succeeded or failed, so a bad file reports once and a good one
- * costs one `.readFile` per call. A stat is not enough: two writes in one timestamp tick share an
- * `mtimeMs`, and two spellings of one shape share a `size`.
- *
- * The kind is part of the key: a config may point `persona` and `turns` at the same path, and each
- * side parses those bytes its own way.
- *
- * `parse` returns `{ value }` or `{ error }`. Both turns and the persona text cache through here.
- */
 export function cachedFile(path, kind, parse) {
 	const key = `${kind}\u0000${path}`;
 	let text;
@@ -72,10 +46,6 @@ export function cachedFile(path, kind, parse) {
 	return entry;
 }
 
-/**
- * The specs of one turn file, or the reason it was rejected. The error keeps the file name, so a
- * report says which file it read.
- */
 export function loadTurns(path) {
 	const hit = cachedFile(path, "turns", (text) => {
 		const parsed = parseTurns(text);
@@ -84,9 +54,6 @@ export function loadTurns(path) {
 	return hit.error ? { error: hit.error } : { specs: hit.value };
 }
 
-/**
- * A role value as the mapping it stands for. A string is the shorthand for `{text}`.
- */
 function fieldsOf(role, value, at) {
 	if (typeof value === "string") return { fields: { text: value } };
 	if (!value || typeof value !== "object" || Array.isArray(value)) return { error: `${at}: ${role} must be a string or a mapping` };
@@ -96,7 +63,6 @@ function fieldsOf(role, value, at) {
 	return { fields: value };
 }
 
-/** The `call` of an assistant, or null when it carries none. */
 function callOf(value, at) {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return { error: `${at}: call must be a mapping` };
 	for (const key of Object.keys(value)) {
@@ -108,15 +74,6 @@ function callOf(value, at) {
 	return { call: { name: value.name, arguments: { ...args } } };
 }
 
-/**
- * The normalized sequence, or the reason the document is rejected.
- *
- * ```
- * { role: "user",       text }
- * { role: "assistant",  cot, text, call: {name, arguments} | null }
- * { role: "toolResult", name, text }
- * ```
- */
 export function parseTurns(text) {
 	if (!YAML) return { error: MISSING };
 	let documents;
@@ -139,7 +96,6 @@ export function parseTurns(text) {
 	if (items.length === 0) return { error: "the sequence is empty" };
 
 	const specs = [];
-	// The item whose `call` is still waiting for its `result`.
 	let pending = -1;
 	for (let index = 0; index < items.length; index++) {
 		const at = `item ${index + 1}`;
@@ -149,9 +105,7 @@ export function parseTurns(text) {
 		if (keys.length !== 1) return { error: `${at} needs exactly one of ${KEYS.join(", ")}` };
 		const [key] = keys;
 		if (!KEYS.includes(key)) return { error: `${at}: ${key} is not one of ${KEYS.join(", ")}` };
-		// A `result` first has no call to answer, which the result branch below says precisely.
 		if (index === 0 && key === "assistant") return { error: "the first item must be user" };
-		// The result follows the call it answers, so anything else leaves that call unanswered.
 		if (key !== "result" && pending >= 0) return { error: `${at}: the call in item ${pending + 1} has no result` };
 
 		if (key === "user") {
@@ -160,7 +114,7 @@ export function parseTurns(text) {
 			const { text } = read.fields;
 			if (typeof text !== "string") return { error: `${at}: text must be a string` };
 			if (!text.trim()) return { error: `${at}: empty text` };
-			specs.push({ role: "user", text });
+			specs.push({ role: "user", text: text.trim() });
 			continue;
 		}
 
@@ -177,7 +131,7 @@ export function parseTurns(text) {
 				normalized = readCall.call;
 			}
 			if (!text.trim() && !normalized) return { error: `${at}: an assistant needs text or a call` };
-			specs.push({ role: "assistant", cot, text, call: normalized });
+			specs.push({ role: "assistant", cot: cot.trim(), text: text.trim(), call: normalized });
 			if (normalized) pending = index;
 			continue;
 		}
@@ -188,37 +142,22 @@ export function parseTurns(text) {
 			const second = specs.at(-1)?.role === "toolResult";
 			return { error: second ? `${at}: a second result for one call` : `${at}: a result needs a preceding call` };
 		}
-		specs.push({ role: "toolResult", name: specs[pending].call.name, text: item.result });
+		specs.push({ role: "toolResult", name: specs[pending].call.name, text: item.result.trim() });
 		pending = -1;
 	}
 	if (pending >= 0) return { error: `item ${pending + 1}: the call has no result` };
 	return { specs };
 }
 
-/**
- * The specs as pi messages. Pure object construction: nothing here reads the clock, the transcript
- * or the file, so two calls with the same specs, model and cot produce identical bytes.
- *
- * The fabricated cot is written ahead of the reply in whichever form the cot slot names:
- *
- *  - `text:<tag>` fences it at the head of the reply's one text block, so the turn reads as reasoning
- *    the assistant wrote down followed by what it said.
- *  - `toolcall:<name>` sends the reasoning as that tool's call, answered by its result, ahead of the
- *    assistant message. The pair is the same one `forge` writes, so a fabricated conversation and a
- *    refilled history are indistinguishable to a model that reads them.
- *
- * A fabricated block is stamped with the live model, so it survives `transformMessages` and pi reads
- * it as this model's own earlier turn rather than as history carried over from somewhere else.
- */
 export function toMessages(specs, { provider, api, model, cot }) {
 	const messages = [];
 	const stamp = { provider, api, model };
-	// The id of the last call, which the result after it answers.
 	let lastCall = null;
 	for (let index = 0; index < specs.length; index++) {
 		const spec = specs[index];
+		const text = String(spec.text ?? "").trim();
 		if (spec.role === "user") {
-			messages.push({ role: "user", content: [{ type: "text", text: spec.text }], timestamp: 0 });
+			messages.push({ role: "user", content: [{ type: "text", text }], timestamp: 0 });
 			continue;
 		}
 		if (spec.role === "toolResult") {
@@ -226,22 +165,20 @@ export function toMessages(specs, { provider, api, model, cot }) {
 				role: "toolResult",
 				toolCallId: lastCall,
 				toolName: spec.name,
-				content: [{ type: "text", text: spec.text }],
+				content: [{ type: "text", text }],
 				isError: false,
 				usage: zeroUsage(),
 				timestamp: 0,
 			});
 			continue;
 		}
-		// A reasoning turn of its own: call, result, then the reply it belongs to.
-		if (spec.cot && cot?.form === "toolcall") {
-			messages.push(...cotPair(spec.cot, cot.name, pairId(`${index}\u0000${spec.cot}`, stamp), stamp));
+		const cotValue = String(spec.cot ?? "").trim();
+		if (cotValue && cot?.form === "toolcall") {
+			messages.push(...cotPair(cotValue, cot.name, pairId(`${index}\u0000${cotValue}`, stamp), stamp));
 		}
 		const content = [];
-		// The cot leads the reply, so it reads as reasoning the assistant wrote down rather than as a
-		// second thing it said. One block, so the fence and the reply stay one turn.
-		const fence = spec.cot && cot?.form !== "toolcall" ? cotText(spec.cot, cot.name) : "";
-		const visible = [fence, spec.text].filter(Boolean).join("\n\n");
+		const fence = cotValue && cot?.form !== "toolcall" ? cotText(cotValue, cot.name) : "";
+		const visible = [fence, text].filter(Boolean).join("\n\n");
 		if (visible) content.push({ type: "text", text: visible });
 		if (spec.call) {
 			lastCall = `tc_${index}`;
@@ -254,7 +191,6 @@ export function toMessages(specs, { provider, api, model, cot }) {
 			provider,
 			model,
 			usage: zeroUsage(),
-			// `transformMessages` drops an assistant marked error or aborted, so this is load-bearing.
 			stopReason: spec.call ? "toolUse" : "stop",
 			timestamp: 0,
 		});

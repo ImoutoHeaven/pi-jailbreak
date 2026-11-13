@@ -2,9 +2,10 @@
 
 `pi-leviathan` configures seven independent per-model slots in Pi: `persona` prepends text to the
 system prompt, `gate` declares the `ask_authorize_gate` tool, `turns` splices a fabricated
-conversation ahead of the first real user message, `forge` restores reasoning Pi drops from foreign
-turns, `cot` sets how chain-of-thought is formatted, `transcribe` rewrites readable reasoning into a
-text fence and removes thinking blocks, and `beat` stamps each assistant turn with its position.
+conversation ahead of the first non-system message, `forge` restores reasoning Pi drops from foreign
+turns, `cot` sets how chain-of-thought is formatted, `transcribe` promotes reasoning into unsigned
+plaintext fences and removes `thinking` blocks, and `beat` stamps visible assistant replies with
+their position.
 
 Each slot switches on or off independently. A model can run `forge` alone, or pair `persona` and
 `gate` while leaving `turns` off. Every switch defaults to `false`, so installing the extension
@@ -39,7 +40,7 @@ Start from `leviathan.example.json`:
 	"rules": [
 		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "persona": true, "gate": true, "turns": true, "forge": true },
 		{ "provider": "deepseek", "persona": true, "gate": true },
-		{ "model": "*deepseek*", "persona": true, "forge": { "maxChars": 1200 }, "cot": "text:analysis" },
+		{ "model": "*deepseek*", "persona": true, "forge": true, "cot": "text:analysis" },
 		{ "model": "*claude*", "forge": true, "cot": "toolcall:think" }
 	]
 }
@@ -60,10 +61,10 @@ the built-in record.
 | `persona` | `false`, `true`, or a path | Prepends text to the leading system message. `true` selects the shipped `prompt.md`; other relative paths resolve against the config file's directory |
 | `gate` | `false` or `true` | Activates `ask_authorize_gate` while enabled |
 | `turns` | `false`, `true`, or a path | Splices a YAML turn sequence ahead of the first non-system message. `true` selects the shipped `turn0.yml` |
-| `forge` | `false`, `true`, or `{ "maxChars": n }` | Refills readable reasoning on foreign turns Pi would drop. `true` sets no character limit; `maxChars` truncates long traces |
+| `forge` | `false` or `true` | Refills readable reasoning on foreign turns Pi would drop |
 | `cot` | `text:<tag>` or `toolcall:<name>` | Selects how writers format chain-of-thought. `text:<think>` and `text:think` name the same tag |
-| `transcribe` | `false` or `true` | Merges a turn's readable reasoning and summary into one fence and removes its `thinking` blocks |
-| `beat` | `false` or `true` | Appends `[turn <position>]` to the last text block of every assistant turn |
+| `transcribe` | `false`, `true`, or `"strict"` | Rewrites turns into unsigned fences and removes all `thinking` blocks. `true` merges readable `thinking` summaries with inline fences; `"strict"` drops `thinking` summaries and keeps only model-written fences |
+| `beat` | `false` or `true` | Appends `[turn <position>]` to the last text block of assistant replies that carry visible text |
 
 Each slot resolves independently down four layers and records which layer answered:
 
@@ -86,18 +87,17 @@ Each assistant turn has three cases:
 
 - Same `(provider, api, model)` as the live model: Pi carries the native `thinking` block, so `forge`
   leaves the turn unchanged.
-- Foreign model with readable `thinking` text and no existing cot fence or fabricated cot call:
-  `forge` writes the cot and preserves the turn's original `(provider, api, model)` stamp so Pi still
-  strips the native `thinking` block on the wire.
-- Foreign model whose `thinking` block is empty, encrypted, or marked redacted: `forge` writes
-  nothing because an opaque signature is valid only to the model that produced it.
+- Foreign model with readable `thinking` text not yet present in an existing fence: `forge` merges
+  readable `thinking` summaries and any leading inline fence into one single trace and preserves the
+  turn's original `(provider, api, model)` stamp so Pi strips the native `thinking` block on the
+  wire. Foreign turns whose leading fence or preceding `cot_` pair already contains the full
+  reasoning stay as they are.
+- Foreign model whose `thinking` block is empty, encrypted, or marked redacted with no inline fence:
+  `forge` writes nothing because an opaque signature is valid only to the model that produced it.
 
-`forge` skips selections Pi routes per request (`api: "pi-virtual"`), where `ctx.model` names the
-virtual selection and Pi picks the physical model after extension hooks run.
-
-`forge` applies no length limit unless `{ "maxChars": n }` is configured. Truncated traces end with
-`[... reasoning truncated]`. If backing off from a split UTF-16 surrogate pair leaves the entire
-trace intact, `forge` omits the truncation note.
+On selections Pi routes per request (`api: "pi-virtual"`), Pi picks the physical model after
+extension hooks run. Enabling `forge` on a virtual selection promotes turns through `transcribe` so
+both same-model and cross-model routes receive one plaintext trace without double-tracing.
 
 Refilling happens only on the outgoing request and leaves the session file untouched. Because output
 is a pure function of each message's persisted bytes, the live model triple, and `cot`, growing
@@ -114,75 +114,58 @@ HTTP reverse proxy that forwards over HTTPS.
   block ahead of any reply. The cot and the reply share one block with identical bytes across
   providers.
 - `toolcall:<name>` inserts a fabricated `toolCall` carrying `{ "thought": ... }` and its `OK`
-  `toolResult` ahead of the assistant message. Inserting a pair keeps the message's own `toolCall`
-  blocks separate so Pi never invents missing-result errors.
+  `toolResult` ahead of the assistant message. When the assistant message already carries a live call
+  to `<name>` with a `thought` string, writers merge into that call's `thought` argument in place.
 
 While `cot` is set to `toolcall:<name>` and `forge`, `transcribe`, or `turns` can emit a cot call,
-the extension registers and activates that tool so providers that check historical tool calls against
-declared tools accept the request. A live call to the tool returns `OK`. Built-in Pi tool names
-(`read`, `write`, `edit`, `bash`, `powershell`, `ls`, `find`, `grep`, `glob`, `codemode`,
-`tool_search`) and `ask_authorize_gate` are rejected as `toolcall` names so the cot tool cannot
-replace Pi's own tools.
+the extension registers and activates that tool (unless a tool with that name already exists in Pi's
+registry) so providers that check historical tool calls against declared tools accept the request. If
+the host allowlist blocks activating `<name>`, writers fall back to `text:<name>` for that request. A
+live call to the tool returns `OK`. Built-in Pi tool names, standard companion tools (`team`,
+`subagent`, `checkpoint`, `history_*`, `get_context_remaining`), and `ask_authorize_gate` are
+rejected as `toolcall` names.
 
-Every cot name declared anywhere in `leviathan.json` travels with the resolved record. A turn fenced
-under one model's tag or preceded by a `cot_`-prefixed call under another model's name counts as
-already carrying a cot across model switches. Genuine model calls to the cot tool do not carry the
-`cot_` id prefix and still have their native `thinking` blocks refilled.
+Every cot name declared anywhere in `leviathan.json` travels with the resolved record so turns
+carrying a fence or `cot_`-prefixed call under another rule's name are recognized without stacking
+duplicate fences. Under `transcribe`, leading text fences under any configured tag name are
+re-wrapped into the active `cot` format while existing `cot_` pairs retain their tool call in place.
 
 ### transcribe
 
-`transcribe` rewrites every assistant turn that carries readable reasoning, including turns written by
-the live model, into one fence in the format `cot` names and removes all `thinking` blocks. On
-backends that attach opaque signatures to reasoning blocks or summaries, the next request sends plain
-text the model can read without signatures.
+`transcribe` promotes assistant turns, including turns written by the live model, into unsigned
+plaintext fences in the format `cot` names and removes all `thinking` blocks, `textSignature` fields,
+`thoughtSignature` fields, and model-affinity stamps so downstream serializers treat every historical
+turn as clean plaintext history. Showing the model zero native reasoning blocks in its history
+conditions subsequent turns to emit plaintext fences directly.
 
-A turn can hold reasoning in three places: readable `thinking` blocks, the interior of a fence the
-model wrote in text, and text ahead of that fence. `transcribe` merges them in order (readable
-`thinking` summary first, pre-fence lead-in text second, fence interior third) and removes every
-`thinking` block. When a provider exposes only a summary in `thinking`, that summary enters the fence
-and encrypted bytes are dropped.
+`transcribe` supports two active modes:
 
-Across a turn's text blocks, the fence runs from the first `<tag>` opener to the last `</tag>` closer
-after it, or to the end of the turn's text when an opener after the last closer (or the only opener)
-has no matching closer:
+- `true`: merges readable `thinking` summaries and any leading inline fence into one single fence in
+  order (`[summary, interior]`), preserving full information when switching models during transition
+  turns.
+- `"strict"`: discards `thinking` summaries and retains only reasoning the model wrote inside a
+  leading fence (or live cot tool call), while still stripping all `thinking` blocks and signatures.
 
-- With no `<tag>` opener in any text block, all text blocks form the reply and readable `thinking`
-  blocks form the reasoning.
-- With `<tag>` present, text blocks before it and the prefix ahead of `<tag>` form the lead-in
-  reasoning, text through the final closing tag across the remaining blocks forms the fence interior,
-  and text after that closing tag forms the reply.
+A text fence is recognized only when the first non-whitespace text block opens with `<tag>` for a
+configured cot tag name (without attributes). Balanced `<tag>` and `</tag>` pairs delimit the fence
+interior across text blocks; an unclosed opening fence counts as reasoning only when
+`stopReason === "length"` truncated the response mid-thought. Configured tags inside the reasoning
+interior are stripped in a single linear scan, while literal tag examples inside the visible reply or
+code blocks remain untouched. Segments are deduplicated by exact equality and `\n\n`-delimited
+paragraph containment without dropping substrings inside sentences. When `transcribe` is active, it
+handles both live and foreign turns directly and `forge` skips the already-promoted transcript.
 
-Before building the outer fence, `transcribe` removes all configured cot tag names case-insensitively
-in a single linear scan. Removing tags introduces no escape syntax for the model to copy. A reply
-that mentions `<tag>` is folded into reasoning, and a `</tag>` quoted in a reply extends the fence to
-that closer. Tags with attributes such as `<think x>` do not open a fence; bare `</think>` closers
-are still removed. `maxChars` bounds only the reasoning and leaves the reply intact.
-
-Each segment is stripped of configured tags, trimmed, cleaned of trailing `[turn <n>]` markers, and
-deduplicated when an earlier segment already contains it. A second pass over an already-transcribed
-turn produces the same bytes and returns the original message reference. Because `transcribe` depends
-only on the message and the `cot` spec, earlier positions stay byte identical as the conversation
-grows.
-
-Under `toolcall:<name>`, `transcribe` writes the merged reasoning into the `thought` argument of a
-fabricated call pair ahead of the turn and leaves the turn with its reply and tool calls. When a cot
-pair already precedes a turn, readable reasoning on the turn merges into that pair's `thought` while
-keeping the pair's call id.
-
-`transcribe` modifies only the outgoing request; turning it off restores the persisted native blocks.
-When both `transcribe` and `forge` are on, `transcribe` runs first and `forge` skips any turn already
-carrying a cot, so `forge`'s `maxChars` limit applies only to turns `transcribe` left untouched. On
-an unbounded foreign turn whose text contains no configured fence tags, both writer orders produce the
-same single-trace output in `text` and `toolcall` forms.
+`transcribe` modifies only the outgoing request; turning it off restores the persisted native blocks
+and signatures.
 
 ### beat
 
-`beat` appends `[turn <position>]` to the last text block of every assistant turn (or inserts a text
-block after leading `thinking` blocks and ahead of `toolCall` blocks when the turn has no text).
-Keeping the marker inside the assistant turn avoids mid-conversation system messages, which several
-providers fold into the system head and invalidate the prompt prefix cache. The number is the
-message's list index, so appending turns leaves earlier markers unchanged, and existing trailing
-markers are stripped before rewriting so repeated passes produce identical bytes.
+`beat` appends `[turn <position>]` to the last text block of every assistant reply that carries
+visible text. Tool-only steps and fabricated `cotPair` call messages have no text blocks and are left
+untouched. Keeping the marker inside the assistant turn avoids mid-conversation system messages,
+which several providers fold into the system head and invalidate the prompt prefix cache. The number
+is the message's transcript index prior to `turns` splicing, so appending turns leaves earlier
+markers unchanged, and existing trailing markers are replaced idempotently.
 
 ### inherit
 
@@ -212,25 +195,26 @@ model in the process tree.
 | `/leviathan persona on\|off\|<path>\|default` | Use `prompt.md`, a custom path, or nothing; `default` clears the session override |
 | `/leviathan gate on\|off\|default` | Activate or withdraw `ask_authorize_gate` |
 | `/leviathan turns on\|off\|<path>\|default` | Splice `turn0.yml`, a custom YAML file, or nothing |
-| `/leviathan forge on\|off\|maxChars <n>\|maxChars none\|default` | Refill foreign cots unbounded, with a character limit, or off |
+| `/leviathan forge on\|off\|default` | Refill foreign cots, or leave off |
 | `/leviathan cot <form>:<name>\|default` | Set the cot format |
-| `/leviathan transcribe on\|off\|default` | Rewrite readable reasoning into fences, or leave native blocks |
-| `/leviathan beat on\|off\|default` | Stamp assistant turns with `[turn <position>]` |
+| `/leviathan transcribe on\|off\|strict\|default` | Promote reasoning with summaries (`on`), fence-only (`strict`), or leave native blocks (`off`) |
+| `/leviathan beat on\|off\|default` | Stamp visible assistant replies with `[turn <position>]` |
 | `/leviathan inherit keyed\|tree\|none` | Set child-process inheritance scope |
 | `/leviathan remember` | Prepend this model's complete seven-slot record to `leviathan.json` and apply it |
 | `/leviathan reset` | Clear session overrides and resolve from `leviathan.json` again |
 
 `remember` writes all seven slots, including `false` values, as one rule at the front of `rules`
-ahead of any wildcards that would shadow it. It keeps portable spellings (`true` and relative paths)
-intact so the rule is not tied to one machine's filesystem, and running `remember` twice leaves the
-file byte identical.
+ahead of any wildcards that would shadow it. Session `on` values for `persona` and `turns` are
+written as `true`, and relative file paths stay relative so the rule remains portable across
+machines. Running `remember` clears memorized session slot overrides and leaves the file byte
+identical on a repeat call.
 
 The status footer shows active switches in a fixed order: 🎭 `persona`, 🛡️ `gate`, 💬 `turns`,
 ⚒️ `forge`, 📝 `transcribe`, 🕑 `beat`. `Leviathan 🎭🛡️💬⚒️📝🕑` indicates all six are active,
 `Leviathan ⚒️` indicates `forge` alone, and `Leviathan` indicates all switches are off. A trailing `!`
 marks an active `persona` or `turns` slot that did not reach the request because the file was missing
-or invalid, the transcript had no valid system message target, or another extension forced the system
-prompt.
+or invalid, a called tool was blocked by the session allowlist, the transcript had no valid target,
+or another extension forced the system prompt.
 
 ## Subagents
 
@@ -238,7 +222,7 @@ Parent Pi sessions pass overrides to child Pi processes through the `PI_LEVIATHA
 variable.
 
 The payload is JSON, such as `{"k":"CLIProxy-Chat/glm-5.3","p":1234}`, plus `"s"` when session slot
-overrides exist (for example `"s":{"persona":"/abs/alt.md","turns":false,"forge":{"maxChars":1200}}`).
+overrides exist (for example `"s":{"persona":"/abs/alt.md","turns":false,"forge":true,"transcribe":"strict"}`).
 `k` is the model key or `*`, `p` is the publisher PID, and `s` holds validated slot settings. A
 malformed `s` rejects the entire payload so the child resolves cleanly from `leviathan.json`. A child
 accepts the variable only when `p` matches `process.ppid` or `process.pid`, re-publishes it under its
@@ -302,10 +286,11 @@ sequence must start with `user`, every `call` must be followed immediately by on
 invalid item rejects the entire file, logs once, marks `!` in the footer, and leaves `persona`
 intact.
 
-The fabricated block is spliced immediately before the first non-system message (after the leading
-system prompt at index `0` and after any compaction summary) on each request without modifying the
-session transcript. Because its bytes depend only on the file, live model, and resolved `cot`, the
-prefix stays cacheable.
+The fabricated block is spliced immediately after leading `system` messages (ahead of any
+`compactionSummary` entry and the first user message) on each request without modifying the session
+transcript. Placing the block ahead of `compactionSummary` keeps its prompt-cache prefix intact
+across compactions and separates a trailing fabricated `assistant` turn from kept history that begins
+on an `assistant` turn.
 
 The final item in the YAML sequence sets the conversational state right before the real user message:
 ending on `assistant` closes a completed turn, ending on `result` hands tool output (such as a gate
@@ -347,8 +332,9 @@ node check.mjs
 
 `node check.mjs` tests slot resolution, `PI_LEVIATHAN` inheritance, prompt head projection and stock
 preamble withholding, `remember` writes, gate rulings, YAML turn parsing and splicing, `forge` and
-`transcribe` purity, fixed-point idempotence, prefix stability, linear-time tag and marker stripping,
-footer rendering, README examples, and `prompt.md` invariants.
+`transcribe` (`true` and `"strict"`) purity, fixed-point idempotence across all 576 slot
+combinations, prefix stability, linear-time tag and marker stripping, footer rendering, README
+examples, and `prompt.md` invariants.
 
 Two static guards scan every package source file: one fails if any file names a provider API family,
 and the second fails if code inspects an `api` value beyond holding and forwarding it. A preamble

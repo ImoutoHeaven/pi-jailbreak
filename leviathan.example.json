@@ -4,7 +4,7 @@
 	"rules": [
 		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "persona": true, "gate": true, "turns": true, "forge": true },
 		{ "provider": "deepseek", "persona": true, "gate": true },
-		{ "model": "*deepseek*", "persona": true, "forge": { "maxChars": 1200 }, "cot": "text:analysis" },
+		{ "model": "*deepseek*", "persona": true, "forge": true, "cot": "text:analysis" },
 		{ "model": "*claude*", "forge": true, "cot": "toolcall:think" }
 	]
 }
