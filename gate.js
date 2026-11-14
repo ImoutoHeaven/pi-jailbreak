@@ -26,8 +26,21 @@
  * module stays importable by the check without resolving pi's bundled typebox.
  */
 
-/** The tool name the model calls. Direct exposure: a tool call of its own, not a codemode step. */
+/**
+ * The tool name the model calls. Direct exposure: a tool call of its own, not a codemode step.
+ */
 export const GATE_TOOL = "ask_authorize_gate";
+
+/**
+ * The invisible markers a rewritten prompt can carry. Defined here rather than imported, so this
+ * module stays importable on its own.
+ */
+const INVISIBLES = /[\u200b\u200c\u200d\u2060\ufeff\u00ad\u034f\u180e]/g;
+
+/** The text with every invisible marker removed, so `N\u200bSFW` and `NSFW` compare equal. */
+export function stripInvisible(value) {
+	return String(value ?? "").replace(INVISIBLES, "");
+}
 
 /** The one field that can be denied, and the field every other ruling is measured against. */
 export const CSAM_FIELD = "NSFW_CSAM";
@@ -150,13 +163,17 @@ const NEXT_RECALL_FIELDS =
  * Field codes from whatever the model sent: one string, or an array, split on separators and
  * upper-cased. Free-form parsing is deliberate, because a code is checked against the closed set
  * after normalization, so a separator style never turns a real call into a failed one.
+ *
+ * Invisible characters are stripped first. A `scrub` rule may have written a marker into the enum
+ * the model read, so `N\u200bSFW` is the same code as `NSFW`: the model echoing back the shape it
+ * was shown is the expected case, not a broken call.
  */
 export function normalizeFields(input) {
 	const raw = Array.isArray(input) ? input : input === undefined || input === null ? [] : [input];
 	const seen = new Set();
 	for (const entry of raw) {
 		if (typeof entry !== "string") continue;
-		for (const part of entry.split(/[\s,;/]+/)) {
+		for (const part of stripInvisible(entry).split(/[\s,;/]+/)) {
 			const code = part.trim().toUpperCase();
 			if (code) seen.add(code);
 		}

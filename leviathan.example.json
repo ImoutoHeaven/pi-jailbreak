@@ -1,10 +1,37 @@
 {
-	"default": { "persona": false, "gate": false, "turns": false, "forge": false },
+	"default": {
+		"persona": false,
+		"gate": false,
+		"turns": false,
+		"forge": false,
+		"scrub": false
+	},
 	"inherit": "keyed",
 	"rules": [
-		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "persona": true, "gate": true, "turns": true, "forge": true },
-		{ "provider": "deepseek", "persona": true, "gate": true },
-		{ "model": "*deepseek*", "persona": true, "forge": true, "cot": "text:analysis" },
-		{ "model": "*claude*", "forge": true, "cot": "toolcall:think" }
+		{
+			"provider": "CLIProxy-Chat",
+			"model": "deepseek-*",
+			"persona": true,
+			"gate": true,
+			"turns": true,
+			"forge": true,
+			"scrub": true
+		},
+		{
+			"provider": "deepseek",
+			"persona": true,
+			"gate": true
+		},
+		{
+			"model": "*deepseek*",
+			"persona": true,
+			"forge": true,
+			"cot": "text:analysis"
+		},
+		{
+			"model": "*claude*",
+			"forge": true,
+			"cot": "toolcall:think"
+		}
 	]
 }

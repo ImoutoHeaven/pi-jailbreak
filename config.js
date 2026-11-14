@@ -1,10 +1,10 @@
 /**
  * The rule table and the resolver.
  *
- * The record has seven slots and they are independent: `persona`, `gate`, `turns`, `forge`, `cot`,
- * `transcribe` and `beat`. Nothing here says "this model is a leviathan" — a model is whatever its
- * slots resolve to. That is the whole point: a model can carry forge alone, or persona and gate with
- * no turns, and no slot drags another along.
+ * The record has eight slots and they are independent: `persona`, `gate`, `turns`, `forge`, `cot`,
+ * `transcribe`, `beat` and `scrub`. Nothing here says "this model is a leviathan": a model is
+ * whatever its slots resolve to. That is the whole point: a model can carry forge alone, or persona
+ * and gate with no turns, and no slot drags another along.
  *
  * Every slot resolves on its own, down the same four layers, and reports which layer answered:
  *
@@ -31,6 +31,7 @@ export const CONFIG_NAME = "leviathan.json";
 /** The two files that ship with the extension. A slot set to `true` names one of them. */
 export const DEFAULT_PROMPT = "prompt.md";
 export const DEFAULT_TURNS = "turn0.yml";
+export const DEFAULT_SCRUB = "scrub.yml";
 export const INHERITS = Object.freeze(["keyed", "tree", "none"]);
 export const TRANSCRIBE_MODES = Object.freeze([false, true, "strict"]);
 /**
@@ -70,9 +71,9 @@ export const RESERVED_COT_NAMES = Object.freeze([
 ]);
 
 /** The slots, in the order the footer renders them. */
-export const SLOTS = Object.freeze(["persona", "gate", "turns", "forge", "cot", "transcribe", "beat"]);
+export const SLOTS = Object.freeze(["persona", "gate", "turns", "forge", "cot", "transcribe", "beat", "scrub"]);
 /** The switches, which are what a footer glyph and a panel row report as on or off. */
-export const SWITCHES = Object.freeze(["persona", "gate", "turns", "forge", "transcribe", "beat"]);
+export const SWITCHES = Object.freeze(["persona", "gate", "turns", "forge", "transcribe", "beat", "scrub"]);
 /** The slots a session answer may carry. `inherit` is the scope, not a slot. */
 export const SETTINGS_KEYS = Object.freeze([...SLOTS, "inherit"]);
 
@@ -88,7 +89,7 @@ const TRANSCRIBE_ERROR = 'transcribe must be false, true, or "strict"';
  * is off: installing the extension and writing no config changes no request.
  */
 export function emptyRecord() {
-	return { persona: false, gate: false, turns: false, forge: false, cot: DEFAULT_COT, transcribe: false, beat: false };
+	return { persona: false, gate: false, turns: false, forge: false, cot: DEFAULT_COT, transcribe: false, beat: false, scrub: false };
 }
 
 /**
@@ -152,6 +153,7 @@ function transcribeSlot(value) {
 function slotSpec(slot, value) {
 	if (slot === "persona") return pathSlot(value, DEFAULT_PROMPT);
 	if (slot === "turns") return pathSlot(value, DEFAULT_TURNS);
+	if (slot === "scrub") return pathSlot(value, DEFAULT_SCRUB);
 	if (slot === "gate" || slot === "forge" || slot === "beat") return plainSlot(value);
 	if (slot === "transcribe") return transcribeSlot(value);
 	const cot = cotSpec(value);
@@ -160,7 +162,7 @@ function slotSpec(slot, value) {
 
 /** A slot's error message, which names the slot and what it takes. */
 function slotError(slot) {
-	if (slot === "persona" || slot === "turns") return PATH_ERROR(slot);
+	if (slot === "persona" || slot === "turns" || slot === "scrub") return PATH_ERROR(slot);
 	if (slot === "transcribe") return TRANSCRIBE_ERROR;
 	if (slot === "cot") return COT_ERROR;
 	return BOOL_ERROR(slot);
@@ -199,6 +201,13 @@ export function promptPath(config, spec) {
 export function turnsPath(config, spec) {
 	if (isAbsolute(spec)) return spec;
 	if (spec === DEFAULT_TURNS) return join(PACKAGE_DIR, spec);
+	return join(config.dir, spec);
+}
+
+/** The absolute path a `scrub` spec names, resolved the same way. */
+export function scrubPath(config, spec) {
+	if (isAbsolute(spec)) return spec;
+	if (spec === DEFAULT_SCRUB) return join(PACKAGE_DIR, spec);
 	return join(config.dir, spec);
 }
 
@@ -349,7 +358,7 @@ function absolutePath(value) {
  * session's cwd, because a command line names what the user can see.
  *
  * The two shipped names are the exception: `prompt.md` and `turn0.yml` mean the package copy on
- * every layer, so they are kept bare. Turning one into a path would name a different file — the one
+ * every layer, so they are kept bare. Turning one into a path would name a different file: the one
  * in whatever directory the recovering process happens to sit in.
  */
 function settingValue(key, value) {
@@ -359,9 +368,9 @@ function settingValue(key, value) {
 		if (!INHERITS.includes(wanted)) return { error: `inherit must be ${INHERITS.join(", ")}` };
 		return { value: wanted };
 	}
-	if (key === "persona" || key === "turns") {
+	if (key === "persona" || key === "turns" || key === "scrub") {
 		if (value === false) return { value: false };
-		const shipped = key === "persona" ? DEFAULT_PROMPT : DEFAULT_TURNS;
+		const shipped = key === "persona" ? DEFAULT_PROMPT : key === "turns" ? DEFAULT_TURNS : DEFAULT_SCRUB;
 		if (value === true) return { value: shipped };
 		if (typeof value !== "string" || !value.trim()) return { error: `a ${key} path must be non-empty` };
 		const text = value.trim();
@@ -422,6 +431,7 @@ export function settingFromCommand(name, value) {
 	if (ON.has(keyword)) {
 		if (key === "persona") return { key, value: DEFAULT_PROMPT };
 		if (key === "turns") return { key, value: DEFAULT_TURNS };
+		if (key === "scrub") return { key, value: DEFAULT_SCRUB };
 		return { key, value: true };
 	}
 	if (key === "transcribe" && keyword === "strict") return { key, value: "strict" };

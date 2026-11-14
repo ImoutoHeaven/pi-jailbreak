@@ -39,6 +39,9 @@ const ARGS = [
 	"beat on",
 	"beat off",
 	"beat default",
+	"scrub on",
+	"scrub off",
+	"scrub default",
 	"inherit keyed",
 	"inherit tree",
 	"inherit none",
@@ -47,7 +50,7 @@ const ARGS = [
 ];
 
 const USAGE =
-	"persona on|off|<path>|default · gate on|off|default · turns on|off|<path>|default · forge on|off|default · cot <form>:<name>|default · transcribe on|off|strict|default · beat on|off|default · inherit keyed|tree|none · remember · reset";
+	"persona on|off|<path>|default · gate on|off|default · turns on|off|<path>|default · forge on|off|default · cot <form>:<name>|default · transcribe on|off|strict|default · beat on|off|default · scrub on|off|<path>|default · inherit keyed|tree|none · remember · reset";
 
 /** The verbs that set one slot, plus the scope key. The first token is lowercased, so a slot's verb
  * compares case-insensitively while its value keeps the case the user typed. */
@@ -63,7 +66,7 @@ function say(ctx: any, text: string, type: "info" | "error" = "info") {
 
 export function registerCommands(pi: any, hooks: Hooks) {
 	pi.registerCommand("leviathan", {
-		description: "Show or set this model's record: persona, gate, turns, forge, cot, transcribe, beat, inherit, remember, reset",
+		description: "Show or set this model's record: persona, gate, turns, forge, cot, transcribe, beat, scrub, inherit, remember, reset",
 		getArgumentCompletions: (prefix: string) => {
 			const typed = String(prefix ?? "").trim().toLowerCase();
 			const items = ARGS.filter((value) => value.toLowerCase().startsWith(typed));
@@ -83,7 +86,8 @@ export function registerCommands(pi: any, hooks: Hooks) {
 				const current = hooks.reset(ctx);
 				// The receipt says what the file answers now, one word per slot.
 				const said = SLOTS.map((slot) => {
-					const resolved = current[slot === "turns" ? "turnsSpec" : slot];
+					const resolved =
+						current[slot === "turns" ? "turnsSpec" : slot === "scrub" ? "scrubSpec" : slot];
 					if (resolved === true) return `${slot} on`;
 					if (resolved === false) return `${slot} off`;
 					return `${slot} ${resolved}`;

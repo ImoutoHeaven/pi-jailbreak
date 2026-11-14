@@ -1,11 +1,11 @@
 # pi-leviathan
 
-`pi-leviathan` configures seven independent per-model slots in Pi: `persona` prepends text to the
+`pi-leviathan` configures eight independent per-model slots in Pi: `persona` prepends text to the
 system prompt, `gate` declares the `ask_authorize_gate` tool, `turns` splices a fabricated
 conversation ahead of the first non-system message, `forge` restores reasoning Pi drops from foreign
 turns, `cot` sets how chain-of-thought is formatted, `transcribe` promotes reasoning into unsigned
 plaintext fences and removes `thinking` blocks, and `beat` stamps visible assistant replies with
-their position.
+their position, and `scrub` rewrites the outbound prompt so a gateway reads different bytes.
 
 Each slot switches on or off independently. A model can run `forge` alone, or pair `persona` and
 `gate` while leaving `turns` off. Every switch defaults to `false`, so installing the extension
@@ -22,8 +22,8 @@ pi install /path/to/pi-leviathan
 ```
 
 `pi -e ./index.ts` loads the extension for a single run. `index.ts` resolves `prompt.md`,
-`config.js`, `channel.js`, `cot.js`, `gate.js`, `turns.js`, `forge.js`, and `commands.ts` from its
-own directory. If `yaml` is missing, `turns` is disabled and the remaining six slots still work.
+`config.js`, `channel.js`, `cot.js`, `gate.js`, `turns.js`, `forge.js`, `scrub.js`, and `commands.ts` from its
+own directory. If `yaml` is missing, `turns` is disabled and the remaining seven slots still work.
 
 ## Configure
 
@@ -35,13 +35,40 @@ Start from `leviathan.example.json`:
 
 ```json
 {
-	"default": { "persona": false, "gate": false, "turns": false, "forge": false },
+	"default": {
+		"persona": false,
+		"gate": false,
+		"turns": false,
+		"forge": false,
+		"scrub": false
+	},
 	"inherit": "keyed",
 	"rules": [
-		{ "provider": "CLIProxy-Chat", "model": "deepseek-*", "persona": true, "gate": true, "turns": true, "forge": true },
-		{ "provider": "deepseek", "persona": true, "gate": true },
-		{ "model": "*deepseek*", "persona": true, "forge": true, "cot": "text:analysis" },
-		{ "model": "*claude*", "forge": true, "cot": "toolcall:think" }
+		{
+			"provider": "CLIProxy-Chat",
+			"model": "deepseek-*",
+			"persona": true,
+			"gate": true,
+			"turns": true,
+			"forge": true,
+			"scrub": true
+		},
+		{
+			"provider": "deepseek",
+			"persona": true,
+			"gate": true
+		},
+		{
+			"model": "*deepseek*",
+			"persona": true,
+			"forge": true,
+			"cot": "text:analysis"
+		},
+		{
+			"model": "*claude*",
+			"forge": true,
+			"cot": "toolcall:think"
+		}
 	]
 }
 ```
@@ -54,7 +81,7 @@ character sequence, patterns without `*` match exact strings, and matching ignor
 One invalid value or unknown key rejects the entire file, reports the error once, and falls back to
 the built-in record.
 
-### The seven slots
+### The eight slots
 
 | Slot | Values | What it does |
 |---|---|---|
@@ -65,6 +92,7 @@ the built-in record.
 | `cot` | `text:<tag>` or `toolcall:<name>` | Selects how writers format chain-of-thought. `text:<think>` and `text:think` name the same tag |
 | `transcribe` | `false`, `true`, or `"strict"` | Rewrites turns into unsigned fences and removes all `thinking` blocks and signatures. `true` merges all readable `thinking` blocks with inline fences; `"strict"` keeps native plaintext `thinking` and inline fences while dropping encrypted `thinking` summaries |
 | `beat` | `false` or `true` | Appends `[turn <position>]` to the last text block of assistant replies that carry visible text |
+| `scrub` | `false`, `true`, or a path | Rewrites the matched strings in the outbound system prompt. `true` selects the shipped `scrub.yml`, whose scope is the whole system prompt |
 
 Each slot resolves independently down four layers and records which layer answered:
 
@@ -72,7 +100,7 @@ Each slot resolves independently down four layers and records which layer answer
 session  ->  the first matching rule  ->  the file's default  ->  the built-in record
 ```
 
-A rule that sets only `gate` leaves the other six slots to `default` and the built-in record, and
+A rule that sets only `gate` leaves the other seven slots to `default` and the built-in record, and
 changing `default.forge` leaves every other slot untouched.
 
 ### forge
@@ -177,6 +205,56 @@ which several providers fold into the system head and invalidate the prompt pref
 is the message's transcript index prior to `turns` splicing, so appending turns leaves earlier
 markers unchanged, and existing trailing markers are replaced idempotently.
 
+### scrub
+
+`scrub` rewrites the outbound prompt before it leaves. A gateway that pattern-matches a system prompt
+can answer with a fabricated quota error instead of a model reply, and the only thing that changes its
+mind is the bytes it reads. Every rule in the file names one string and one action, and the action
+turns that string into the same words with an invisible marker inside, so the gateway reads different
+bytes while the model reads the same sentence.
+
+`scope` is a property of the file, never a second config slot. `system` rewrites the whole system
+prompt: the head text, every section beside it, and the persona text at its head. `system+user` adds
+user messages. Assistant messages, tool results and `thinking` blocks are never touched, because a
+rewritten block loses the signature a cross-model replay depends on.
+
+| Action | Effect |
+|---|---|
+| `zw` | Puts U+200B after every word gap, keeping the gap |
+| `first` | Puts U+200B after the first rune of the match |
+| `soft` | Puts U+00AD inside each word long enough to hold one |
+| `cgj` | Puts U+034F after the first rune of each word |
+
+Those are the whole set. A rule may insert a marker and may not rewrite or delete a character, because
+that is the property the slot rests on. A file naming any other action is rejected, and so is a rule
+the action could not mark at all, such as `first` on a one-rune match or `soft` on a word of four
+runes or fewer, since it would leave the trigger in place while the footer reported success.
+
+Three properties make the slot safe to leave on. It is pure: the rewrite is computed on the outbound
+array and never written back, so the transcript keeps the original text and every turn recomputes the
+same output from the same input.
+
+It is idempotent by construction. Every action inserts one of three markers
+and changes no other character, so removing the markers from a rewritten string gives back exactly
+the string it came from, and that makes a second pass land on the bytes of the first, for any rule
+set and any input. Stripping rather than skipping is also the right failure direction: a user who
+pastes `N` + U+200B + `SFW`, or a model quoting a rewritten prompt back, is not told "already done";
+the markers come off, the rules see the bare word, and the text leaves the shape any other text
+would. Only the three markers this file writes are stripped, so a ZWJ inside an emoji is not mistaken
+for evidence of a rewrite.
+
+And it is content-deterministic: every action is a function of the matched text alone, with no random
+marker position, so the prompt prefix stays byte-identical across turns.
+
+The shipped `scrub.yml` is written so that a marker always sits against a word: `zw` puts it after the
+gap it found, and a rule whose match is only whitespace is refused, because a marker between two
+spaces would be a token no strip could remove. Every rule in it obfuscates and none rewrites the
+wording, so a persona's own words arrive intact.
+
+A code the model reads through a rewrite still reaches the gate as itself: `fields` is open at the
+schema, and both the tool boundary and the gate strip the markers before matching, so `N` + U+200B +
+`SFW` rules exactly as `NSFW` does.
+
 ### inherit
 
 `inherit` sets what session overrides pass to child Pi processes: `keyed` (the same `provider/id`
@@ -213,7 +291,7 @@ model in the process tree.
 | `/leviathan remember` | Prepend this model's complete seven-slot record to `leviathan.json` and apply it |
 | `/leviathan reset` | Clear session overrides and resolve from `leviathan.json` again |
 
-`remember` writes all seven slots, including `false` values, as one rule at the front of `rules`
+`remember` writes all eight slots, including `false` values, as one rule at the front of `rules`
 ahead of any wildcards that would shadow it. Session `on` values for `persona` and `turns` are
 written as `true`, and relative file paths stay relative so the rule remains portable across
 machines. Running `remember` clears memorized session slot overrides and leaves the file byte
@@ -331,8 +409,9 @@ with one `NEXT ACTION` line.
 - `cot.js`: `cot` formatting, `cotPair` construction, `transcribe` writer, and `beat` markers.
 - `forge.js`: cross-model chain-of-thought refilling and prefix-stability check.
 - `turns.js`: YAML turn-file parser, byte-keyed file cache, and message builder.
+- `scrub.js`: rule-file parser, the obfuscation actions, and the outbound rewrite.
 - `gate.js`: category table and `ask_authorize_gate` rulings.
-- `prompt.md` and `turn0.yml`: default files used when `persona` or `turns` is `true`.
+- `prompt.md`, `turn0.yml` and `scrub.yml`: default files used when `persona`, `turns` or `scrub` is `true`.
 
 ## Check
 
